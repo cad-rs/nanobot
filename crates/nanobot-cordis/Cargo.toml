@@ -1,0 +1,11 @@
+[package]
+name = "nanobot-cordis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "nanobot plugin kernel: Context (named service repository) / Events (typed, 4 dispatch modes) / Fiber (reversible effects)"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]

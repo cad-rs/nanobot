@@ -1,0 +1,22 @@
+[package]
+name = "nanobot-llm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "nanobot LLM provider adapter seam: StreamChunk/BlockAssembler vocabulary + LlmAdapter trait + OpenAI-compatible and Scripted adapters"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+bytes.workspace = true
+reqwest.workspace = true
+eventsource-stream.workspace = true
+futures-core.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+futures-executor = "0.3"
