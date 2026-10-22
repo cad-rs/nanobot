@@ -1,0 +1,21 @@
+[package]
+name = "nanobot-rhai"
+version = "0.1.0"
+edition = "2021"
+license = "Proprietary"
+description = "nanobot Rhai script-plugin host: a plugin.toml manifest and a Rhai entry point that declares panels, views, commands and toolbar items"
+
+[dependencies]
+# Declarative UiNode trees (the only thing a script panel may render) and the
+# Rhai runtime that compiles them.
+gpui-rhai = { workspace = true }
+rhai = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+# gpui-rhai renders SVG text and calls `fontdb::Database::load_system_fonts()`,
+# which lives behind fontdb's `fs` feature — but its own manifest only enables
+# `usvg/text`. In workbench-rs that feature arrives transitively via
+# `cosmic-text` (pulled in by gpui-wgpu); a graph without gpui-wgpu does not
+# have it, and gpui-rhai then fails to compile. Declare it here so the host
+# builds standalone and inside a product workspace alike.
+usvg = { workspace = true }

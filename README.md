@@ -25,9 +25,9 @@ Extraction is incremental. See the migration path in the design doc:
 | `nanobot-agent` | **landed** — turn/step loop, plan state machine, PlanVerifier seam |
 | `nanobot-skills` | **landed** — skill runner (manifest -> listeners), ships no skills |
 | `nanobot-boot` | **landed** — `Harness`/`HarnessBuilder` assembly, `harness.toml` identity, CLI modes (`--selfcheck` / `--selfcheck-crash` / `--agent-smoke` / `--agent-run` / `--smoke`), probe-style selfcheck with the three-phase crash-recovery probe, generic project container (`ProjectPaths` / `Manifest` / `Project`) |
-| `nanobot-gpu` | pending — wgpu↔gpui render slot (mechanism out of `ocad-viewport`); confirmed direction: the product keeps its renderer and takes the shared-device entry |
-| `nanobot-rhai` | pending — Rhai script plugin host |
-| `nanobot-ui` | pending — gpui workbench shell (confirmed direction: the shell lives here) |
+| `nanobot-gpu` | **landed** — the wgpu↔gpui render slot: process-wide shared device (`shared_gpu`), offscreen targets, zero-copy compositing (`paint_surface`), and the `ViewportSlot` contract the product's renderer implements |
+| `nanobot-rhai` | **landed** — Rhai script plugin host: `plugin.toml` manifest plus an entry point that declares panels / views / commands / toolbar items; loading is isolated, so a bad plugin never stops the others |
+| `nanobot-ui` | **landed** — gpui workbench shell: session list, session workspace (conversation + plan review + approval / clarify bars + composer), viewport region, and the panel dock that hosts product and script-plugin panels. Generic over `SessionView` |
 
 ## Layout
 
@@ -35,12 +35,29 @@ Extraction is incremental. See the migration path in the design doc:
 crates/
   nanobot-cordis/   plugin kernel: Context / Events / Fiber / Disposable
   nanobot-llm/      LlmAdapter seam + StreamChunk/BlockAssembler + adapters
+  nanobot-session/  event log + seq + projection + JSONL + fork
+  nanobot-tools/    ToolRegistry + waterfalls + ApprovalPolicy
+  nanobot-agent/    turn/step loop + plan state machine
+  nanobot-skills/   skill runner (manifest -> listeners)
   nanobot-boot/     Harness assembly + harness.toml + CLI/selfcheck + project container
+  nanobot-gpu/      render slot: shared device + offscreen target + zero copy
+  nanobot-rhai/     Rhai script plugin host (manifest -> panels/views/commands)
+  nanobot-ui/       gpui workbench shell + panel dock
+.vendor/            gpui-ce / gpui-component / gpui-rhai (see .vendor/README.md)
 ```
 
 The kernel crates are **GUI-free**: no `gpui`, no `wgpu`, no `rcad-*`, no `ocad-*`.
-That is enforced by CI (see the architecture doc §3.2), and it is what lets the
-kernel serve a CLI, a test, or an MCP server without dragging a UI along.
+That is enforced by `tools/nanobot-vendor-check.py` in rcad-pro (design §3.2),
+and it is what lets the kernel serve a CLI, a test, or an MCP server without
+dragging a UI along. The shell layer (`nanobot-gpu` / `nanobot-rhai` /
+`nanobot-ui`) is the only place gpui and wgpu appear.
+
+The vendored gpui stack in `.vendor/` is a copy of `cad-rs/workbench-rs`'s, kept
+byte-identical so a single `gpui-ce` serves both workspaces — see
+`.vendor/README.md`. nanobot's own `[patch.crates-io]` table supplies the vendor
+path for standalone builds; a consuming workspace supplies its own (rcad-pro
+points at `workbench-rs/.vendor`), which is why the dependency entries in this
+workspace carry a version rather than a path.
 
 ## Develop
 

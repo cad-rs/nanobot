@@ -1,0 +1,3164 @@
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::rc::{Rc, Weak};
+
+use rhai::{
+    Array, CustomType, Dynamic, EvalAltResult, FLOAT, FnPtr, INT, ImmutableString, Map,
+    NativeCallContext, Position, TypeBuilder,
+};
+use unicode_segmentation::UnicodeSegmentation;
+
+use crate::{
+    AssetId, ComponentInstancePath, HostCallback, MotionSource, OpaqueHandle, OverlayId,
+    OverlayKind, OverlayPlacement, PrimitiveNode, ScriptCallback, ScriptGeneration, Style,
+    UiEventBinding, UiEventHandler, UiValue,
+};
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ImageSourceSpec {
+    Handle(OpaqueHandle),
+    Asset(AssetId),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct OverlayNodeSpec {
+    pub id: OverlayId,
+    pub parent: Option<OverlayId>,
+    pub kind: OverlayKind,
+    pub placement: OverlayPlacement,
+    pub anchor: Option<crate::OverlayBounds>,
+    pub open: bool,
+    pub gap: f64,
+    pub modal: bool,
+    pub dismiss: OverlayDismissPolicy,
+    pub tooltip_delays: Option<TooltipDelays>,
+    pub initial_focus: OverlayInitialFocus,
+    pub activate_on_trigger: bool,
+    pub width_policy: OverlayWidthPolicy,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum OverlayWidthPolicy {
+    #[default]
+    Content,
+    MatchTrigger,
+}
+
+/// Where focus lands on each closed -> open presentation cycle of a modal
+/// or menu overlay. This is an overlay-lifecycle contract, deliberately not
+/// tied to entity mount: overlays keep their semantic subtree (and thus
+/// primitive identity) across close/reopen, so mount-time mechanisms like
+/// input `autofocus` fire only on the first open.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum OverlayInitialFocus {
+    /// Focus the overlay panel itself (historical behavior).
+    #[default]
+    Panel,
+    /// Focus the first focusable element inside the panel once the content
+    /// has entered the focus tree.
+    ///
+    /// Note: any node with interaction handlers (click/hover/key) gets an
+    /// interaction wrapper, and wrappers are tab stops by default. A content
+    /// container that listens for keys (arrow navigation, say) will itself
+    /// be "first" unless it opts out with `tab_stop(false)`.
+    First,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LayerPlacement {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+    Center,
+    Fill,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LayerNodeSpec {
+    pub id: OverlayId,
+    pub placement: LayerPlacement,
+    pub inset: f64,
+    pub priority: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TooltipDelays {
+    pub show_ms: u64,
+    pub hide_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OverlayDismissPolicy {
+    pub escape: bool,
+    pub outside: bool,
+}
+
+/// Stable identity for a node among its siblings.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct NodeKey(ImmutableString);
+
+impl NodeKey {
+    #[must_use]
+    pub fn new(value: impl Into<ImmutableString>) -> Self {
+        Self(value.into())
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceLocation {
+    pub module: String,
+    pub line: u32,
+    pub column: u32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Span {
+    text: ImmutableString,
+    key: Option<ImmutableString>,
+    color: Option<crate::ColorValue>,
+    bold: bool,
+    italic: bool,
+    motions: Vec<MotionSource>,
+}
+
+impl Span {
+    #[must_use]
+    pub fn new(text: impl Into<ImmutableString>) -> Self {
+        Self {
+            text: text.into(),
+            key: None,
+            color: None,
+            bold: false,
+            italic: false,
+            motions: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn color(mut self, color: crate::ColorValue) -> Self {
+        self.color = Some(color);
+        self
+    }
+
+    #[must_use]
+    pub fn with_key(mut self, key: impl Into<ImmutableString>) -> Self {
+        self.key = Some(key.into());
+        self
+    }
+
+    #[must_use]
+    pub fn motion(mut self, source: MotionSource) -> Self {
+        self.motions
+            .retain(|existing| existing.property() != source.property());
+        self.motions.push(source);
+        self
+    }
+
+    #[must_use]
+    pub const fn bold(mut self) -> Self {
+        self.bold = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn italic(mut self) -> Self {
+        self.italic = true;
+        self
+    }
+
+    #[must_use]
+    pub fn text(&self) -> &str {
+        self.text.as_str()
+    }
+
+    #[must_use]
+    pub fn key(&self) -> Option<&str> {
+        self.key.as_deref()
+    }
+
+    #[must_use]
+    pub fn motions(&self) -> &[MotionSource] {
+        &self.motions
+    }
+
+    #[must_use]
+    pub const fn color_value(&self) -> Option<&crate::ColorValue> {
+        self.color.as_ref()
+    }
+
+    #[must_use]
+    pub const fn is_bold(&self) -> bool {
+        self.bold
+    }
+
+    #[must_use]
+    pub const fn is_italic(&self) -> bool {
+        self.italic
+    }
+}
+
+impl CustomType for Span {
+    fn build(mut builder: TypeBuilder<Self>) {
+        builder
+            .with_name("Span")
+            .with_fn("with_key", |span: &mut Self, key: ImmutableString| {
+                span.clone().with_key(key)
+            })
+            .with_fn("color", |span: &mut Self, color: crate::ColorValue| {
+                span.clone().color(color)
+            })
+            .with_fn("motion", |span: &mut Self, source: MotionSource| {
+                span.clone().motion(source)
+            })
+            .with_fn("bold", |span: &mut Self| span.clone().bold())
+            .with_fn("italic", |span: &mut Self| span.clone().italic());
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum UiNodeKind {
+    Text {
+        text: ImmutableString,
+    },
+    RichText {
+        text: ImmutableString,
+        spans: Vec<Span>,
+    },
+    Canvas {
+        scene: crate::CanvasScene,
+    },
+    Svg {
+        source: crate::InlineSvg,
+    },
+    Box {
+        children: Vec<UiNode>,
+    },
+    Fragment {
+        children: Vec<UiNode>,
+    },
+    Custom {
+        primitive: PrimitiveNode,
+    },
+    Image {
+        source: ImageSourceSpec,
+    },
+    DirectionalImage {
+        left_to_right: ImageSourceSpec,
+        right_to_left: ImageSourceSpec,
+    },
+    Overlay {
+        trigger: Box<UiNode>,
+        content: Box<UiNode>,
+        spec: OverlayNodeSpec,
+    },
+    Layer {
+        content: Box<UiNode>,
+        spec: LayerNodeSpec,
+    },
+    VirtualCollection {
+        spec: crate::VirtualCollectionNodeSpec,
+    },
+    ErrorBoundary {
+        child: Box<UiNode>,
+        fallback: Box<UiNode>,
+    },
+}
+
+/// Stable discriminant used by retained reconciliation without exposing GPUI
+/// element types or borrowing a complete [`UiNodeKind`] payload.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum UiNodeKindTag {
+    Text,
+    Canvas,
+    Svg,
+    Box,
+    Fragment,
+    Custom,
+    Image,
+    DirectionalImage,
+    Overlay,
+    Layer,
+    VirtualCollection,
+    ErrorBoundary,
+}
+
+/// A stable declarative UI node. Script-produced nodes contain no GPUI values
+/// or lifetimes; trusted Rust Hosts may attach opaque foreground callbacks.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UiNode {
+    kind: UiNodeKind,
+    key: Option<NodeKey>,
+    style: Style,
+    part_styles: BTreeMap<String, Style>,
+    source: Option<SourceLocation>,
+    component_root: Option<ComponentInstancePath>,
+    attributes: BTreeMap<String, UiValue>,
+    handlers: BTreeMap<String, Vec<UiEventBinding>>,
+    handler_payloads: BTreeMap<String, UiValue>,
+    motions: Vec<MotionSource>,
+    exit_motions: Vec<MotionSource>,
+    progress_motions: Vec<crate::MotionProgressBinding>,
+    timelines: Vec<crate::MotionTimeline>,
+    signal_bindings: BTreeMap<crate::SignalProperty, crate::NativeSignal>,
+    element_ref: Option<crate::ElementRef>,
+    presentation: Vec<NodePresentationMutation>,
+    component_snapshot: Option<ComponentOwnedSnapshotRef>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct ComponentOwnedSnapshot(Rc<RefCell<Option<Rc<UiNode>>>>);
+
+#[derive(Clone, Default)]
+pub(crate) struct ComponentOwnedSnapshotRef(Weak<RefCell<Option<Rc<UiNode>>>>);
+
+impl ComponentOwnedSnapshot {
+    pub(crate) fn reference(&self) -> ComponentOwnedSnapshotRef {
+        ComponentOwnedSnapshotRef(Rc::downgrade(&self.0))
+    }
+
+    pub(crate) fn current(&self) -> Option<Rc<UiNode>> {
+        self.0.borrow().clone()
+    }
+
+    pub(crate) fn restore(&self, snapshot: Option<Rc<UiNode>>) {
+        *self.0.borrow_mut() = snapshot;
+    }
+
+    pub(crate) fn update_if_active(&self, node: &UiNode) {
+        let mut snapshot = self.0.borrow_mut();
+        if snapshot.is_some() {
+            *snapshot = Some(Rc::new(node.clone()));
+        }
+    }
+
+    pub(crate) fn replace_if_active(&self, node: Rc<UiNode>) {
+        let mut snapshot = self.0.borrow_mut();
+        if snapshot.is_some() {
+            *snapshot = Some(node);
+        }
+    }
+}
+
+impl fmt::Debug for ComponentOwnedSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ComponentOwnedSnapshot")
+            .field("active", &self.0.borrow().is_some())
+            .finish()
+    }
+}
+
+impl ComponentOwnedSnapshotRef {
+    fn current(&self) -> Option<Rc<UiNode>> {
+        self.0.upgrade()?.borrow().clone()
+    }
+
+    fn activate(&self, node: &UiNode) {
+        let Some(snapshot) = self.0.upgrade() else {
+            return;
+        };
+        let mut snapshot = snapshot.borrow_mut();
+        if snapshot.is_none() {
+            *snapshot = Some(Rc::new(node.clone()));
+        }
+    }
+}
+
+impl fmt::Debug for ComponentOwnedSnapshotRef {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ComponentOwnedSnapshotRef")
+            .field("live", &(self.0.strong_count() > 0))
+            .finish()
+    }
+}
+
+impl PartialEq for ComponentOwnedSnapshotRef {
+    fn eq(&self, _: &Self) -> bool {
+        // Snapshot links are runtime ownership metadata. Effective node data
+        // and presentation mutations already participate in UiNode equality;
+        // comparing allocation identity would make equivalent full renders
+        // differ across transactions and engines.
+        true
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum NodePresentationMutation {
+    Key(NodeKey),
+    Style(Rc<Style>),
+    PartStyles(Rc<BTreeMap<String, Style>>),
+    Signal(crate::SignalProperty, crate::NativeSignal),
+    ElementRef(crate::ElementRef),
+    Attribute(String, UiValue),
+    Handler(String, UiEventBinding),
+    HandlerPayload(String, UiValue),
+    Motion(MotionSource),
+    ExitMotion(MotionSource),
+    ProgressMotion(crate::MotionProgressBinding),
+    Timeline(Box<crate::MotionTimeline>),
+    MotionGroup(String),
+}
+
+impl NodePresentationMutation {
+    fn apply(&self, node: &mut UiNode) {
+        match self {
+            Self::Key(key) => node.key = Some(key.clone()),
+            Self::Style(style) => node.style = std::mem::take(&mut node.style).merged(style),
+            Self::PartStyles(styles) => node.part_styles.extend(styles.as_ref().clone()),
+            Self::Signal(property, signal) => {
+                node.signal_bindings.insert(*property, signal.clone());
+            }
+            Self::ElementRef(reference) => node.element_ref = Some(reference.clone()),
+            Self::Attribute(name, value) => {
+                node.attributes.insert(name.clone(), value.clone());
+            }
+            Self::Handler(event, binding) => {
+                node.handlers
+                    .entry(event.clone())
+                    .or_default()
+                    .push(binding.clone());
+            }
+            Self::HandlerPayload(event, payload) => {
+                node.handler_payloads.insert(event.clone(), payload.clone());
+            }
+            Self::Motion(animation) => {
+                node.motions
+                    .retain(|existing| existing.property() != animation.property());
+                node.motions.push(animation.clone());
+            }
+            Self::ExitMotion(motion) => {
+                node.exit_motions
+                    .retain(|existing| existing.property() != motion.property());
+                node.exit_motions.push(motion.clone());
+            }
+            Self::ProgressMotion(binding) => {
+                node.progress_motions
+                    .retain(|existing| existing.property() != binding.property());
+                node.progress_motions.push(binding.clone());
+            }
+            Self::Timeline(timeline) => {
+                node.timelines
+                    .retain(|existing| existing.name != timeline.name);
+                node.timelines.push(timeline.as_ref().clone());
+            }
+            Self::MotionGroup(group) => apply_motion_group_contents(node, group),
+        }
+    }
+
+    fn bind_generation(&mut self, generation: ScriptGeneration) {
+        match self {
+            Self::Handler(_, binding) => {
+                if let Some(callback) = binding.handler_mut().as_script_mut() {
+                    callback.bind_generation(generation);
+                }
+            }
+            Self::Timeline(timeline) => timeline.bind_generation(generation),
+            _ => {}
+        }
+    }
+
+    fn bind_component_scope(
+        &mut self,
+        component: &ComponentInstancePath,
+        incarnation: crate::ComponentIncarnation,
+        events: &BTreeMap<String, crate::EventSchema>,
+        native_context: Option<&crate::invocation::ScriptInvocationContext>,
+    ) {
+        match self {
+            Self::Handler(_, binding) => {
+                if let Some(callback) = binding.handler_mut().as_script_mut() {
+                    callback.bind_component_scope_if_unset(component, incarnation, events.clone());
+                    if let Some(context) = native_context {
+                        callback.bind_native_context_if_unset(context.clone());
+                    }
+                }
+            }
+            Self::Timeline(timeline) => {
+                timeline.bind_component_scope(component, incarnation, events, native_context);
+            }
+            _ => {}
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ComponentSubtreeIndex {
+    addresses: BTreeMap<ComponentInstancePath, Vec<ComponentSubtreeStep>>,
+}
+
+#[derive(Clone, Debug)]
+enum ComponentSubtreeStep {
+    Child(usize),
+    CustomNode(String),
+    CustomNodes(String, usize),
+    OverlayTrigger,
+    OverlayContent,
+    LayerContent,
+    VirtualItem(usize),
+    ErrorChild,
+    ErrorFallback,
+}
+
+impl ComponentSubtreeIndex {
+    pub(crate) fn new(root: &UiNode) -> Self {
+        let mut index = Self {
+            addresses: BTreeMap::new(),
+        };
+        index.visit(root, &mut Vec::new());
+        index
+    }
+
+    pub(crate) fn get<'a>(
+        &self,
+        root: &'a UiNode,
+        component: &ComponentInstancePath,
+    ) -> Option<&'a UiNode> {
+        let mut node = root;
+        for step in self.addresses.get(component)? {
+            node = match (step, &node.kind) {
+                (
+                    ComponentSubtreeStep::Child(index),
+                    UiNodeKind::Box { children } | UiNodeKind::Fragment { children },
+                ) => children.get(*index)?,
+                (ComponentSubtreeStep::CustomNode(name), UiNodeKind::Custom { primitive }) => {
+                    match primitive.props.get(name.as_str())? {
+                        crate::PrimitiveValue::Node(node) => node,
+                        _ => return None,
+                    }
+                }
+                (
+                    ComponentSubtreeStep::CustomNodes(name, index),
+                    UiNodeKind::Custom { primitive },
+                ) => match primitive.props.get(name.as_str())? {
+                    crate::PrimitiveValue::Nodes(nodes) => nodes.get(*index)?,
+                    _ => return None,
+                },
+                (ComponentSubtreeStep::OverlayTrigger, UiNodeKind::Overlay { trigger, .. }) => {
+                    trigger
+                }
+                (ComponentSubtreeStep::OverlayContent, UiNodeKind::Overlay { content, .. }) => {
+                    content
+                }
+                (ComponentSubtreeStep::LayerContent, UiNodeKind::Layer { content, .. }) => content,
+                (
+                    ComponentSubtreeStep::VirtualItem(index),
+                    UiNodeKind::VirtualCollection { spec },
+                ) => spec.realized.get(index)?,
+                (ComponentSubtreeStep::ErrorChild, UiNodeKind::ErrorBoundary { child, .. }) => {
+                    child
+                }
+                (
+                    ComponentSubtreeStep::ErrorFallback,
+                    UiNodeKind::ErrorBoundary { fallback, .. },
+                ) => fallback,
+                _ => return None,
+            };
+        }
+        Some(node)
+    }
+
+    fn visit(&mut self, node: &UiNode, address: &mut Vec<ComponentSubtreeStep>) {
+        if let Some(component) = node.component_root() {
+            self.addresses.insert(component.clone(), address.clone());
+        }
+        match &node.kind {
+            UiNodeKind::Box { children } | UiNodeKind::Fragment { children } => {
+                for (index, child) in children.iter().enumerate() {
+                    address.push(ComponentSubtreeStep::Child(index));
+                    self.visit(child, address);
+                    address.pop();
+                }
+            }
+            UiNodeKind::Custom { primitive } => {
+                for (name, value) in primitive.props.iter() {
+                    match value {
+                        crate::PrimitiveValue::Node(node) => {
+                            address.push(ComponentSubtreeStep::CustomNode(name.to_string()));
+                            self.visit(node.as_ref(), address);
+                            address.pop();
+                        }
+                        crate::PrimitiveValue::Nodes(nodes) => {
+                            for (index, node) in nodes.iter().enumerate() {
+                                address.push(ComponentSubtreeStep::CustomNodes(
+                                    name.to_string(),
+                                    index,
+                                ));
+                                self.visit(node, address);
+                                address.pop();
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            UiNodeKind::Overlay {
+                trigger, content, ..
+            } => {
+                address.push(ComponentSubtreeStep::OverlayTrigger);
+                self.visit(trigger, address);
+                address.pop();
+                address.push(ComponentSubtreeStep::OverlayContent);
+                self.visit(content, address);
+                address.pop();
+            }
+            UiNodeKind::Layer { content, .. } => {
+                address.push(ComponentSubtreeStep::LayerContent);
+                self.visit(content, address);
+                address.pop();
+            }
+            UiNodeKind::VirtualCollection { spec } => {
+                for (index, node) in &spec.realized {
+                    address.push(ComponentSubtreeStep::VirtualItem(*index));
+                    self.visit(node, address);
+                    address.pop();
+                }
+            }
+            UiNodeKind::ErrorBoundary { child, fallback } => {
+                address.push(ComponentSubtreeStep::ErrorChild);
+                self.visit(child, address);
+                address.pop();
+                address.push(ComponentSubtreeStep::ErrorFallback);
+                self.visit(fallback, address);
+                address.pop();
+            }
+            UiNodeKind::Text { .. }
+            | UiNodeKind::RichText { .. }
+            | UiNodeKind::Canvas { .. }
+            | UiNodeKind::Svg { .. }
+            | UiNodeKind::Image { .. }
+            | UiNodeKind::DirectionalImage { .. } => {}
+        }
+    }
+}
+
+impl UiNode {
+    #[must_use]
+    pub fn text(text: impl Into<ImmutableString>) -> Self {
+        Self {
+            kind: UiNodeKind::Text { text: text.into() },
+            key: None,
+            style: Style::new(),
+            part_styles: BTreeMap::new(),
+            source: None,
+            component_root: None,
+            attributes: BTreeMap::new(),
+            handlers: BTreeMap::new(),
+            handler_payloads: BTreeMap::new(),
+            motions: Vec::new(),
+            exit_motions: Vec::new(),
+            progress_motions: Vec::new(),
+            timelines: Vec::new(),
+            signal_bindings: BTreeMap::new(),
+            element_ref: None,
+            presentation: Vec::new(),
+            component_snapshot: None,
+        }
+    }
+
+    #[must_use]
+    pub fn rich_text(spans: Vec<Span>) -> Self {
+        let text = spans.iter().map(Span::text).collect::<String>().into();
+        Self {
+            kind: UiNodeKind::RichText { text, spans },
+            key: None,
+            style: Style::new(),
+            part_styles: BTreeMap::new(),
+            source: None,
+            component_root: None,
+            attributes: BTreeMap::new(),
+            handlers: BTreeMap::new(),
+            handler_payloads: BTreeMap::new(),
+            motions: Vec::new(),
+            exit_motions: Vec::new(),
+            progress_motions: Vec::new(),
+            timelines: Vec::new(),
+            signal_bindings: BTreeMap::new(),
+            element_ref: None,
+            presentation: Vec::new(),
+            component_snapshot: None,
+        }
+    }
+
+    #[must_use]
+    pub fn canvas(scene: crate::CanvasScene) -> Self {
+        let mut node = Self::text("");
+        node.kind = UiNodeKind::Canvas { scene };
+        node
+    }
+
+    /// Construct a validated self-contained inline SVG atom.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::InlineSvgError`] for active, external, or oversized
+    /// markup.
+    pub fn svg(source: impl Into<String>) -> Result<Self, crate::InlineSvgError> {
+        let mut node = Self::text("");
+        node.kind = UiNodeKind::Svg {
+            source: crate::InlineSvg::new(source)?,
+        };
+        Ok(node)
+    }
+
+    #[must_use]
+    pub fn box_node(children: Vec<Self>) -> Self {
+        Self {
+            kind: UiNodeKind::Box { children },
+            key: None,
+            style: Style::new(),
+            part_styles: BTreeMap::new(),
+            source: None,
+            component_root: None,
+            attributes: BTreeMap::new(),
+            handlers: BTreeMap::new(),
+            handler_payloads: BTreeMap::new(),
+            motions: Vec::new(),
+            exit_motions: Vec::new(),
+            progress_motions: Vec::new(),
+            timelines: Vec::new(),
+            signal_bindings: BTreeMap::new(),
+            element_ref: None,
+            presentation: Vec::new(),
+            component_snapshot: None,
+        }
+    }
+
+    #[must_use]
+    pub fn fragment(children: Vec<Self>) -> Self {
+        let mut node = Self::box_node(children);
+        node.kind = match node.kind {
+            UiNodeKind::Box { children } => UiNodeKind::Fragment { children },
+            _ => unreachable!(),
+        };
+        node
+    }
+
+    #[must_use]
+    pub fn column(children: Vec<Self>) -> Self {
+        Self::box_node(children).with_style(&Style::new().flex_col())
+    }
+
+    #[must_use]
+    pub fn row(children: Vec<Self>) -> Self {
+        Self::box_node(children).with_style(&Style::new().flex_row())
+    }
+
+    #[must_use]
+    pub fn custom(primitive: PrimitiveNode) -> Self {
+        let key = primitive.key.as_ref().map(NodeKey::new);
+        Self {
+            kind: UiNodeKind::Custom { primitive },
+            key,
+            style: Style::new(),
+            part_styles: BTreeMap::new(),
+            source: None,
+            component_root: None,
+            attributes: BTreeMap::new(),
+            handlers: BTreeMap::new(),
+            handler_payloads: BTreeMap::new(),
+            motions: Vec::new(),
+            exit_motions: Vec::new(),
+            progress_motions: Vec::new(),
+            timelines: Vec::new(),
+            signal_bindings: BTreeMap::new(),
+            element_ref: None,
+            presentation: Vec::new(),
+            component_snapshot: None,
+        }
+    }
+
+    #[must_use]
+    pub fn error_boundary(child: Self, fallback: Self) -> Self {
+        Self {
+            kind: UiNodeKind::ErrorBoundary {
+                child: Box::new(child),
+                fallback: Box::new(fallback),
+            },
+            key: None,
+            style: Style::new(),
+            part_styles: BTreeMap::new(),
+            source: None,
+            component_root: None,
+            attributes: BTreeMap::new(),
+            handlers: BTreeMap::new(),
+            handler_payloads: BTreeMap::new(),
+            motions: Vec::new(),
+            exit_motions: Vec::new(),
+            progress_motions: Vec::new(),
+            timelines: Vec::new(),
+            signal_bindings: BTreeMap::new(),
+            element_ref: None,
+            presentation: Vec::new(),
+            component_snapshot: None,
+        }
+    }
+
+    #[must_use]
+    pub fn image(handle: OpaqueHandle) -> Self {
+        Self::image_source(ImageSourceSpec::Handle(handle))
+    }
+
+    #[must_use]
+    pub fn asset_image(asset: AssetId) -> Self {
+        Self::image_source(ImageSourceSpec::Asset(asset))
+    }
+
+    fn image_source(source: ImageSourceSpec) -> Self {
+        Self {
+            kind: UiNodeKind::Image { source },
+            key: None,
+            style: Style::new(),
+            part_styles: BTreeMap::new(),
+            source: None,
+            component_root: None,
+            attributes: BTreeMap::new(),
+            handlers: BTreeMap::new(),
+            handler_payloads: BTreeMap::new(),
+            motions: Vec::new(),
+            exit_motions: Vec::new(),
+            progress_motions: Vec::new(),
+            timelines: Vec::new(),
+            signal_bindings: BTreeMap::new(),
+            element_ref: None,
+            presentation: Vec::new(),
+            component_snapshot: None,
+        }
+    }
+
+    #[must_use]
+    pub fn directional_image(left_to_right: OpaqueHandle, right_to_left: OpaqueHandle) -> Self {
+        Self::directional_image_sources(
+            ImageSourceSpec::Handle(left_to_right),
+            ImageSourceSpec::Handle(right_to_left),
+        )
+    }
+
+    #[must_use]
+    pub fn directional_asset_image(left_to_right: AssetId, right_to_left: AssetId) -> Self {
+        Self::directional_image_sources(
+            ImageSourceSpec::Asset(left_to_right),
+            ImageSourceSpec::Asset(right_to_left),
+        )
+    }
+
+    fn directional_image_sources(
+        left_to_right: ImageSourceSpec,
+        right_to_left: ImageSourceSpec,
+    ) -> Self {
+        Self {
+            kind: UiNodeKind::DirectionalImage {
+                left_to_right,
+                right_to_left,
+            },
+            key: None,
+            style: Style::new(),
+            part_styles: BTreeMap::new(),
+            source: None,
+            component_root: None,
+            attributes: BTreeMap::new(),
+            handlers: BTreeMap::new(),
+            handler_payloads: BTreeMap::new(),
+            motions: Vec::new(),
+            exit_motions: Vec::new(),
+            progress_motions: Vec::new(),
+            timelines: Vec::new(),
+            signal_bindings: BTreeMap::new(),
+            element_ref: None,
+            presentation: Vec::new(),
+            component_snapshot: None,
+        }
+    }
+
+    #[must_use]
+    pub fn overlay(trigger: Self, content: Self, spec: OverlayNodeSpec) -> Self {
+        Self {
+            kind: UiNodeKind::Overlay {
+                trigger: Box::new(trigger),
+                content: Box::new(content),
+                spec,
+            },
+            key: None,
+            style: Style::new(),
+            part_styles: BTreeMap::new(),
+            source: None,
+            component_root: None,
+            attributes: BTreeMap::new(),
+            handlers: BTreeMap::new(),
+            handler_payloads: BTreeMap::new(),
+            motions: Vec::new(),
+            exit_motions: Vec::new(),
+            progress_motions: Vec::new(),
+            timelines: Vec::new(),
+            signal_bindings: BTreeMap::new(),
+            element_ref: None,
+            presentation: Vec::new(),
+            component_snapshot: None,
+        }
+    }
+
+    #[must_use]
+    pub fn layer(content: Self, spec: LayerNodeSpec) -> Self {
+        let key = spec.id.as_str().to_owned();
+        Self {
+            kind: UiNodeKind::Layer {
+                content: Box::new(content),
+                spec,
+            },
+            key: Some(NodeKey::new(key)),
+            style: Style::new(),
+            part_styles: BTreeMap::new(),
+            source: None,
+            component_root: None,
+            attributes: BTreeMap::new(),
+            handlers: BTreeMap::new(),
+            handler_payloads: BTreeMap::new(),
+            motions: Vec::new(),
+            exit_motions: Vec::new(),
+            progress_motions: Vec::new(),
+            timelines: Vec::new(),
+            signal_bindings: BTreeMap::new(),
+            element_ref: None,
+            presentation: Vec::new(),
+            component_snapshot: None,
+        }
+    }
+
+    #[must_use]
+    pub fn virtual_collection(spec: crate::VirtualCollectionNodeSpec) -> Self {
+        let key = spec.id.key.clone();
+        Self {
+            kind: UiNodeKind::VirtualCollection { spec },
+            key: Some(NodeKey::new(key)),
+            style: Style::new(),
+            part_styles: BTreeMap::new(),
+            source: None,
+            component_root: None,
+            attributes: BTreeMap::new(),
+            handlers: BTreeMap::new(),
+            handler_payloads: BTreeMap::new(),
+            motions: Vec::new(),
+            exit_motions: Vec::new(),
+            progress_motions: Vec::new(),
+            timelines: Vec::new(),
+            signal_bindings: BTreeMap::new(),
+            element_ref: None,
+            presentation: Vec::new(),
+            component_snapshot: None,
+        }
+    }
+
+    fn apply_presentation_mutation(&mut self, mutation: NodePresentationMutation) {
+        if self.component_root.is_some()
+            && let Some(snapshot) = self.component_snapshot.clone()
+        {
+            snapshot.activate(self);
+        }
+        mutation.apply(self);
+        if self.component_root.is_some() {
+            self.presentation.push(mutation);
+        }
+    }
+
+    fn restore_presentation(&mut self, presentation: Vec<NodePresentationMutation>) {
+        for mutation in &presentation {
+            mutation.apply(self);
+        }
+        self.presentation.extend(presentation);
+    }
+
+    #[must_use]
+    pub fn with_key(mut self, key: impl Into<ImmutableString>) -> Self {
+        self.apply_presentation_mutation(NodePresentationMutation::Key(NodeKey::new(key)));
+        self
+    }
+
+    #[must_use]
+    pub fn with_style(mut self, style: &Style) -> Self {
+        self.apply_presentation_mutation(NodePresentationMutation::Style(Rc::new(style.clone())));
+        self
+    }
+
+    /// Bind one approved hot property to a component-scoped native signal.
+    ///
+    /// # Errors
+    ///
+    /// Returns a property/type mismatch without changing the node.
+    pub fn with_signal_binding(
+        mut self,
+        property: crate::SignalProperty,
+        signal: crate::NativeSignal,
+    ) -> Result<Self, crate::SignalError> {
+        let expected = property.signal_kind();
+        let actual = signal.id().kind();
+        if expected != actual {
+            return Err(crate::SignalError::InvalidBinding {
+                property,
+                expected,
+                actual,
+            });
+        }
+        self.apply_presentation_mutation(NodePresentationMutation::Signal(property, signal));
+        Ok(self)
+    }
+
+    #[must_use]
+    pub fn with_element_ref(mut self, reference: crate::ElementRef) -> Self {
+        self.apply_presentation_mutation(NodePresentationMutation::ElementRef(reference));
+        self
+    }
+
+    #[must_use]
+    pub fn with_scrollbars(mut self, spec: crate::ScrollbarSpec) -> Self {
+        self.apply_presentation_mutation(NodePresentationMutation::Attribute(
+            "scrollbar_horizontal".to_owned(),
+            UiValue::String(spec.horizontal().as_str().to_owned()),
+        ));
+        self.apply_presentation_mutation(NodePresentationMutation::Attribute(
+            "scrollbar_vertical".to_owned(),
+            UiValue::String(spec.vertical().as_str().to_owned()),
+        ));
+        self
+    }
+
+    #[must_use]
+    pub fn with_part_styles(mut self, styles: BTreeMap<String, Style>) -> Self {
+        self.apply_presentation_mutation(NodePresentationMutation::PartStyles(Rc::new(styles)));
+        self
+    }
+
+    pub(crate) fn with_owned_part_styles(mut self, styles: BTreeMap<String, Style>) -> Self {
+        self.part_styles.extend(styles);
+        self
+    }
+
+    #[must_use]
+    pub fn with_part_style(mut self, part: impl Into<String>, style: Style) -> Self {
+        self.apply_presentation_mutation(NodePresentationMutation::PartStyles(Rc::new(
+            BTreeMap::from([(part.into(), style)]),
+        )));
+        self
+    }
+
+    #[must_use]
+    pub fn with_source(mut self, source: SourceLocation) -> Self {
+        self.source = Some(source);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_component_root(mut self, component: ComponentInstancePath) -> Self {
+        self.component_root = Some(component);
+        self.presentation.clear();
+        self.component_snapshot = None;
+        self
+    }
+
+    pub(crate) fn with_component_root_snapshot(
+        mut self,
+        component: ComponentInstancePath,
+        snapshot: ComponentOwnedSnapshotRef,
+    ) -> Self {
+        self.component_root = Some(component);
+        self.presentation.clear();
+        self.component_snapshot = Some(snapshot);
+        self
+    }
+
+    #[must_use]
+    pub fn component_root(&self) -> Option<&ComponentInstancePath> {
+        self.component_root.as_ref()
+    }
+
+    pub(crate) fn replace_component_subtree(
+        &mut self,
+        component: &ComponentInstancePath,
+        replacement: Self,
+    ) -> bool {
+        if self.component_root.as_ref() == Some(component) {
+            let presentation = std::mem::take(&mut self.presentation);
+            *self = replacement;
+            self.restore_presentation(presentation);
+            return true;
+        }
+        match &mut self.kind {
+            UiNodeKind::Box { children } | UiNodeKind::Fragment { children } => {
+                replace_in_nodes(children.iter_mut(), component, &replacement)
+            }
+            UiNodeKind::Custom { primitive } => {
+                for (_, value) in primitive.props.iter_mut() {
+                    match value {
+                        crate::PrimitiveValue::Node(node) => {
+                            if node.replace_component_subtree(component, replacement.clone()) {
+                                return true;
+                            }
+                        }
+                        crate::PrimitiveValue::Nodes(nodes) => {
+                            if replace_in_nodes(nodes.iter_mut(), component, &replacement) {
+                                return true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                false
+            }
+            UiNodeKind::Overlay {
+                trigger, content, ..
+            }
+            | UiNodeKind::ErrorBoundary {
+                child: trigger,
+                fallback: content,
+            } => {
+                trigger.replace_component_subtree(component, replacement.clone())
+                    || content.replace_component_subtree(component, replacement)
+            }
+            UiNodeKind::Layer { content, .. } => {
+                content.replace_component_subtree(component, replacement)
+            }
+            UiNodeKind::VirtualCollection { spec } => {
+                replace_in_nodes(spec.realized.values_mut(), component, &replacement)
+            }
+            UiNodeKind::Text { .. }
+            | UiNodeKind::RichText { .. }
+            | UiNodeKind::Canvas { .. }
+            | UiNodeKind::Svg { .. }
+            | UiNodeKind::Image { .. }
+            | UiNodeKind::DirectionalImage { .. } => false,
+        }
+    }
+
+    pub(crate) fn activate_component_snapshots(&mut self) {
+        if self.component_root.is_some()
+            && let Some(snapshot) = self.component_snapshot.clone()
+        {
+            snapshot.activate(self);
+        }
+        self.visit_component_children_mut(Self::activate_component_snapshots);
+    }
+
+    pub(crate) fn hydrate_component_subtrees(&mut self) {
+        if let Some(current) = self
+            .component_snapshot
+            .as_ref()
+            .and_then(ComponentOwnedSnapshotRef::current)
+        {
+            let presentation = std::mem::take(&mut self.presentation);
+            *self = current.as_ref().clone();
+            self.restore_presentation(presentation);
+        }
+        self.visit_component_children_mut(Self::hydrate_component_subtrees);
+    }
+
+    fn visit_component_children_mut(&mut self, mut visit: impl FnMut(&mut Self)) {
+        match &mut self.kind {
+            UiNodeKind::Box { children } | UiNodeKind::Fragment { children } => {
+                for child in children {
+                    visit(child);
+                }
+            }
+            UiNodeKind::Custom { primitive } => {
+                for (_, value) in primitive.props.iter_mut() {
+                    match value {
+                        crate::PrimitiveValue::Node(node) => {
+                            visit(node);
+                        }
+                        crate::PrimitiveValue::Nodes(nodes) => {
+                            for node in nodes {
+                                visit(node);
+                            }
+                        }
+                        crate::PrimitiveValue::Data(_)
+                        | crate::PrimitiveValue::Callback(_)
+                        | crate::PrimitiveValue::Style(_)
+                        | crate::PrimitiveValue::Length(_)
+                        | crate::PrimitiveValue::Asset(_)
+                        | crate::PrimitiveValue::Signal(_)
+                        | crate::PrimitiveValue::Ref(_)
+                        | crate::PrimitiveValue::Document(_) => {}
+                        #[cfg(feature = "charts")]
+                        crate::PrimitiveValue::ChartData(_) => {}
+                    }
+                }
+            }
+            UiNodeKind::Overlay {
+                trigger, content, ..
+            } => {
+                visit(trigger);
+                visit(content);
+            }
+            UiNodeKind::Layer { content, .. } => {
+                visit(content);
+            }
+            UiNodeKind::VirtualCollection { spec } => {
+                for item in spec.realized.values_mut() {
+                    visit(item);
+                }
+            }
+            UiNodeKind::ErrorBoundary { child, fallback } => {
+                visit(child);
+                visit(fallback);
+            }
+            UiNodeKind::Text { .. }
+            | UiNodeKind::RichText { .. }
+            | UiNodeKind::Canvas { .. }
+            | UiNodeKind::Svg { .. }
+            | UiNodeKind::Image { .. }
+            | UiNodeKind::DirectionalImage { .. } => {}
+        }
+    }
+
+    pub(crate) fn virtual_collection_items(
+        &self,
+        id: &crate::VirtualCollectionId,
+    ) -> Option<&BTreeMap<usize, UiNode>> {
+        self.virtual_collection_spec(id).map(|spec| &spec.realized)
+    }
+
+    pub(crate) fn virtual_collection_spec(
+        &self,
+        id: &crate::VirtualCollectionId,
+    ) -> Option<&crate::VirtualCollectionNodeSpec> {
+        match &self.kind {
+            UiNodeKind::VirtualCollection { spec } if &spec.id == id => Some(spec),
+            UiNodeKind::Box { children } | UiNodeKind::Fragment { children } => children
+                .iter()
+                .find_map(|child| child.virtual_collection_spec(id)),
+            UiNodeKind::Overlay {
+                trigger, content, ..
+            }
+            | UiNodeKind::ErrorBoundary {
+                child: trigger,
+                fallback: content,
+            } => trigger
+                .virtual_collection_spec(id)
+                .or_else(|| content.virtual_collection_spec(id)),
+            UiNodeKind::Layer { content, .. } => content.virtual_collection_spec(id),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn replace_virtual_collection_items(
+        &mut self,
+        id: &crate::VirtualCollectionId,
+        items: BTreeMap<usize, UiNode>,
+    ) -> bool {
+        match &mut self.kind {
+            UiNodeKind::VirtualCollection { spec } if &spec.id == id => {
+                spec.realized = items;
+                true
+            }
+            UiNodeKind::Box { children } | UiNodeKind::Fragment { children } => children
+                .iter_mut()
+                .any(|child| child.replace_virtual_collection_items(id, items.clone())),
+            UiNodeKind::Overlay {
+                trigger, content, ..
+            }
+            | UiNodeKind::ErrorBoundary {
+                child: trigger,
+                fallback: content,
+            } => {
+                trigger.replace_virtual_collection_items(id, items.clone())
+                    || content.replace_virtual_collection_items(id, items)
+            }
+            UiNodeKind::Layer { content, .. } => {
+                content.replace_virtual_collection_items(id, items)
+            }
+            _ => false,
+        }
+    }
+
+    #[must_use]
+    pub fn with_attribute(mut self, name: impl Into<String>, value: UiValue) -> Self {
+        self.apply_presentation_mutation(NodePresentationMutation::Attribute(name.into(), value));
+        self
+    }
+
+    #[must_use]
+    pub fn with_handler(
+        mut self,
+        event: impl Into<String>,
+        handler: impl Into<UiEventHandler>,
+    ) -> Self {
+        self.apply_presentation_mutation(NodePresentationMutation::Handler(
+            event.into(),
+            UiEventBinding::new(crate::EventPhase::Target, handler),
+        ));
+        self
+    }
+
+    #[must_use]
+    pub fn with_handler_phase(
+        mut self,
+        event: impl Into<String>,
+        phase: crate::EventPhase,
+        handler: impl Into<UiEventHandler>,
+    ) -> Self {
+        self.apply_presentation_mutation(NodePresentationMutation::Handler(
+            event.into(),
+            UiEventBinding::new(phase, handler),
+        ));
+        self
+    }
+
+    #[must_use]
+    pub fn with_host_handler(self, event: impl Into<String>, callback: HostCallback) -> Self {
+        self.with_handler(event, UiEventHandler::Host(callback))
+    }
+
+    #[must_use]
+    pub fn with_handler_payload(mut self, event: impl Into<String>, payload: UiValue) -> Self {
+        self.apply_presentation_mutation(NodePresentationMutation::HandlerPayload(
+            event.into(),
+            payload,
+        ));
+        self
+    }
+
+    #[must_use]
+    pub fn with_motion(mut self, animation: MotionSource) -> Self {
+        self.apply_presentation_mutation(NodePresentationMutation::Motion(animation));
+        self
+    }
+
+    #[must_use]
+    pub fn with_exit_motion(mut self, motion: MotionSource) -> Self {
+        self.apply_presentation_mutation(NodePresentationMutation::ExitMotion(motion));
+        self
+    }
+
+    #[must_use]
+    pub fn with_progress_motion(mut self, binding: crate::MotionProgressBinding) -> Self {
+        self.apply_presentation_mutation(NodePresentationMutation::ProgressMotion(binding));
+        self
+    }
+
+    #[must_use]
+    pub fn with_motion_replay_key(mut self, key: impl Into<String>) -> Self {
+        self.apply_presentation_mutation(NodePresentationMutation::Attribute(
+            "motion_replay_key".to_owned(),
+            UiValue::String(key.into()),
+        ));
+        self
+    }
+
+    #[must_use]
+    pub fn with_motion_particle_count(mut self, count: usize) -> Self {
+        self.apply_presentation_mutation(NodePresentationMutation::Attribute(
+            "motion_particle_count".to_owned(),
+            UiValue::Integer(INT::try_from(count).unwrap_or(INT::MAX)),
+        ));
+        self
+    }
+
+    #[must_use]
+    pub fn with_timeline(mut self, timeline: crate::MotionTimeline) -> Self {
+        self.apply_presentation_mutation(NodePresentationMutation::Timeline(Box::new(timeline)));
+        self
+    }
+
+    /// Opt this node into committed-geometry layout motion.
+    #[must_use]
+    pub fn with_layout_motion(mut self, duration_ms: u64, easing: crate::MotionEasing) -> Self {
+        self.apply_presentation_mutation(NodePresentationMutation::Attribute(
+            "layout_motion_duration_ms".to_owned(),
+            UiValue::Integer(INT::try_from(duration_ms).unwrap_or(INT::MAX)),
+        ));
+        self.apply_presentation_mutation(NodePresentationMutation::Attribute(
+            "layout_motion_easing".to_owned(),
+            UiValue::String(easing.as_str().to_owned()),
+        ));
+        self
+    }
+
+    /// Assign a same-window shared-layout identity to this real node.
+    #[must_use]
+    pub fn with_shared_layout(mut self, group: impl Into<String>, id: impl Into<String>) -> Self {
+        self.apply_presentation_mutation(NodePresentationMutation::Attribute(
+            "shared_layout_group".to_owned(),
+            UiValue::String(group.into()),
+        ));
+        self.apply_presentation_mutation(NodePresentationMutation::Attribute(
+            "shared_layout_id".to_owned(),
+            UiValue::String(id.into()),
+        ));
+        self
+    }
+
+    #[must_use]
+    pub fn with_shared_layout_id(mut self, id: impl Into<String>) -> Self {
+        self.apply_presentation_mutation(NodePresentationMutation::Attribute(
+            "shared_layout_id".to_owned(),
+            UiValue::String(id.into()),
+        ));
+        self
+    }
+
+    #[must_use]
+    pub fn handlers(&self) -> &BTreeMap<String, Vec<UiEventBinding>> {
+        &self.handlers
+    }
+
+    #[must_use]
+    pub fn handler(&self, event: &str) -> Option<&UiEventHandler> {
+        self.handlers
+            .get(event)?
+            .iter()
+            .find(|binding| binding.phase() == crate::EventPhase::Target)
+            .map(UiEventBinding::handler)
+    }
+
+    #[must_use]
+    pub fn event_handlers(&self, event: &str) -> &[UiEventBinding] {
+        self.handlers.get(event).map_or(&[], Vec::as_slice)
+    }
+
+    #[must_use]
+    pub fn handler_payload(&self, event: &str) -> Option<&UiValue> {
+        self.handler_payloads.get(event)
+    }
+
+    #[must_use]
+    pub(crate) const fn handler_payloads(&self) -> &BTreeMap<String, UiValue> {
+        &self.handler_payloads
+    }
+
+    #[must_use]
+    pub fn motions(&self) -> &[MotionSource] {
+        &self.motions
+    }
+
+    #[must_use]
+    pub fn exit_motions(&self) -> &[MotionSource] {
+        &self.exit_motions
+    }
+
+    #[must_use]
+    pub fn progress_motions(&self) -> &[crate::MotionProgressBinding] {
+        &self.progress_motions
+    }
+
+    pub(crate) fn motion_ghost(&self) -> Option<Self> {
+        self.motion_ghost_node(true)
+    }
+
+    fn motion_ghost_node(&self, root: bool) -> Option<Self> {
+        let mut ghost = self.clone();
+        ghost.handlers.clear();
+        ghost.handler_payloads.clear();
+        ghost.signal_bindings.clear();
+        ghost.element_ref = None;
+        ghost.component_root = None;
+        ghost.component_snapshot = None;
+        ghost.presentation.clear();
+        ghost.motions.clear();
+        ghost.exit_motions.clear();
+        ghost.progress_motions.clear();
+        ghost.timelines.clear();
+        ghost.attributes.clear();
+        ghost
+            .attributes
+            .insert("motion_ghost".to_owned(), UiValue::Bool(true));
+        ghost.style.base.hit_test = None;
+        ghost.style.base.cursor = None;
+        if root {
+            ghost.style.base.margin = crate::LayoutEdgeLengths::default();
+            ghost.style.base.position = None;
+            ghost.style.base.top = None;
+            ghost.style.base.right = None;
+            ghost.style.base.bottom = None;
+            ghost.style.base.left = None;
+            ghost.style.base.translate_x = None;
+            ghost.style.base.translate_y = None;
+            ghost.style.base.align_self = None;
+            ghost.style.base.flex_grow = None;
+            ghost.style.base.flex_grow_weight = None;
+            ghost.style.base.flex_shrink = None;
+            ghost.style.base.flex_basis = None;
+        }
+        match &mut ghost.kind {
+            UiNodeKind::Box { children } | UiNodeKind::Fragment { children } => {
+                *children = children
+                    .iter()
+                    .map(|child| child.motion_ghost_node(false))
+                    .collect::<Option<Vec<_>>>()?;
+            }
+            UiNodeKind::Text { .. }
+            | UiNodeKind::RichText { .. }
+            | UiNodeKind::Canvas { .. }
+            | UiNodeKind::Svg { .. }
+            | UiNodeKind::Image { .. }
+            | UiNodeKind::DirectionalImage { .. } => {}
+            UiNodeKind::Custom { .. }
+            | UiNodeKind::Overlay { .. }
+            | UiNodeKind::Layer { .. }
+            | UiNodeKind::VirtualCollection { .. }
+            | UiNodeKind::ErrorBoundary { .. } => return None,
+        }
+        Some(ghost)
+    }
+
+    #[must_use]
+    pub fn timelines(&self) -> &[crate::MotionTimeline] {
+        &self.timelines
+    }
+
+    pub(crate) fn bind_generation(&mut self, generation: ScriptGeneration) {
+        for bindings in self.handlers.values_mut() {
+            for binding in bindings {
+                if let Some(callback) = binding.handler_mut().as_script_mut() {
+                    callback.bind_generation(generation);
+                }
+            }
+        }
+        for timeline in &mut self.timelines {
+            timeline.bind_generation(generation);
+        }
+        for mutation in &mut self.presentation {
+            mutation.bind_generation(generation);
+        }
+        match &mut self.kind {
+            UiNodeKind::Box { children } | UiNodeKind::Fragment { children } => {
+                for child in children {
+                    child.bind_generation(generation);
+                }
+            }
+            UiNodeKind::ErrorBoundary { child, fallback } => {
+                child.bind_generation(generation);
+                fallback.bind_generation(generation);
+            }
+            UiNodeKind::Overlay {
+                trigger, content, ..
+            } => {
+                trigger.bind_generation(generation);
+                content.bind_generation(generation);
+            }
+            UiNodeKind::Layer { content, .. } => content.bind_generation(generation),
+            UiNodeKind::Text { .. }
+            | UiNodeKind::RichText { .. }
+            | UiNodeKind::Canvas { .. }
+            | UiNodeKind::Svg { .. }
+            | UiNodeKind::Custom { .. }
+            | UiNodeKind::Image { .. }
+            | UiNodeKind::DirectionalImage { .. } => {}
+            UiNodeKind::VirtualCollection { spec } => {
+                for item in spec.realized.values_mut() {
+                    item.bind_generation(generation);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn bind_component_scope(
+        &mut self,
+        component: &crate::ComponentInstancePath,
+        incarnation: crate::ComponentIncarnation,
+        events: &BTreeMap<String, crate::EventSchema>,
+        native_context: Option<&crate::invocation::ScriptInvocationContext>,
+    ) {
+        for bindings in self.handlers.values_mut() {
+            for binding in bindings {
+                if let Some(callback) = binding.handler_mut().as_script_mut() {
+                    callback.bind_component_scope_if_unset(component, incarnation, events.clone());
+                    if let Some(context) = native_context {
+                        callback.bind_native_context_if_unset(context.clone());
+                    }
+                }
+            }
+        }
+        for timeline in &mut self.timelines {
+            timeline.bind_component_scope(component, incarnation, events, native_context);
+        }
+        for mutation in &mut self.presentation {
+            mutation.bind_component_scope(component, incarnation, events, native_context);
+        }
+        match &mut self.kind {
+            UiNodeKind::Box { children } | UiNodeKind::Fragment { children } => {
+                for child in children {
+                    child.bind_component_scope(component, incarnation, events, native_context);
+                }
+            }
+            UiNodeKind::Custom { primitive } => {
+                primitive.props.bind_component_scope(
+                    component,
+                    incarnation,
+                    events,
+                    native_context,
+                );
+            }
+            UiNodeKind::ErrorBoundary { child, fallback } => {
+                child.bind_component_scope(component, incarnation, events, native_context);
+                fallback.bind_component_scope(component, incarnation, events, native_context);
+            }
+            UiNodeKind::Overlay {
+                trigger, content, ..
+            } => {
+                trigger.bind_component_scope(component, incarnation, events, native_context);
+                content.bind_component_scope(component, incarnation, events, native_context);
+            }
+            UiNodeKind::Layer { content, .. } => {
+                content.bind_component_scope(component, incarnation, events, native_context);
+            }
+            UiNodeKind::VirtualCollection { spec } => {
+                for item in spec.realized.values_mut() {
+                    item.bind_component_scope(component, incarnation, events, native_context);
+                }
+            }
+            UiNodeKind::Text { .. }
+            | UiNodeKind::RichText { .. }
+            | UiNodeKind::Canvas { .. }
+            | UiNodeKind::Svg { .. }
+            | UiNodeKind::Image { .. }
+            | UiNodeKind::DirectionalImage { .. } => {}
+        }
+    }
+
+    #[must_use]
+    pub fn kind(&self) -> &UiNodeKind {
+        &self.kind
+    }
+
+    #[must_use]
+    pub const fn kind_tag(&self) -> UiNodeKindTag {
+        match self.kind {
+            UiNodeKind::Text { .. } | UiNodeKind::RichText { .. } => UiNodeKindTag::Text,
+            UiNodeKind::Canvas { .. } => UiNodeKindTag::Canvas,
+            UiNodeKind::Svg { .. } => UiNodeKindTag::Svg,
+            UiNodeKind::Box { .. } => UiNodeKindTag::Box,
+            UiNodeKind::Fragment { .. } => UiNodeKindTag::Fragment,
+            UiNodeKind::Custom { .. } => UiNodeKindTag::Custom,
+            UiNodeKind::Image { .. } => UiNodeKindTag::Image,
+            UiNodeKind::DirectionalImage { .. } => UiNodeKindTag::DirectionalImage,
+            UiNodeKind::Overlay { .. } => UiNodeKindTag::Overlay,
+            UiNodeKind::Layer { .. } => UiNodeKindTag::Layer,
+            UiNodeKind::VirtualCollection { .. } => UiNodeKindTag::VirtualCollection,
+            UiNodeKind::ErrorBoundary { .. } => UiNodeKindTag::ErrorBoundary,
+        }
+    }
+
+    pub(crate) fn retained_child_groups(&self) -> Vec<(String, Vec<&Self>)> {
+        match &self.kind {
+            UiNodeKind::Box { children } | UiNodeKind::Fragment { children } => {
+                vec![("children".to_owned(), children.iter().collect())]
+            }
+            UiNodeKind::Custom { primitive } => primitive
+                .props
+                .iter()
+                .filter_map(|(name, value)| match value {
+                    crate::PrimitiveValue::Node(node) => {
+                        Some((format!("prop:{name}"), vec![node.as_ref()]))
+                    }
+                    crate::PrimitiveValue::Nodes(nodes) => {
+                        Some((format!("prop:{name}"), nodes.iter().collect::<Vec<_>>()))
+                    }
+                    crate::PrimitiveValue::Data(_)
+                    | crate::PrimitiveValue::Callback(_)
+                    | crate::PrimitiveValue::Style(_)
+                    | crate::PrimitiveValue::Length(_)
+                    | crate::PrimitiveValue::Asset(_)
+                    | crate::PrimitiveValue::Signal(_)
+                    | crate::PrimitiveValue::Ref(_)
+                    | crate::PrimitiveValue::Document(_) => None,
+                    #[cfg(feature = "charts")]
+                    crate::PrimitiveValue::ChartData(_) => None,
+                })
+                .collect(),
+            UiNodeKind::Overlay {
+                trigger, content, ..
+            } => vec![
+                ("trigger".to_owned(), vec![trigger.as_ref()]),
+                ("content".to_owned(), vec![content.as_ref()]),
+            ],
+            UiNodeKind::Layer { content, .. } => {
+                vec![("content".to_owned(), vec![content.as_ref()])]
+            }
+            UiNodeKind::VirtualCollection { spec } => {
+                vec![("items".to_owned(), spec.realized.values().collect())]
+            }
+            UiNodeKind::ErrorBoundary { child, fallback } => vec![
+                ("child".to_owned(), vec![child.as_ref()]),
+                ("fallback".to_owned(), vec![fallback.as_ref()]),
+            ],
+            UiNodeKind::Text { .. }
+            | UiNodeKind::RichText { .. }
+            | UiNodeKind::Canvas { .. }
+            | UiNodeKind::Svg { .. }
+            | UiNodeKind::Image { .. }
+            | UiNodeKind::DirectionalImage { .. } => Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn key(&self) -> Option<&NodeKey> {
+        self.key.as_ref()
+    }
+
+    #[must_use]
+    pub fn style(&self) -> &Style {
+        &self.style
+    }
+
+    #[must_use]
+    pub fn part_style(&self, part: &str) -> Option<&Style> {
+        self.part_styles.get(part)
+    }
+
+    pub fn part_styles(&self) -> impl Iterator<Item = (&str, &Style)> {
+        self.part_styles
+            .iter()
+            .map(|(name, style)| (name.as_str(), style))
+    }
+
+    #[must_use]
+    pub fn source(&self) -> Option<&SourceLocation> {
+        self.source.as_ref()
+    }
+
+    #[must_use]
+    pub fn attributes(&self) -> &BTreeMap<String, UiValue> {
+        &self.attributes
+    }
+
+    pub fn signal_bindings(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (crate::SignalProperty, &crate::NativeSignal)> {
+        self.signal_bindings
+            .iter()
+            .map(|(property, signal)| (*property, signal))
+    }
+
+    #[must_use]
+    pub const fn element_ref(&self) -> Option<&crate::ElementRef> {
+        self.element_ref.as_ref()
+    }
+}
+
+fn replace_in_nodes<'a>(
+    nodes: impl IntoIterator<Item = &'a mut UiNode>,
+    component: &ComponentInstancePath,
+    replacement: &UiNode,
+) -> bool {
+    for node in nodes {
+        if node.replace_component_subtree(component, replacement.clone()) {
+            return true;
+        }
+    }
+    false
+}
+
+impl CustomType for UiNode {
+    fn build(mut builder: TypeBuilder<Self>) {
+        builder
+            .with_name("UiNode")
+            .with_fn("with_key", |node: &mut Self, key: ImmutableString| {
+                node.clone().with_key(key)
+            })
+            .with_fn("with_style", |node: &mut Self, style: Style| {
+                node.clone().with_style(&style)
+            })
+            .with_fn(
+                "bind_signal",
+                |node: &mut Self,
+                 property: ImmutableString,
+                 signal: crate::NativeSignal|
+                 -> Result<Self, Box<EvalAltResult>> {
+                    let property = crate::SignalProperty::parse(property.as_str())
+                        .map_err(|error| Box::new(crate::signal::signal_runtime_error(&error)))?;
+                    node.clone()
+                        .with_signal_binding(property, signal)
+                        .map_err(|error| Box::new(crate::signal::signal_runtime_error(&error)))
+                },
+            )
+            .with_fn(
+                "bind_parent_signal",
+                |node: &mut Self,
+                 context: crate::UiContext,
+                 property: ImmutableString,
+                 key: ImmutableString|
+                 -> Result<Self, Box<EvalAltResult>> {
+                    let property = crate::SignalProperty::parse(property.as_str())
+                        .map_err(|error| Box::new(crate::signal::signal_runtime_error(&error)))?;
+                    if property.signal_kind() != crate::SignalKind::OptionalFloat {
+                        return Err(Box::new(crate::signal::signal_runtime_error(
+                            &"parent signal binding currently supports optional-float properties",
+                        )));
+                    }
+                    let signal = context
+                        .parent_optional_float_signal_ref(key.as_str())
+                        .map_err(|error| Box::new(crate::signal::signal_runtime_error(&error)))?;
+                    node.clone()
+                        .with_signal_binding(property, signal)
+                        .map_err(|error| Box::new(crate::signal::signal_runtime_error(&error)))
+                },
+            )
+            .with_fn(
+                "with_ref",
+                |node: &mut Self, reference: crate::ElementRef| {
+                    node.clone().with_element_ref(reference)
+                },
+            )
+            .with_fn(
+                "with_part_style",
+                |node: &mut Self, part: ImmutableString, style: Style| {
+                    node.clone().with_part_style(part.to_string(), style)
+                },
+            );
+        register_value_event_methods(&mut builder);
+        register_raw_event_methods(&mut builder);
+        register_semantic_event_methods(&mut builder);
+        register_node_behavior_methods(&mut builder);
+        register_accessibility_methods(&mut builder);
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn register_node_behavior_methods(builder: &mut TypeBuilder<UiNode>) {
+    builder
+        .with_fn("motion", |node: &mut UiNode, animation: MotionSource| {
+            node.clone().with_motion(animation)
+        })
+        .with_fn("enter_motion", |node: &mut UiNode, motion: MotionSource| {
+            node.clone().with_motion(motion)
+        })
+        .with_fn("exit_motion", |node: &mut UiNode, motion: MotionSource| {
+            node.clone().with_exit_motion(motion)
+        })
+        .with_fn(
+            "progress_motion",
+            |node: &mut UiNode, binding: crate::MotionProgressBinding| {
+                node.clone().with_progress_motion(binding)
+            },
+        )
+        .with_fn(
+            "motion_replay_key",
+            |node: &mut UiNode, key: ImmutableString| {
+                node.clone().with_motion_replay_key(key.to_string())
+            },
+        )
+        .with_fn(
+            "motion_particle_count",
+            |node: &mut UiNode, count: INT| -> Result<UiNode, Box<EvalAltResult>> {
+                let count = usize::try_from(count).map_err(|_| {
+                    Box::new(EvalAltResult::ErrorRuntime(
+                        "motion particle count must be non-negative".into(),
+                        Position::NONE,
+                    ))
+                })?;
+                Ok(node.clone().with_motion_particle_count(count))
+            },
+        )
+        .with_fn(
+            "timeline",
+            |node: &mut UiNode, timeline: crate::MotionTimeline| {
+                node.clone().with_timeline(timeline)
+            },
+        )
+        .with_fn(
+            "layout_motion",
+            |node: &mut UiNode,
+             duration_ms: INT,
+             easing: ImmutableString|
+             -> Result<UiNode, Box<EvalAltResult>> {
+                let duration_ms = u64::try_from(duration_ms).map_err(|_| {
+                    Box::new(EvalAltResult::ErrorRuntime(
+                        "layout motion duration must be non-negative".into(),
+                        Position::NONE,
+                    ))
+                })?;
+                let easing = crate::MotionEasing::parse(easing.as_str()).map_err(|error| {
+                    Box::new(EvalAltResult::ErrorRuntime(
+                        error.to_string().into(),
+                        Position::NONE,
+                    ))
+                })?;
+                Ok(node.clone().with_layout_motion(duration_ms, easing))
+            },
+        )
+        .with_fn(
+            "shared_layout",
+            |node: &mut UiNode, group: ImmutableString, id: ImmutableString| {
+                node.clone()
+                    .with_shared_layout(group.to_string(), id.to_string())
+            },
+        )
+        .with_fn("shared_layout", |node: &mut UiNode, id: ImmutableString| {
+            node.clone().with_shared_layout_id(id.to_string())
+        })
+        .with_fn("disabled", |node: &mut UiNode, disabled: bool| {
+            node.clone()
+                .with_attribute("disabled", UiValue::Bool(disabled))
+        })
+        .with_fn("tab_stop", |node: &mut UiNode, tab_stop: bool| {
+            node.clone()
+                .with_attribute("tab_stop", UiValue::Bool(tab_stop))
+        })
+        .with_fn(
+            "selectable",
+            |node: &mut UiNode, selectable: bool| -> Result<UiNode, Box<EvalAltResult>> {
+                if selectable && !matches!(node.kind(), UiNodeKind::Text { .. }) {
+                    return Err(Box::new(EvalAltResult::ErrorRuntime(
+                        "selectable(true) is supported only on text() nodes".into(),
+                        Position::NONE,
+                    )));
+                }
+                Ok(node
+                    .clone()
+                    .with_attribute("selectable", UiValue::Bool(selectable)))
+            },
+        )
+        .with_fn(
+            "tab_index",
+            |node: &mut UiNode, index: INT| -> Result<UiNode, Box<EvalAltResult>> {
+                if !(-32_768..=32_767).contains(&index) {
+                    return Err(Box::new(EvalAltResult::ErrorRuntime(
+                        "tab index must be between -32768 and 32767".into(),
+                        Position::NONE,
+                    )));
+                }
+                Ok(node
+                    .clone()
+                    .with_attribute("tab_index", UiValue::Integer(index)))
+            },
+        )
+        .with_fn("tab_group", |node: &mut UiNode| {
+            node.clone()
+                .with_attribute("tab_group", UiValue::Bool(true))
+        })
+        .with_fn(
+            "scrollbars",
+            |node: &mut UiNode,
+             horizontal: ImmutableString,
+             vertical: ImmutableString|
+             -> Result<UiNode, Box<EvalAltResult>> {
+                let spec = crate::ScrollbarSpec::new(horizontal.as_str(), vertical.as_str())
+                    .map_err(|error| {
+                        Box::new(EvalAltResult::ErrorRuntime(error.into(), Position::NONE))
+                    })?;
+                Ok(node.clone().with_scrollbars(spec))
+            },
+        )
+        .with_fn(
+            "on_key_value",
+            |call: NativeCallContext<'_>,
+             node: &mut UiNode,
+             key: ImmutableString,
+             callback: FnPtr,
+             payload: Dynamic|
+             -> Result<UiNode, Box<EvalAltResult>> {
+                let key = key.trim().to_ascii_lowercase();
+                if key.is_empty()
+                    || !key
+                        .chars()
+                        .all(|character| character.is_ascii_alphanumeric() || character == '_')
+                {
+                    return Err(Box::new(EvalAltResult::ErrorRuntime(
+                        "key handler name must be a non-empty key identifier".into(),
+                        Position::NONE,
+                    )));
+                }
+                let payload = UiValue::from_dynamic(payload).map_err(|error| {
+                    Box::new(EvalAltResult::ErrorRuntime(
+                        error.to_string().into(),
+                        Position::NONE,
+                    ))
+                })?;
+                let event = format!("key:{key}");
+                Ok(node
+                    .clone()
+                    .with_handler(event.clone(), retained_script_callback(&call, callback)?)
+                    .with_handler_payload(event, payload))
+            },
+        );
+}
+
+fn register_value_event_methods(builder: &mut TypeBuilder<UiNode>) {
+    builder
+        .with_fn(
+            "on_click_value",
+            |call: NativeCallContext<'_>,
+             node: &mut UiNode,
+             callback: FnPtr,
+             payload: Dynamic|
+             -> Result<UiNode, Box<EvalAltResult>> {
+                let payload = dynamic_ui_value(payload)?;
+                Ok(node
+                    .clone()
+                    .with_handler("click", retained_script_callback(&call, callback)?)
+                    .with_handler_payload("click", payload))
+            },
+        )
+        .with_fn(
+            "on_hover_value",
+            |call: NativeCallContext<'_>,
+             node: &mut UiNode,
+             callback: FnPtr,
+             payload: Dynamic|
+             -> Result<UiNode, Box<EvalAltResult>> {
+                let payload = dynamic_ui_value(payload)?;
+                Ok(node
+                    .clone()
+                    .with_handler("hover_change", retained_script_callback(&call, callback)?)
+                    .with_handler_payload("hover_change", payload))
+            },
+        );
+}
+
+fn register_raw_event_methods(builder: &mut TypeBuilder<UiNode>) {
+    builder
+        .with_fn(
+            "on_click",
+            |call: NativeCallContext<'_>,
+             node: &mut UiNode,
+             callback: FnPtr|
+             -> Result<UiNode, Box<EvalAltResult>> {
+                Ok(node
+                    .clone()
+                    .with_handler("click", retained_script_callback(&call, callback)?))
+            },
+        )
+        .with_fn(
+            "on",
+            |call: NativeCallContext<'_>,
+             node: &mut UiNode,
+             event: ImmutableString,
+             callback: FnPtr|
+             -> Result<UiNode, Box<EvalAltResult>> {
+                validate_node_event_name(event.as_str())?;
+                Ok(node.clone().with_handler(
+                    event.to_string(),
+                    retained_script_callback(&call, callback)?,
+                ))
+            },
+        )
+        .with_fn(
+            "on_capture",
+            |call: NativeCallContext<'_>,
+             node: &mut UiNode,
+             event: ImmutableString,
+             callback: FnPtr|
+             -> Result<UiNode, Box<EvalAltResult>> {
+                validate_node_event_name(event.as_str())?;
+                Ok(node.clone().with_handler_phase(
+                    event.to_string(),
+                    crate::EventPhase::Capture,
+                    retained_script_callback(&call, callback)?,
+                ))
+            },
+        )
+        .with_fn(
+            "on_bubble",
+            |call: NativeCallContext<'_>,
+             node: &mut UiNode,
+             event: ImmutableString,
+             callback: FnPtr|
+             -> Result<UiNode, Box<EvalAltResult>> {
+                validate_node_event_name(event.as_str())?;
+                Ok(node.clone().with_handler_phase(
+                    event.to_string(),
+                    crate::EventPhase::Bubble,
+                    retained_script_callback(&call, callback)?,
+                ))
+            },
+        );
+    register_native_event_methods(builder);
+}
+
+fn register_native_event_methods(builder: &mut TypeBuilder<UiNode>) {
+    builder
+        .with_fn(
+            "on_click",
+            |node: &mut UiNode,
+             handler: crate::NativeHandlerRef|
+             -> Result<UiNode, Box<EvalAltResult>> {
+                handler.validate_event("click").map_err(|error| {
+                    Box::new(EvalAltResult::ErrorRuntime(
+                        error.to_string().into(),
+                        Position::NONE,
+                    ))
+                })?;
+                Ok(node.clone().with_handler("click", handler))
+            },
+        )
+        .with_fn(
+            "on_click_value",
+            |node: &mut UiNode,
+             handler: crate::NativeHandlerRef,
+             payload: Dynamic|
+             -> Result<UiNode, Box<EvalAltResult>> {
+                handler.validate_event("click").map_err(|error| {
+                    Box::new(EvalAltResult::ErrorRuntime(
+                        error.to_string().into(),
+                        Position::NONE,
+                    ))
+                })?;
+                Ok(node
+                    .clone()
+                    .with_handler("click", handler)
+                    .with_handler_payload("click", dynamic_ui_value(payload)?))
+            },
+        )
+        .with_fn(
+            "on",
+            |node: &mut UiNode,
+             event: ImmutableString,
+             handler: crate::NativeHandlerRef|
+             -> Result<UiNode, Box<EvalAltResult>> {
+                validate_node_event_name(event.as_str())?;
+                handler.validate_event(event.as_str()).map_err(|error| {
+                    Box::new(EvalAltResult::ErrorRuntime(
+                        error.to_string().into(),
+                        Position::NONE,
+                    ))
+                })?;
+                Ok(node.clone().with_handler(event.to_string(), handler))
+            },
+        )
+        .with_fn(
+            "on_capture",
+            |node: &mut UiNode,
+             event: ImmutableString,
+             handler: crate::NativeHandlerRef|
+             -> Result<UiNode, Box<EvalAltResult>> {
+                validate_node_event_name(event.as_str())?;
+                handler.validate_event(event.as_str()).map_err(|error| {
+                    Box::new(EvalAltResult::ErrorRuntime(
+                        error.to_string().into(),
+                        Position::NONE,
+                    ))
+                })?;
+                Ok(node.clone().with_handler_phase(
+                    event.to_string(),
+                    crate::EventPhase::Capture,
+                    handler,
+                ))
+            },
+        )
+        .with_fn(
+            "on_bubble",
+            |node: &mut UiNode,
+             event: ImmutableString,
+             handler: crate::NativeHandlerRef|
+             -> Result<UiNode, Box<EvalAltResult>> {
+                validate_node_event_name(event.as_str())?;
+                handler.validate_event(event.as_str()).map_err(|error| {
+                    Box::new(EvalAltResult::ErrorRuntime(
+                        error.to_string().into(),
+                        Position::NONE,
+                    ))
+                })?;
+                Ok(node.clone().with_handler_phase(
+                    event.to_string(),
+                    crate::EventPhase::Bubble,
+                    handler,
+                ))
+            },
+        );
+}
+
+fn validate_node_event_name(event: &str) -> Result<(), Box<EvalAltResult>> {
+    let valid = (1..=64).contains(&event.len())
+        && event.chars().all(|character| {
+            character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+                || matches!(character, '_' | ':')
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(Box::new(EvalAltResult::ErrorRuntime(
+            format!("event `{event}` must be a 1-64 character snake_case or namespaced name")
+                .into(),
+            Position::NONE,
+        )))
+    }
+}
+
+fn register_semantic_event_methods(builder: &mut TypeBuilder<UiNode>) {
+    for (method, event) in [
+        ("on_hover_change", "hover_change"),
+        ("on_open_change", "open_change"),
+        ("on_change", "change"),
+    ] {
+        let event = event.to_owned();
+        builder.with_fn(
+            method,
+            move |call: NativeCallContext<'_>,
+                  node: &mut UiNode,
+                  callback: FnPtr|
+                  -> Result<UiNode, Box<EvalAltResult>> {
+                Ok(node
+                    .clone()
+                    .with_handler(event.clone(), retained_script_callback(&call, callback)?))
+            },
+        );
+    }
+}
+
+fn retained_script_callback(
+    call: &NativeCallContext<'_>,
+    callback: FnPtr,
+) -> Result<ScriptCallback, Box<EvalAltResult>> {
+    let mut callback = ScriptCallback::try_from_fn_ptr(callback, ScriptGeneration::default())
+        .map_err(|error| {
+            Box::new(EvalAltResult::ErrorRuntime(
+                error.to_string().into(),
+                Position::NONE,
+            ))
+        })?;
+    callback
+        .bind_native_context_if_unset(crate::invocation::ScriptInvocationContext::capture(call));
+    Ok(callback)
+}
+
+fn register_accessibility_methods(builder: &mut TypeBuilder<UiNode>) {
+    register_accessibility_state_methods(builder);
+    register_accessibility_reference_methods(builder);
+}
+
+fn register_accessibility_state_methods(builder: &mut TypeBuilder<UiNode>) {
+    builder
+        .with_fn(
+            "accessibility_role",
+            |node: &mut UiNode, role: ImmutableString| {
+                node.clone()
+                    .with_attribute("role", UiValue::String(role.to_string()))
+            },
+        )
+        .with_fn(
+            "accessibility_label",
+            |node: &mut UiNode, label: ImmutableString| {
+                node.clone()
+                    .with_attribute("label", UiValue::String(label.to_string()))
+            },
+        )
+        .with_fn(
+            "accessibility_checked",
+            |node: &mut UiNode, value: Dynamic| -> Result<UiNode, Box<EvalAltResult>> {
+                let value = dynamic_ui_value(value)?;
+                Ok(node.clone().with_attribute("checked", value))
+            },
+        )
+        .with_fn(
+            "accessibility_pressed",
+            |node: &mut UiNode, pressed: bool| {
+                node.clone()
+                    .with_attribute("pressed", UiValue::Bool(pressed))
+            },
+        )
+        .with_fn(
+            "accessibility_expanded",
+            |node: &mut UiNode, expanded: bool| {
+                node.clone()
+                    .with_attribute("expanded", UiValue::Bool(expanded))
+            },
+        )
+        .with_fn(
+            "accessibility_orientation",
+            |node: &mut UiNode,
+             orientation: ImmutableString|
+             -> Result<UiNode, Box<EvalAltResult>> {
+                if !matches!(orientation.as_str(), "horizontal" | "vertical") {
+                    return Err(Box::new(EvalAltResult::ErrorRuntime(
+                        "accessibility_orientation must be horizontal or vertical".into(),
+                        Position::NONE,
+                    )));
+                }
+                Ok(node
+                    .clone()
+                    .with_attribute("orientation", UiValue::String(orientation.to_string())))
+            },
+        );
+    register_accessibility_range_methods(builder);
+    builder
+        .with_fn(
+            "accessibility_value",
+            |node: &mut UiNode, value: Dynamic| -> Result<UiNode, Box<EvalAltResult>> {
+                let value = dynamic_ui_value(value)?;
+                Ok(node.clone().with_attribute("value", value))
+            },
+        )
+        .with_fn(
+            "accessibility_current",
+            |node: &mut UiNode, value: ImmutableString| -> Result<UiNode, Box<EvalAltResult>> {
+                if !matches!(
+                    value.as_str(),
+                    "page" | "step" | "location" | "date" | "time" | "true"
+                ) {
+                    return Err(Box::new(EvalAltResult::ErrorRuntime(
+                        "accessibility_current must be page, step, location, date, time, or true"
+                            .into(),
+                        Position::NONE,
+                    )));
+                }
+                Ok(node
+                    .clone()
+                    .with_attribute("current", UiValue::String(value.to_string())))
+            },
+        )
+        .with_fn(
+            "accessibility_invalid",
+            |node: &mut UiNode, invalid: bool| {
+                node.clone()
+                    .with_attribute("invalid", UiValue::Bool(invalid))
+            },
+        );
+}
+
+fn register_accessibility_range_methods(builder: &mut TypeBuilder<UiNode>) {
+    builder
+        .with_fn(
+            "accessibility_value_min",
+            |node: &mut UiNode, value: Dynamic| -> Result<UiNode, Box<EvalAltResult>> {
+                let value = accessibility_number(value, "minimum")?;
+                Ok(node
+                    .clone()
+                    .with_attribute("value_min", UiValue::Float(value)))
+            },
+        )
+        .with_fn(
+            "accessibility_value_max",
+            |node: &mut UiNode, value: Dynamic| -> Result<UiNode, Box<EvalAltResult>> {
+                let value = accessibility_number(value, "maximum")?;
+                Ok(node
+                    .clone()
+                    .with_attribute("value_max", UiValue::Float(value)))
+            },
+        );
+}
+
+fn accessibility_number(value: Dynamic, name: &str) -> Result<f64, Box<EvalAltResult>> {
+    let value = if value.is::<FLOAT>() {
+        value.cast::<FLOAT>()
+    } else if value.is::<INT>() {
+        value
+            .cast::<INT>()
+            .to_string()
+            .parse::<f64>()
+            .map_err(|_| {
+                Box::new(EvalAltResult::ErrorRuntime(
+                    format!("accessibility {name} value cannot be represented").into(),
+                    Position::NONE,
+                ))
+            })?
+    } else {
+        return Err(Box::new(EvalAltResult::ErrorRuntime(
+            format!("accessibility {name} value must be a number").into(),
+            Position::NONE,
+        )));
+    };
+    if !value.is_finite() {
+        return Err(Box::new(EvalAltResult::ErrorRuntime(
+            format!("accessibility {name} value must be finite").into(),
+            Position::NONE,
+        )));
+    }
+    Ok(value)
+}
+
+fn register_accessibility_reference_methods(builder: &mut TypeBuilder<UiNode>) {
+    builder
+        .with_fn(
+            "accessibility_id",
+            |node: &mut UiNode, id: ImmutableString| {
+                node.clone()
+                    .with_attribute("semantic_id", UiValue::String(id.to_string()))
+            },
+        )
+        .with_fn(
+            "test_id",
+            |node: &mut UiNode, id: ImmutableString| -> Result<UiNode, Box<EvalAltResult>> {
+                let id = id.to_string();
+                if id.is_empty()
+                    || id.len() > 128
+                    || !id.chars().all(|character| {
+                        character.is_ascii_alphanumeric()
+                            || matches!(character, '_' | '-' | '.' | ':')
+                    })
+                {
+                    return Err(Box::new(EvalAltResult::ErrorRuntime(
+                        "test_id must be 1-128 safe identifier characters".into(),
+                        Position::NONE,
+                    )));
+                }
+                Ok(node.clone().with_attribute("test_id", UiValue::String(id)))
+            },
+        )
+        .with_fn(
+            "accessibility_labelled_by",
+            |node: &mut UiNode, id: ImmutableString| {
+                node.clone()
+                    .with_attribute("labelled_by", UiValue::String(id.to_string()))
+            },
+        )
+        .with_fn(
+            "accessibility_described_by",
+            |node: &mut UiNode, ids: ImmutableString| {
+                node.clone()
+                    .with_attribute("described_by", UiValue::String(ids.to_string()))
+            },
+        )
+        .with_fn(
+            "accessibility_required",
+            |node: &mut UiNode, required: bool| {
+                node.clone()
+                    .with_attribute("required", UiValue::Bool(required))
+            },
+        );
+}
+
+fn dynamic_ui_value(value: Dynamic) -> Result<UiValue, Box<EvalAltResult>> {
+    UiValue::from_dynamic(value).map_err(|error| {
+        Box::new(EvalAltResult::ErrorRuntime(
+            error.to_string().into(),
+            Position::NONE,
+        ))
+    })
+}
+
+pub(crate) fn text_node(call: NativeCallContext<'_>, text: ImmutableString) -> UiNode {
+    with_call_source(UiNode::text(text), call)
+}
+
+pub(crate) fn span_value(text: ImmutableString) -> Span {
+    Span::new(text)
+}
+
+pub(crate) fn rich_text_node(
+    call: NativeCallContext<'_>,
+    spans: Array,
+) -> Result<UiNode, Box<EvalAltResult>> {
+    let spans = spans
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| {
+            value.try_cast::<Span>().ok_or_else(|| {
+                Box::new(EvalAltResult::ErrorRuntime(
+                    format!("text span {index} must be Span").into(),
+                    Position::NONE,
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let text = spans.iter().map(Span::text).collect::<String>();
+    let mut boundaries = text
+        .grapheme_indices(true)
+        .map(|(index, _)| index)
+        .collect::<BTreeSet<_>>();
+    boundaries.insert(text.len());
+    let mut offset = 0usize;
+    for (index, span) in spans.iter().enumerate() {
+        offset = offset.saturating_add(span.text().len());
+        if !boundaries.contains(&offset) {
+            return Err(Box::new(EvalAltResult::ErrorRuntime(
+                format!("text span {index} splits an extended grapheme cluster").into(),
+                Position::NONE,
+            )));
+        }
+    }
+    Ok(with_call_source(UiNode::rich_text(spans), call))
+}
+
+pub(crate) fn canvas_node(call: NativeCallContext<'_>, scene: crate::CanvasScene) -> UiNode {
+    with_call_source(UiNode::canvas(scene), call)
+}
+
+pub(crate) fn svg_node(
+    call: NativeCallContext<'_>,
+    source: &str,
+) -> Result<UiNode, Box<EvalAltResult>> {
+    UiNode::svg(source)
+        .map(|node| with_call_source(node, call))
+        .map_err(|error| {
+            Box::new(EvalAltResult::ErrorRuntime(
+                error.to_string().into(),
+                Position::NONE,
+            ))
+        })
+}
+
+pub(crate) fn box_node(
+    call: NativeCallContext<'_>,
+    children: Array,
+) -> Result<UiNode, Box<rhai::EvalAltResult>> {
+    collect_children(children, "box")
+        .map(|children| with_call_source(UiNode::box_node(children), call))
+}
+
+pub(crate) fn fragment_node(
+    call: NativeCallContext<'_>,
+    children: Array,
+) -> Result<UiNode, Box<rhai::EvalAltResult>> {
+    collect_children(children, "fragment")
+        .map(|children| with_call_source(UiNode::fragment(children), call))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn motion_group_node(
+    call: NativeCallContext<'_>,
+    id: ImmutableString,
+    children: Array,
+) -> Result<UiNode, Box<EvalAltResult>> {
+    let id = id.to_string();
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+    {
+        return Err(Box::new(EvalAltResult::ErrorRuntime(
+            "motion group id must be 1-128 safe ASCII characters".into(),
+            Position::NONE,
+        )));
+    }
+    let mut node = fragment_node(call, children)?;
+    apply_motion_group(&mut node, &id);
+    Ok(node)
+}
+
+pub(crate) fn apply_motion_group(node: &mut UiNode, group: &str) {
+    if node.component_root.is_some() {
+        node.apply_presentation_mutation(NodePresentationMutation::MotionGroup(group.to_owned()));
+    } else {
+        apply_motion_group_contents(node, group);
+    }
+}
+
+fn apply_motion_group_contents(node: &mut UiNode, group: &str) {
+    if node.attributes.contains_key("shared_layout_id")
+        && !node.attributes.contains_key("shared_layout_group")
+    {
+        node.attributes.insert(
+            "shared_layout_group".to_owned(),
+            UiValue::String(group.to_owned()),
+        );
+    }
+    match &mut node.kind {
+        UiNodeKind::Box { children } | UiNodeKind::Fragment { children } => {
+            for child in children {
+                apply_motion_group(child, group);
+            }
+        }
+        UiNodeKind::Overlay {
+            trigger, content, ..
+        } => {
+            apply_motion_group(trigger, group);
+            apply_motion_group(content, group);
+        }
+        UiNodeKind::Layer { content, .. } => apply_motion_group(content, group),
+        UiNodeKind::ErrorBoundary { child, fallback } => {
+            apply_motion_group(child, group);
+            apply_motion_group(fallback, group);
+        }
+        UiNodeKind::VirtualCollection { spec } => {
+            if spec.inherited_motion_group.is_none() {
+                spec.inherited_motion_group = Some(group.to_owned());
+            }
+            for child in spec.realized.values_mut() {
+                apply_motion_group(child, group);
+            }
+        }
+        UiNodeKind::Text { .. }
+        | UiNodeKind::RichText { .. }
+        | UiNodeKind::Canvas { .. }
+        | UiNodeKind::Svg { .. }
+        | UiNodeKind::Custom { .. }
+        | UiNodeKind::Image { .. }
+        | UiNodeKind::DirectionalImage { .. } => {}
+    }
+}
+
+pub(crate) fn stack_node(
+    call: NativeCallContext<'_>,
+    children: Array,
+) -> Result<UiNode, Box<rhai::EvalAltResult>> {
+    collect_children(children, "stack").map(|children| {
+        with_call_source(
+            UiNode::box_node(children).with_style(&Style::new().relative()),
+            call,
+        )
+    })
+}
+
+pub(crate) fn column_node(
+    call: NativeCallContext<'_>,
+    children: Array,
+) -> Result<UiNode, Box<rhai::EvalAltResult>> {
+    collect_children(children, "column")
+        .map(|children| with_call_source(UiNode::column(children), call))
+}
+
+pub(crate) fn row_node(
+    call: NativeCallContext<'_>,
+    children: Array,
+) -> Result<UiNode, Box<rhai::EvalAltResult>> {
+    collect_children(children, "row").map(|children| with_call_source(UiNode::row(children), call))
+}
+
+pub(crate) fn error_boundary_node(
+    call: NativeCallContext<'_>,
+    child: UiNode,
+    fallback: UiNode,
+) -> UiNode {
+    with_call_source(UiNode::error_boundary(child, fallback), call)
+}
+
+pub(crate) fn lazy_error_boundary_node(
+    call: NativeCallContext<'_>,
+    child: FnPtr,
+    fallback: FnPtr,
+) -> Result<UiNode, Box<EvalAltResult>> {
+    let fallback_node = fallback.call_within_context::<UiNode>(&call, ())?;
+    let child_result = child.call_within_context::<UiNode>(&call, ());
+    drop(child);
+    drop(fallback);
+    match child_result {
+        Ok(child) => Ok(with_call_source(
+            UiNode::error_boundary(child, fallback_node),
+            call,
+        )),
+        Err(error) => Ok(with_call_source(
+            fallback_node.with_attribute("boundary_error", UiValue::String(error.to_string())),
+            call,
+        )),
+    }
+}
+
+pub(crate) fn image_node(call: NativeCallContext<'_>, handle: OpaqueHandle) -> UiNode {
+    with_call_source(UiNode::image(handle), call)
+}
+
+pub(crate) fn asset_image_node(call: NativeCallContext<'_>, asset: AssetId) -> UiNode {
+    with_call_source(UiNode::asset_image(asset), call)
+}
+
+pub(crate) fn generic_image_node(
+    call: NativeCallContext<'_>,
+    source: Dynamic,
+) -> Result<UiNode, Box<EvalAltResult>> {
+    Ok(with_call_source(
+        UiNode::image_source(parse_image_source(source)?),
+        call,
+    ))
+}
+
+pub(crate) fn directional_image_node(
+    call: NativeCallContext<'_>,
+    left_to_right: OpaqueHandle,
+    right_to_left: OpaqueHandle,
+) -> UiNode {
+    with_call_source(
+        UiNode::directional_image(left_to_right, right_to_left),
+        call,
+    )
+}
+
+pub(crate) fn directional_asset_image_node(
+    call: NativeCallContext<'_>,
+    left_to_right: AssetId,
+    right_to_left: AssetId,
+) -> UiNode {
+    with_call_source(
+        UiNode::directional_asset_image(left_to_right, right_to_left),
+        call,
+    )
+}
+
+pub(crate) fn generic_directional_image_node(
+    call: NativeCallContext<'_>,
+    left_to_right: Dynamic,
+    right_to_left: Dynamic,
+) -> Result<UiNode, Box<EvalAltResult>> {
+    Ok(with_call_source(
+        UiNode::directional_image_sources(
+            parse_image_source(left_to_right)?,
+            parse_image_source(right_to_left)?,
+        ),
+        call,
+    ))
+}
+
+fn parse_image_source(source: Dynamic) -> Result<ImageSourceSpec, Box<EvalAltResult>> {
+    if source.is::<AssetId>() {
+        Ok(ImageSourceSpec::Asset(source.cast::<AssetId>()))
+    } else if source.is::<OpaqueHandle>() {
+        let handle = source.cast::<OpaqueHandle>();
+        if handle.kind() == "image" {
+            Ok(ImageSourceSpec::Handle(handle))
+        } else {
+            Err(Box::new(EvalAltResult::ErrorRuntime(
+                format!(
+                    "image source handle must have kind `image`, got `{}`",
+                    handle.kind()
+                )
+                .into(),
+                Position::NONE,
+            )))
+        }
+    } else {
+        Err(Box::new(EvalAltResult::ErrorRuntime(
+            format!(
+                "image source must be an AssetId or image handle, got {}",
+                source.type_name()
+            )
+            .into(),
+            Position::NONE,
+        )))
+    }
+}
+
+pub(crate) fn overlay_node(
+    call: NativeCallContext<'_>,
+    trigger: UiNode,
+    overlay_content: UiNode,
+    mut config: Map,
+) -> Result<UiNode, Box<EvalAltResult>> {
+    let id = required_string(&mut config, "id")?;
+    if id.trim().is_empty() {
+        return overlay_config_error("overlay ID cannot be empty");
+    }
+    let parent = optional_string(&mut config, "parent")?;
+    let kind = match optional_string(&mut config, "kind")?.as_deref() {
+        None | Some("popover") => OverlayKind::Popover,
+        Some("combobox") => OverlayKind::Combobox,
+        Some("tooltip") => OverlayKind::Tooltip,
+        Some("dialog") => OverlayKind::Dialog,
+        Some("sheet") => OverlayKind::Sheet,
+        Some("menu") => OverlayKind::Menu,
+        Some(other) => return overlay_config_error(format!("unknown overlay kind `{other}`")),
+    };
+    let placement = match optional_string(&mut config, "placement")?.as_deref() {
+        None | Some("bottom") => OverlayPlacement::Bottom,
+        Some("top") => OverlayPlacement::Top,
+        Some("left") => OverlayPlacement::Left,
+        Some("right") => OverlayPlacement::Right,
+        Some("start") => OverlayPlacement::Start,
+        Some("end") => OverlayPlacement::End,
+        Some("center") => OverlayPlacement::Center,
+        Some(other) => {
+            return overlay_config_error(format!("unknown overlay placement `{other}`"));
+        }
+    };
+    let open = optional_bool(&mut config, "open")?.unwrap_or(false);
+    let anchor = optional_overlay_bounds(&mut config, "anchor")?;
+    let gap = optional_number(&mut config, "gap")?.unwrap_or(8.0);
+    if !gap.is_finite() || gap < 0.0 {
+        return overlay_config_error("overlay gap must be finite and non-negative");
+    }
+    let modal = optional_bool(&mut config, "modal")?
+        .unwrap_or(matches!(kind, OverlayKind::Dialog | OverlayKind::Sheet));
+    let activate_on_trigger = optional_bool(&mut config, "activate_on_trigger")?.unwrap_or(true);
+    let width_policy = if optional_bool(&mut config, "match_trigger_width")?.unwrap_or(false) {
+        OverlayWidthPolicy::MatchTrigger
+    } else {
+        OverlayWidthPolicy::Content
+    };
+    let initial_focus = match optional_string(&mut config, "initial_focus")?.as_deref() {
+        None | Some("panel") => OverlayInitialFocus::Panel,
+        Some("first") => OverlayInitialFocus::First,
+        Some(other) => {
+            return overlay_config_error(format!(
+                "unknown overlay initial_focus `{other}` (expected `panel` or `first`)"
+            ));
+        }
+    };
+    let dismiss_on_escape = optional_bool(&mut config, "dismiss_on_escape")?.unwrap_or(true);
+    let dismiss_on_outside = optional_bool(&mut config, "dismiss_on_outside")?.unwrap_or(true);
+    let show_delay_ms = optional_usize(&mut config, "show_delay_ms")?;
+    let hide_delay_ms = optional_usize(&mut config, "hide_delay_ms")?;
+    let tooltip_delays = (kind == OverlayKind::Tooltip).then(|| TooltipDelays {
+        show_ms: u64::try_from(show_delay_ms.unwrap_or(500)).unwrap_or(u64::MAX),
+        hide_ms: u64::try_from(hide_delay_ms.unwrap_or(100)).unwrap_or(u64::MAX),
+    });
+    if let Some((unknown, _)) = config.into_iter().next() {
+        return overlay_config_error(format!("unknown overlay config field `{unknown}`"));
+    }
+    Ok(with_call_source(
+        UiNode::overlay(
+            trigger,
+            overlay_content,
+            OverlayNodeSpec {
+                id: OverlayId::new(id),
+                parent: parent.map(OverlayId::new),
+                kind,
+                placement,
+                anchor,
+                open,
+                gap,
+                modal,
+                dismiss: OverlayDismissPolicy {
+                    escape: dismiss_on_escape,
+                    outside: dismiss_on_outside,
+                },
+                tooltip_delays,
+                initial_focus,
+                activate_on_trigger,
+                width_policy,
+            },
+        ),
+        call,
+    ))
+}
+
+pub(crate) fn layer_node(
+    call: NativeCallContext<'_>,
+    content: UiNode,
+    mut config: Map,
+) -> Result<UiNode, Box<EvalAltResult>> {
+    let id = required_string(&mut config, "id")?;
+    if id.trim().is_empty() {
+        return overlay_config_error("layer ID cannot be empty");
+    }
+    let placement = match optional_string(&mut config, "placement")?.as_deref() {
+        None | Some("top_right") => LayerPlacement::TopRight,
+        Some("top_left") => LayerPlacement::TopLeft,
+        Some("bottom_left") => LayerPlacement::BottomLeft,
+        Some("bottom_right") => LayerPlacement::BottomRight,
+        Some("center") => LayerPlacement::Center,
+        Some("fill") => LayerPlacement::Fill,
+        Some(other) => return overlay_config_error(format!("unknown layer placement `{other}`")),
+    };
+    let inset = optional_number(&mut config, "inset")?.unwrap_or(12.0);
+    if !inset.is_finite() || inset < 0.0 {
+        return overlay_config_error("layer inset must be finite and non-negative");
+    }
+    let priority = optional_usize(&mut config, "priority")?.unwrap_or(9_000);
+    if priority > 1_000_000 {
+        return overlay_config_error("layer priority cannot exceed 1000000");
+    }
+    if let Some((unknown, _)) = config.into_iter().next() {
+        return overlay_config_error(format!("unknown layer config field `{unknown}`"));
+    }
+    Ok(with_call_source(
+        UiNode::layer(
+            content,
+            LayerNodeSpec {
+                id: OverlayId::new(id),
+                placement,
+                inset,
+                priority,
+            },
+        ),
+        call,
+    ))
+}
+
+fn with_call_source(node: UiNode, call: NativeCallContext<'_>) -> UiNode {
+    let position = call.call_position();
+    let module = call
+        .call_source()
+        .or_else(|| call.fn_source())
+        .map(ToOwned::to_owned);
+    let _ = std::hint::black_box(call);
+    let Some(module) = module else {
+        return node;
+    };
+    let (Some(line), Some(column)) = (position.line(), position.position()) else {
+        return node;
+    };
+    let (Ok(line), Ok(column)) = (u32::try_from(line), u32::try_from(column)) else {
+        return node;
+    };
+    node.with_source(SourceLocation {
+        module,
+        line,
+        column,
+    })
+}
+
+fn required_string(config: &mut Map, name: &str) -> Result<String, Box<EvalAltResult>> {
+    optional_string(config, name)?.ok_or_else(|| {
+        Box::new(EvalAltResult::ErrorRuntime(
+            format!("overlay config field `{name}` is required").into(),
+            Position::NONE,
+        ))
+    })
+}
+
+fn optional_string(config: &mut Map, name: &str) -> Result<Option<String>, Box<EvalAltResult>> {
+    let Some(value) = config.remove(name) else {
+        return Ok(None);
+    };
+    value
+        .try_cast::<ImmutableString>()
+        .map(|value| Some(value.to_string()))
+        .ok_or_else(|| Box::new(overlay_type_error(name, "string")))
+}
+
+fn optional_bool(config: &mut Map, name: &str) -> Result<Option<bool>, Box<EvalAltResult>> {
+    let Some(value) = config.remove(name) else {
+        return Ok(None);
+    };
+    value
+        .try_cast::<bool>()
+        .map(Some)
+        .ok_or_else(|| Box::new(overlay_type_error(name, "bool")))
+}
+
+fn optional_number(config: &mut Map, name: &str) -> Result<Option<f64>, Box<EvalAltResult>> {
+    let Some(value) = config.remove(name) else {
+        return Ok(None);
+    };
+    if value.is::<INT>() {
+        value
+            .cast::<INT>()
+            .to_string()
+            .parse::<f64>()
+            .map(Some)
+            .map_err(|_| Box::new(overlay_type_error(name, "number")))
+    } else if value.is::<FLOAT>() {
+        Ok(Some(value.cast::<FLOAT>()))
+    } else {
+        Err(Box::new(overlay_type_error(name, "number")))
+    }
+}
+
+fn optional_usize(config: &mut Map, name: &str) -> Result<Option<usize>, Box<EvalAltResult>> {
+    let Some(value) = config.remove(name) else {
+        return Ok(None);
+    };
+    value
+        .try_cast::<INT>()
+        .and_then(|value| usize::try_from(value).ok())
+        .map(Some)
+        .ok_or_else(|| Box::new(overlay_type_error(name, "a non-negative integer")))
+}
+
+fn optional_overlay_bounds(
+    config: &mut Map,
+    name: &str,
+) -> Result<Option<crate::OverlayBounds>, Box<EvalAltResult>> {
+    let Some(value) = config.remove(name) else {
+        return Ok(None);
+    };
+    let Some(mut bounds) = value.try_cast::<Map>() else {
+        return Err(Box::new(overlay_type_error(
+            name,
+            "a map with x, y, width, and height",
+        )));
+    };
+    let x = optional_number(&mut bounds, "x")?
+        .ok_or_else(|| Box::new(overlay_type_error("anchor.x", "number")))?;
+    let y = optional_number(&mut bounds, "y")?
+        .ok_or_else(|| Box::new(overlay_type_error("anchor.y", "number")))?;
+    let width = optional_number(&mut bounds, "width")?.unwrap_or(0.0);
+    let height = optional_number(&mut bounds, "height")?.unwrap_or(0.0);
+    if let Some((unknown, _)) = bounds.into_iter().next() {
+        return overlay_config_error(format!("unknown overlay anchor field `{unknown}`"));
+    }
+    if !x.is_finite()
+        || !y.is_finite()
+        || !width.is_finite()
+        || width < 0.0
+        || !height.is_finite()
+        || height < 0.0
+    {
+        return overlay_config_error("overlay anchor geometry must be finite and non-negative");
+    }
+    Ok(Some(crate::OverlayBounds {
+        x,
+        y,
+        width,
+        height,
+    }))
+}
+
+fn overlay_type_error(name: &str, expected: &str) -> EvalAltResult {
+    EvalAltResult::ErrorRuntime(
+        format!("overlay config field `{name}` must be {expected}").into(),
+        Position::NONE,
+    )
+}
+
+fn overlay_config_error<T>(message: impl Into<String>) -> Result<T, Box<EvalAltResult>> {
+    Err(Box::new(EvalAltResult::ErrorRuntime(
+        message.into().into(),
+        Position::NONE,
+    )))
+}
+
+fn collect_children(
+    children: Array,
+    constructor: &str,
+) -> Result<Vec<UiNode>, Box<rhai::EvalAltResult>> {
+    let mut nodes = Vec::with_capacity(children.len());
+    for (index, child) in children.into_iter().enumerate() {
+        match child.try_cast::<UiNode>() {
+            Some(node) => nodes.push(node),
+            None => {
+                return Err(format!("{constructor} child at index {index} is not a UiNode").into());
+            }
+        }
+    }
+    Ok(nodes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        ColorValue, EventPropagation, Length, MotionProperty, MotionTransition, Rgba8, SignalId,
+        SignalKind, SignalProperty,
+    };
+
+    #[test]
+    fn node_identity_style_source_and_attributes_are_runtime_owned() {
+        let node = UiNode::text("hello")
+            .with_key("greeting")
+            .with_style(
+                &Style::new()
+                    .width(Length::pixels(100.0).unwrap())
+                    .text_color(ColorValue::Literal(Rgba8::from_rgb_hex(0x00ff_ffff))),
+            )
+            .with_source(SourceLocation {
+                module: "ui/main.rhai".to_owned(),
+                line: 4,
+                column: 9,
+            })
+            .with_attribute("role", UiValue::String("label".to_owned()));
+
+        assert_eq!(node.key().map(NodeKey::as_str), Some("greeting"));
+        assert_eq!(node.source().unwrap().line, 4);
+        assert_eq!(
+            node.attributes().get("role"),
+            Some(&UiValue::String("label".to_owned()))
+        );
+    }
+
+    #[test]
+    fn selectable_rejects_non_text_nodes_at_the_script_boundary() {
+        let mut runtime = crate::RuntimeEngine::new();
+        let compiled = runtime
+            .compile_named("selectable.rhai", "fn view() { row([]).selectable(true) }")
+            .unwrap();
+        let error = runtime.render(&compiled).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("selectable(true) is supported only on text() nodes"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn component_replacement_preserves_every_external_presentation_mutation() {
+        let component = ComponentInstancePath::root("Probe", "owned");
+        let signal = crate::NativeSignal::new(
+            SignalId::new(component.clone(), "opacity", SignalKind::Float).unwrap(),
+        );
+        let reference =
+            crate::ElementRef::new(crate::ElementRefId::new(component.clone(), "target").unwrap());
+        let style = Style::new().width(Length::pixels(120.0).unwrap());
+        let part_style = Style::new().height(Length::pixels(24.0).unwrap());
+        let animation = MotionSource::Transition(MotionTransition::new(
+            MotionProperty::Opacity,
+            0.0,
+            1.0,
+            100,
+        ));
+        let mut presented = UiNode::text("old")
+            .with_key("owned")
+            .with_component_root(component.clone())
+            .with_key("presented")
+            .with_style(&style)
+            .with_part_style("label", part_style.clone())
+            .with_signal_binding(SignalProperty::Opacity, signal.clone())
+            .unwrap()
+            .with_element_ref(reference.clone())
+            .with_attribute("role", UiValue::String("status".to_owned()))
+            .with_host_handler(
+                "click",
+                crate::HostCallback::new("outer.click", |_, _, _| EventPropagation::Handled),
+            )
+            .with_handler_payload("click", UiValue::Integer(7))
+            .with_motion(animation.clone());
+        assert_eq!(presented.presentation.len(), 9);
+
+        let replacement = UiNode::text("new")
+            .with_key("replacement")
+            .with_component_root(component.clone());
+        assert!(presented.replace_component_subtree(&component, replacement));
+        assert!(matches!(presented.kind(), UiNodeKind::Text { text } if text == "new"));
+        assert_eq!(presented.key().map(NodeKey::as_str), Some("presented"));
+        assert_eq!(presented.style(), &style);
+        assert_eq!(presented.part_style("label"), Some(&part_style));
+        assert_eq!(
+            presented.signal_bindings().collect::<Vec<_>>(),
+            vec![(SignalProperty::Opacity, &signal)]
+        );
+        assert_eq!(presented.element_ref(), Some(&reference));
+        assert_eq!(
+            presented.attributes().get("role"),
+            Some(&UiValue::String("status".to_owned()))
+        );
+        assert_eq!(presented.event_handlers("click").len(), 1);
+        assert_eq!(
+            presented.handler_payload("click"),
+            Some(&UiValue::Integer(7))
+        );
+        assert_eq!(presented.motions(), &[animation]);
+        assert_eq!(presented.presentation.len(), 9);
+    }
+
+    #[test]
+    fn component_snapshot_activates_lazily_and_stays_free_of_outer_presentation() {
+        let component = ComponentInstancePath::root("Probe", "lazy");
+        let snapshot = ComponentOwnedSnapshot::default();
+        let node = UiNode::text("initial")
+            .with_component_root_snapshot(component.clone(), snapshot.reference());
+        assert!(snapshot.current().is_none());
+
+        let mut presented = node.with_style(&Style::new().opacity(0.5).unwrap());
+        let owned = snapshot
+            .current()
+            .expect("first outer mutation activates snapshot");
+        assert_eq!(Rc::strong_count(&snapshot.0), 1, "node link must stay weak");
+        assert!(matches!(owned.kind(), UiNodeKind::Text { text } if text == "initial"));
+        assert_eq!(owned.style().base.opacity, None);
+
+        let replacement =
+            UiNode::text("updated").with_component_root_snapshot(component, snapshot.reference());
+        snapshot.update_if_active(&replacement);
+        presented.hydrate_component_subtrees();
+        assert!(matches!(presented.kind(), UiNodeKind::Text { text } if text == "updated"));
+        assert_eq!(presented.style().base.opacity, Some(0.5));
+    }
+
+    #[test]
+    fn inherited_motion_group_replays_across_nested_component_replacement() {
+        let outer = ComponentInstancePath::root("Outer", "root");
+        let inner = outer.child("Inner", "child");
+        let inner_node = UiNode::text("initial")
+            .with_shared_layout_id("item")
+            .with_component_root(inner.clone());
+        let mut root = UiNode::column(vec![inner_node]).with_component_root(outer);
+
+        apply_motion_group(&mut root, "outer-group");
+        let UiNodeKind::Box { children } = root.kind() else {
+            panic!("expected component column");
+        };
+        assert_eq!(
+            children[0].attributes().get("shared_layout_group"),
+            Some(&UiValue::String("outer-group".to_owned()))
+        );
+
+        let replacement = UiNode::text("updated")
+            .with_shared_layout_id("item")
+            .with_component_root(inner.clone());
+        assert!(root.replace_component_subtree(&inner, replacement));
+        let UiNodeKind::Box { children } = root.kind() else {
+            panic!("expected component column");
+        };
+        assert_eq!(
+            children[0].attributes().get("shared_layout_group"),
+            Some(&UiValue::String("outer-group".to_owned()))
+        );
+        assert!(matches!(children[0].kind(), UiNodeKind::Text { text } if text == "updated"));
+    }
+}

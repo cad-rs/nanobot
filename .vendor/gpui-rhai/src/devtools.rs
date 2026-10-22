@@ -1,0 +1,1200 @@
+use std::collections::{BTreeMap, VecDeque};
+
+#[cfg(feature = "dev-reload")]
+use gpui::{
+    AnyElement, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement, Styled,
+    deferred, div, px, rgba,
+};
+
+use crate::{
+    ComponentRegistry, ExecutionTiming, PrimitiveValue, SourceLocation, StateInstanceSnapshot,
+    StoreSnapshot, StyleProperties, ThemeVariant, UiNode, UiNodeKind, UiRuntimeState, UiValue,
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeTraceKind {
+    Reconcile,
+    Event,
+    Action,
+    Capability,
+    Task,
+    Subscription,
+    State,
+    Store,
+    Signal,
+    Theme,
+    Locale,
+    Reload,
+    Window,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RuntimeTrace {
+    pub sequence: u64,
+    pub kind: RuntimeTraceKind,
+    pub scope: String,
+    pub message: String,
+    pub payload: Option<UiValue>,
+    pub sensitive: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct TraceBuffer {
+    capacity: usize,
+    next_sequence: u64,
+    traces: VecDeque<RuntimeTrace>,
+}
+
+impl Default for TraceBuffer {
+    fn default() -> Self {
+        Self::new(200)
+    }
+}
+
+impl TraceBuffer {
+    #[must_use]
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            next_sequence: 1,
+            traces: VecDeque::new(),
+        }
+    }
+
+    pub fn push(
+        &mut self,
+        kind: RuntimeTraceKind,
+        scope: impl Into<String>,
+        message: impl Into<String>,
+        payload: Option<UiValue>,
+        sensitive: bool,
+    ) {
+        if self.traces.len() == self.capacity {
+            self.traces.pop_front();
+        }
+        self.traces.push_back(RuntimeTrace {
+            sequence: self.next_sequence,
+            kind,
+            scope: scope.into(),
+            message: message.into(),
+            payload: if sensitive && payload.is_some() {
+                Some(UiValue::String("<sensitive>".to_owned()))
+            } else {
+                payload
+            },
+            sensitive,
+        });
+        self.next_sequence = self.next_sequence.saturating_add(1);
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<RuntimeTrace> {
+        self.traces.iter().cloned().collect()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct InspectorNode {
+    pub path: String,
+    pub kind: String,
+    pub key: Option<String>,
+    pub source: Option<SourceLocation>,
+    pub props: BTreeMap<String, String>,
+    pub attributes: BTreeMap<String, String>,
+    pub handlers: Vec<String>,
+    pub motions: Vec<String>,
+    pub style: StyleProperties,
+    pub children: Vec<InspectorNode>,
+}
+
+#[derive(Clone, Debug)]
+pub struct InspectorSnapshot {
+    pub root: Option<InspectorNode>,
+    pub state: Vec<StateInstanceSnapshot>,
+    pub stores: Vec<StoreSnapshot>,
+    pub theme_family: String,
+    pub theme_name: String,
+    pub theme_colors: BTreeMap<String, String>,
+    pub traces: Vec<RuntimeTrace>,
+    pub timings: Vec<ExecutionTiming>,
+    pub dirty: Vec<String>,
+    pub components: Vec<InspectorComponent>,
+    pub signals: Vec<InspectorSignal>,
+    pub effects: Vec<InspectorEffect>,
+    pub motions: Vec<InspectorMotion>,
+    pub timelines: Vec<InspectorTimeline>,
+    pub timers: Vec<InspectorTimer>,
+    pub element_refs: Vec<InspectorElementRef>,
+    pub virtual_collections: Vec<InspectorVirtualCollection>,
+    pub geometry_nodes: usize,
+    pub pointer_captures: BTreeMap<u64, u64>,
+    pub locale_readers: usize,
+    pub theme_readers: usize,
+    pub viewport_readers: usize,
+    pub clock_elapsed_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InspectorComponent {
+    pub id: String,
+    pub export: String,
+    pub props: BTreeMap<String, String>,
+    pub slots: Vec<String>,
+    pub parts: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InspectorSignal {
+    pub id: String,
+    pub kind: String,
+    pub value: String,
+    pub revision: u64,
+    pub last_writer: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InspectorEffect {
+    pub id: String,
+    pub activation: u64,
+    pub dependencies: String,
+    pub start: String,
+    pub cleanup: String,
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct InspectorMotion {
+    pub id: String,
+    pub kind: String,
+    pub value: f64,
+    pub target: f64,
+    pub velocity: Option<f64>,
+    pub elapsed_ms: u64,
+    pub duration_ms: Option<u64>,
+    pub repeating: bool,
+    pub active: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InspectorTimeline {
+    pub id: String,
+    pub state: String,
+    pub elapsed_ms: u64,
+    pub duration_ms: Option<u64>,
+    pub iterations: Option<u32>,
+    pub autoreverse: bool,
+    pub track_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InspectorTimer {
+    pub id: String,
+    pub delay_ms: u64,
+    pub remaining_ms: u64,
+    pub declaration_paused: bool,
+    pub interaction_paused: bool,
+    pub view_paused: bool,
+    pub callback: String,
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InspectorElementRef {
+    pub id: String,
+    pub node: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct InspectorVirtualCollection {
+    pub id: String,
+    pub item_count: usize,
+    pub realized_count: usize,
+    pub realized_range: std::ops::Range<usize>,
+    pub requested_count: usize,
+    pub requested_range: std::ops::Range<usize>,
+    pub visible_range: std::ops::Range<usize>,
+    pub viewport_height: f64,
+    pub scroll_item: usize,
+    pub scroll_offset: f64,
+    pub is_scrolled: bool,
+    pub sticky_header: Option<usize>,
+    pub bottom_align: bool,
+    pub follow_tail: bool,
+}
+
+struct InspectorRuntimeMechanisms {
+    signals: Vec<InspectorSignal>,
+    effects: Vec<InspectorEffect>,
+    motions: Vec<InspectorMotion>,
+    timelines: Vec<InspectorTimeline>,
+    timers: Vec<InspectorTimer>,
+    element_refs: Vec<InspectorElementRef>,
+    virtual_collections: Vec<InspectorVirtualCollection>,
+    geometry_nodes: usize,
+    pointer_captures: BTreeMap<u64, u64>,
+    locale_readers: usize,
+    theme_readers: usize,
+    viewport_readers: usize,
+    clock_elapsed_ms: u64,
+}
+
+impl InspectorSnapshot {
+    #[must_use]
+    pub fn capture(
+        root: Option<&UiNode>,
+        runtime: &UiRuntimeState,
+        theme: &ThemeVariant,
+        components: &ComponentRegistry,
+        timings: Vec<ExecutionTiming>,
+    ) -> Self {
+        Self::capture_for_view(root, runtime, theme, components, timings, None)
+    }
+
+    #[must_use]
+    pub fn capture_for_view(
+        root: Option<&UiNode>,
+        runtime: &UiRuntimeState,
+        theme: &ThemeVariant,
+        components: &ComponentRegistry,
+        timings: Vec<ExecutionTiming>,
+        view: Option<&str>,
+    ) -> Self {
+        let mechanisms = inspect_runtime_mechanisms(runtime, view);
+        Self {
+            root: root.map(|root| inspect_node(root, "root")),
+            state: runtime.component_state.inspect(),
+            stores: runtime.stores.inspect(),
+            theme_family: theme.family.clone(),
+            theme_name: theme.name.clone(),
+            theme_colors: theme
+                .tokens
+                .colors
+                .iter()
+                .map(|(name, color)| (name.clone(), format!("#{:08x}", color.as_rgba_hex())))
+                .collect(),
+            traces: runtime.traces.snapshot(),
+            timings,
+            dirty: runtime
+                .dirty_components()
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            components: components
+                .iter()
+                .map(|(id, component)| InspectorComponent {
+                    id: id.to_string(),
+                    export: component.metadata.export.clone(),
+                    props: component
+                        .schema
+                        .props
+                        .iter()
+                        .map(|(name, field)| {
+                            (
+                                name.clone(),
+                                if field.sensitive {
+                                    "<sensitive>".to_owned()
+                                } else {
+                                    format!("{:?}", field.schema)
+                                },
+                            )
+                        })
+                        .collect(),
+                    slots: component.schema.slots.keys().cloned().collect(),
+                    parts: component.schema.parts.iter().cloned().collect(),
+                })
+                .collect(),
+            signals: mechanisms.signals,
+            effects: mechanisms.effects,
+            motions: mechanisms.motions,
+            timelines: mechanisms.timelines,
+            timers: mechanisms.timers,
+            element_refs: mechanisms.element_refs,
+            virtual_collections: mechanisms.virtual_collections,
+            geometry_nodes: mechanisms.geometry_nodes,
+            pointer_captures: mechanisms.pointer_captures,
+            locale_readers: mechanisms.locale_readers,
+            theme_readers: mechanisms.theme_readers,
+            viewport_readers: mechanisms.viewport_readers,
+            clock_elapsed_ms: mechanisms.clock_elapsed_ms,
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn inspect_runtime_mechanisms(
+    runtime: &UiRuntimeState,
+    view: Option<&str>,
+) -> InspectorRuntimeMechanisms {
+    let geometry = runtime.geometry_for(view);
+    let pointer_capture = runtime.pointer_capture_for(view);
+    InspectorRuntimeMechanisms {
+        signals: runtime
+            .signals
+            .inspect()
+            .into_iter()
+            .map(|signal| InspectorSignal {
+                id: format!(
+                    "{}/{}:{}",
+                    signal.id.component(),
+                    signal.id.key(),
+                    signal.id.kind().as_str()
+                ),
+                kind: signal.id.kind().as_str().to_owned(),
+                value: format!("{:?}", signal.value),
+                revision: signal.revision,
+                last_writer: format!("{:?}", signal.last_writer),
+            })
+            .collect(),
+        effects: runtime
+            .effects
+            .iter_active()
+            .map(|(id, effect, activation)| InspectorEffect {
+                id: format!("{}/{}", id.component(), id.key()),
+                activation,
+                dependencies: display_value(effect.dependencies(), false),
+                start: effect.start().name().to_owned(),
+                cleanup: effect.cleanup().name().to_owned(),
+                generation: effect.generation().get(),
+            })
+            .collect(),
+        motions: runtime
+            .motions
+            .inspect(runtime.clock.now())
+            .into_iter()
+            .map(|animation| InspectorMotion {
+                id: format!(
+                    "{}/{}",
+                    animation.key.component,
+                    animation.key.property.as_str()
+                ),
+                kind: animation.kind,
+                value: animation.value,
+                target: animation.target,
+                velocity: animation.velocity,
+                elapsed_ms: animation.elapsed_ms,
+                duration_ms: animation.duration_ms,
+                repeating: animation.repeating,
+                active: animation.active,
+            })
+            .collect(),
+        timelines: runtime
+            .motions
+            .inspect_timelines(runtime.clock.now())
+            .into_iter()
+            .map(|timeline| InspectorTimeline {
+                id: format!(
+                    "{}/{}/{}",
+                    timeline.handle.domain(),
+                    timeline.handle.owner(),
+                    timeline.handle.name()
+                ),
+                state: format!("{:?}", timeline.state),
+                elapsed_ms: timeline.elapsed_ms,
+                duration_ms: timeline.duration_ms,
+                iterations: timeline.iterations,
+                autoreverse: timeline.autoreverse,
+                track_count: timeline.track_count,
+            })
+            .collect(),
+        timers: runtime
+            .timers
+            .inspect(runtime.clock.now())
+            .into_iter()
+            .map(|timer| InspectorTimer {
+                id: format!("{}/{}", timer.id.component(), timer.id.key()),
+                delay_ms: u64::try_from(timer.delay.as_millis()).unwrap_or(u64::MAX),
+                remaining_ms: u64::try_from(timer.remaining.as_millis()).unwrap_or(u64::MAX),
+                declaration_paused: timer.declaration_paused,
+                interaction_paused: timer.interaction_paused,
+                view_paused: timer.view_paused,
+                callback: timer.callback,
+                generation: timer.generation.get(),
+            })
+            .collect(),
+        element_refs: runtime
+            .element_refs
+            .iter()
+            .map(|(id, node)| InspectorElementRef {
+                id: format!("{}/{}", id.component(), id.key()),
+                node: node.get(),
+            })
+            .collect(),
+        virtual_collections: inspect_virtual_collections(runtime),
+        geometry_nodes: geometry.len(),
+        pointer_captures: pointer_capture
+            .snapshot()
+            .into_iter()
+            .map(|(pointer, node)| (pointer, node.get()))
+            .collect(),
+        locale_readers: runtime.environment_dependencies.locale_reader_count(),
+        theme_readers: runtime.environment_dependencies.theme_reader_count(),
+        viewport_readers: runtime.environment_dependencies.viewport_reader_count(),
+        clock_elapsed_ms: u64::try_from(runtime.clock.elapsed().as_millis()).unwrap_or(u64::MAX),
+    }
+}
+
+fn inspect_virtual_collections(runtime: &UiRuntimeState) -> Vec<InspectorVirtualCollection> {
+    runtime
+        .virtual_requests
+        .inspect()
+        .into_iter()
+        .map(|metrics| InspectorVirtualCollection {
+            id: format!("{}/{}", metrics.id.component, metrics.id.key),
+            item_count: metrics.item_count,
+            realized_count: metrics.realized_count,
+            realized_range: metrics.realized_range,
+            requested_count: metrics.requested_count,
+            requested_range: metrics.requested_range,
+            visible_range: metrics.visible_range,
+            viewport_height: metrics.viewport_height,
+            scroll_item: metrics.scroll_item,
+            scroll_offset: metrics.scroll_offset,
+            is_scrolled: metrics.is_scrolled,
+            sticky_header: metrics.sticky_header,
+            bottom_align: metrics.bottom_align,
+            follow_tail: metrics.follow_tail,
+        })
+        .collect()
+}
+
+fn inspect_node(node: &UiNode, path: &str) -> InspectorNode {
+    let mut props = BTreeMap::new();
+    let (kind, descendants): (String, Vec<&UiNode>) = match node.kind() {
+        UiNodeKind::Text { text } => {
+            props.insert("text".to_owned(), truncate(text, 80));
+            ("text".to_owned(), Vec::new())
+        }
+        UiNodeKind::RichText { text, spans } => {
+            (inspect_rich_text(text, spans, &mut props), Vec::new())
+        }
+        UiNodeKind::Canvas { scene } => (inspect_canvas(scene, &mut props), Vec::new()),
+        UiNodeKind::Svg { source } => {
+            props.insert("bytes".to_owned(), source.len().to_string());
+            ("svg".to_owned(), Vec::new())
+        }
+        UiNodeKind::Box { children } => ("box".to_owned(), children.iter().collect()),
+        UiNodeKind::Fragment { children } => ("fragment".to_owned(), children.iter().collect()),
+        UiNodeKind::Custom { primitive } => {
+            props = inspect_primitive_props(primitive);
+            (
+                format!("primitive:{}", primitive.primitive.as_str()),
+                Vec::new(),
+            )
+        }
+        UiNodeKind::Image { source } => inspect_image(source, &mut props),
+        UiNodeKind::DirectionalImage {
+            left_to_right,
+            right_to_left,
+        } => inspect_directional_image(left_to_right, right_to_left, &mut props),
+        UiNodeKind::Overlay {
+            trigger,
+            content,
+            spec,
+        } => {
+            props.insert("id".to_owned(), spec.id.as_str().to_owned());
+            props.insert("kind".to_owned(), format!("{:?}", spec.kind));
+            props.insert("placement".to_owned(), format!("{:?}", spec.placement));
+            props.insert("open".to_owned(), spec.open.to_string());
+            (
+                "overlay".to_owned(),
+                vec![trigger.as_ref(), content.as_ref()],
+            )
+        }
+        UiNodeKind::Layer { content, spec } => {
+            props.insert("id".to_owned(), spec.id.as_str().to_owned());
+            props.insert("placement".to_owned(), format!("{:?}", spec.placement));
+            props.insert("priority".to_owned(), spec.priority.to_string());
+            ("layer".to_owned(), vec![content.as_ref()])
+        }
+        UiNodeKind::VirtualCollection { spec } => inspect_virtual_collection(spec, &mut props),
+        UiNodeKind::ErrorBoundary { child, fallback } => (
+            "error_boundary".to_owned(),
+            vec![child.as_ref(), fallback.as_ref()],
+        ),
+    };
+    let children = descendants
+        .into_iter()
+        .enumerate()
+        .map(|(index, child)| {
+            let segment = child
+                .key()
+                .map_or_else(|| index.to_string(), |key| format!("key:{}", key.as_str()));
+            inspect_node(child, &format!("{path}/{segment}"))
+        })
+        .collect();
+    InspectorNode {
+        path: path.to_owned(),
+        kind,
+        key: node.key().map(|key| key.as_str().to_owned()),
+        source: node.source().cloned(),
+        props,
+        attributes: node
+            .attributes()
+            .iter()
+            .map(|(name, value)| (name.clone(), display_value(value, false)))
+            .collect(),
+        handlers: node
+            .handlers()
+            .iter()
+            .flat_map(|(event, bindings)| {
+                bindings.iter().map(move |binding| {
+                    format!(
+                        "{event}:{:?}={}",
+                        binding.phase(),
+                        binding.handler().diagnostic_label()
+                    )
+                })
+            })
+            .collect(),
+        motions: node
+            .motions()
+            .iter()
+            .map(|animation| format!("{animation:?}"))
+            .collect(),
+        style: node.style().resolve(&crate::InteractionState::default()),
+        children,
+    }
+}
+
+fn inspect_primitive_props(primitive: &crate::PrimitiveNode) -> BTreeMap<String, String> {
+    let props = primitive
+        .props
+        .iter()
+        .map(|(name, value)| (name.to_owned(), primitive_value(value)))
+        .collect();
+    #[cfg(feature = "charts")]
+    {
+        let mut props = props;
+        if primitive.primitive.as_str() == "gpui_rhai.chart" {
+            inspect_chart_primitive(primitive, &mut props);
+        }
+        props
+    }
+    #[cfg(not(feature = "charts"))]
+    {
+        props
+    }
+}
+
+#[cfg(feature = "charts")]
+fn inspect_chart_primitive(primitive: &crate::PrimitiveNode, props: &mut BTreeMap<String, String>) {
+    let Some(crate::PrimitiveValue::Data(spec)) = primitive.props.get("spec") else {
+        return;
+    };
+    let spec = match crate::ChartSpec::from_ui_value(spec) {
+        Ok(spec) => spec,
+        Err(error) => {
+            props.insert("chart_config_error".to_owned(), error.to_string());
+            return;
+        }
+    };
+    let lengths = match primitive.props.get("data") {
+        Some(crate::PrimitiveValue::ChartData(data)) => data
+            .snapshot()
+            .datasets()
+            .map(|(name, dataset)| (name.to_owned(), dataset.len()))
+            .collect::<BTreeMap<_, _>>(),
+        Some(crate::PrimitiveValue::Data(crate::UiValue::Array(rows))) => {
+            BTreeMap::from([("main".to_owned(), rows.len())])
+        }
+        _ => BTreeMap::new(),
+    };
+    let sampling = spec
+        .series
+        .iter()
+        .filter_map(|series| {
+            let source = lengths.get(&series.dataset).copied()?;
+            let explicit = series
+                .transforms
+                .iter()
+                .find_map(|transform| match transform {
+                    crate::ChartTransformSpec::Downsample { threshold, .. } => Some(*threshold),
+                    _ => None,
+                });
+            let target = explicit.or_else(|| {
+                matches!(
+                    series.kind,
+                    crate::ChartSeriesKind::Line | crate::ChartSeriesKind::Area
+                )
+                .then_some(4_000)
+            })?;
+            (source > target).then(|| format!("{}:{target}/{source}", series.key))
+        })
+        .collect::<Vec<_>>();
+    if !sampling.is_empty() {
+        props.insert("chart_sampling_plan".to_owned(), sampling.join(", "));
+    }
+}
+
+fn inspect_virtual_collection<'a>(
+    spec: &'a crate::VirtualCollectionNodeSpec,
+    props: &mut BTreeMap<String, String>,
+) -> (String, Vec<&'a UiNode>) {
+    props.insert("items".to_owned(), spec.data.len().to_string());
+    props.insert("realized".to_owned(), spec.realized.len().to_string());
+    (
+        "virtual_collection".to_owned(),
+        spec.realized.values().collect(),
+    )
+}
+
+fn inspect_rich_text(
+    text: &str,
+    spans: &[crate::Span],
+    props: &mut BTreeMap<String, String>,
+) -> String {
+    props.insert("text".to_owned(), truncate(text, 80));
+    props.insert("span_count".to_owned(), spans.len().to_string());
+    "rich_text".to_owned()
+}
+
+fn inspect_canvas(scene: &crate::CanvasScene, props: &mut BTreeMap<String, String>) -> String {
+    props.insert(
+        "command_count".to_owned(),
+        scene.commands().len().to_string(),
+    );
+    "canvas".to_owned()
+}
+
+fn inspect_image<'a>(
+    source: &crate::ImageSourceSpec,
+    props: &mut BTreeMap<String, String>,
+) -> (String, Vec<&'a UiNode>) {
+    props.insert("source".to_owned(), inspect_image_source(source));
+    ("image".to_owned(), Vec::new())
+}
+
+fn inspect_directional_image<'a>(
+    left_to_right: &crate::ImageSourceSpec,
+    right_to_left: &crate::ImageSourceSpec,
+    props: &mut BTreeMap<String, String>,
+) -> (String, Vec<&'a UiNode>) {
+    props.insert(
+        "left_to_right".to_owned(),
+        inspect_image_source(left_to_right),
+    );
+    props.insert(
+        "right_to_left".to_owned(),
+        inspect_image_source(right_to_left),
+    );
+    ("directional_image".to_owned(), Vec::new())
+}
+
+fn inspect_image_source(source: &crate::ImageSourceSpec) -> String {
+    match source {
+        crate::ImageSourceSpec::Handle(handle) => format!("{}#<opaque>", handle.kind()),
+        crate::ImageSourceSpec::Asset(asset) => asset.as_str().to_owned(),
+    }
+}
+
+fn primitive_value(value: &PrimitiveValue) -> String {
+    match value {
+        PrimitiveValue::Data(value) => display_value(value, false),
+        PrimitiveValue::Node(_) => "<node>".to_owned(),
+        PrimitiveValue::Nodes(nodes) => format!("<{} nodes>", nodes.len()),
+        PrimitiveValue::Callback(callback) => callback.diagnostic_label(),
+        PrimitiveValue::Style(_) => "<style>".to_owned(),
+        PrimitiveValue::Length(length) => format!("{length:?}"),
+        PrimitiveValue::Asset(asset) => asset.as_str().to_owned(),
+        PrimitiveValue::Signal(signal) => format!("signal:{}", signal.id().key()),
+        PrimitiveValue::Ref(reference) => format!("ref:{}", reference.id().key()),
+        PrimitiveValue::Document(document) => format!(
+            "{}@{} ({} bytes)",
+            document.identity(),
+            document.revision(),
+            document.text().len()
+        ),
+        #[cfg(feature = "charts")]
+        PrimitiveValue::ChartData(data) => format!("chart-data@{}", data.revision()),
+    }
+}
+
+fn display_value(value: &UiValue, sensitive: bool) -> String {
+    if sensitive {
+        return "<redacted>".to_owned();
+    }
+    match value {
+        UiValue::Null => "null".to_owned(),
+        UiValue::Bool(value) => value.to_string(),
+        UiValue::Integer(value) => value.to_string(),
+        UiValue::Float(value) => value.to_string(),
+        UiValue::String(value) => format!("{:?}", truncate(value, 80)),
+        UiValue::Array(values) => format!("[{} items]", values.len()),
+        UiValue::Map(values) => format!("{{{} fields}}", values.len()),
+        UiValue::Handle(handle) => format!("{}#<opaque>", handle.kind()),
+    }
+}
+
+fn truncate(value: &str, max: usize) -> String {
+    let mut output = value.chars().take(max).collect::<String>();
+    if value.chars().count() > max {
+        output.push('…');
+    }
+    output
+}
+
+#[must_use]
+#[cfg(feature = "dev-reload")]
+pub(crate) fn inspector_element(snapshot: &InspectorSnapshot) -> AnyElement {
+    let mut lines = inspector_header(snapshot);
+    if let Some(root) = &snapshot.root {
+        append_node_lines(root, 0, &mut lines);
+    }
+    lines.push("Components".to_owned());
+    for component in &snapshot.components {
+        lines.push(format!("  {}::{}", component.id, component.export));
+        lines.push(format!("    props={:?}", component.props));
+        lines.push(format!("    slots={:?}", component.slots));
+        lines.push(format!("    parts={:?}", component.parts));
+    }
+    append_mechanism_lines(snapshot, &mut lines);
+    lines.push("State".to_owned());
+    for instance in &snapshot.state {
+        lines.push(format!("  {}", instance.path));
+        for (name, value) in &instance.fields {
+            lines.push(format!(
+                "    {name}: {}",
+                display_value(&value.value, value.sensitive)
+            ));
+        }
+    }
+    lines.push("Stores".to_owned());
+    for store in &snapshot.stores {
+        lines.push(format!("  {:?}:{}", store.id.scope, store.id.name));
+        for (name, value) in &store.fields {
+            lines.push(format!(
+                "    {name}: {}",
+                display_value(&value.value, value.sensitive)
+            ));
+        }
+    }
+    lines.push("Theme tokens".to_owned());
+    for (name, value) in &snapshot.theme_colors {
+        lines.push(format!("  {name}: {value}"));
+    }
+    lines.push("Invalidations".to_owned());
+    if snapshot.dirty.is_empty() {
+        lines.push("  none pending".to_owned());
+    } else {
+        lines.extend(snapshot.dirty.iter().map(|path| format!("  dirty: {path}")));
+    }
+    lines.push("Script timings".to_owned());
+    for timing in snapshot.timings.iter().rev().take(20) {
+        lines.push(format!(
+            "  {:?} {} {:.2?} {} ops(v{}){}",
+            timing.operation,
+            timing.source,
+            timing.duration,
+            timing.operations,
+            timing.operation_semantics,
+            if timing.slow { " SLOW" } else { "" }
+        ));
+    }
+    lines.push("Recent traces".to_owned());
+    for trace in snapshot.traces.iter().rev().take(20) {
+        lines.push(format!(
+            "  #{} {:?} {} — {} {}",
+            trace.sequence,
+            trace.kind,
+            trace.scope,
+            trace.message,
+            trace
+                .payload
+                .as_ref()
+                .map_or_else(String::new, |value| display_value(value, trace.sensitive))
+        ));
+    }
+    deferred(
+        div()
+            .id("gpui-rhai-inspector")
+            .absolute()
+            .top_0()
+            .right_0()
+            .w(px(420.0))
+            .h_full()
+            .overflow_y_scroll()
+            .p_3()
+            .bg(rgba(0x1717_1bee))
+            .text_color(rgba(0xf4f4_f5ff))
+            .text_size(px(11.0))
+            .children(lines.into_iter().map(|line| div().child(line))),
+    )
+    .with_priority(10_000)
+    .into_any_element()
+}
+
+#[cfg(feature = "dev-reload")]
+fn inspector_header(snapshot: &InspectorSnapshot) -> Vec<String> {
+    vec![
+        format!(
+            "GPUI Rhai Inspector — {} / {}",
+            snapshot.theme_family, snapshot.theme_name
+        ),
+        format!(
+            "nodes={} state={} stores={} signals={} effects={} motions={} timelines={} timers={} refs={} virtual={} geometry={} captures={} dirty={} traces={} timings={} clock={}ms",
+            snapshot.root.as_ref().map_or(0, count_nodes),
+            snapshot.state.len(),
+            snapshot.stores.len(),
+            snapshot.signals.len(),
+            snapshot.effects.len(),
+            snapshot.motions.len(),
+            snapshot.timelines.len(),
+            snapshot.timers.len(),
+            snapshot.element_refs.len(),
+            snapshot.virtual_collections.len(),
+            snapshot.geometry_nodes,
+            snapshot.pointer_captures.len(),
+            snapshot.dirty.len(),
+            snapshot.traces.len(),
+            snapshot.timings.len(),
+            snapshot.clock_elapsed_ms
+        ),
+    ]
+}
+
+#[cfg(feature = "dev-reload")]
+fn append_mechanism_lines(snapshot: &InspectorSnapshot, lines: &mut Vec<String>) {
+    lines.push(format!(
+        "Dependencies — locale={} theme={} viewport={}",
+        snapshot.locale_readers, snapshot.theme_readers, snapshot.viewport_readers
+    ));
+    lines.push("Signals".to_owned());
+    for signal in &snapshot.signals {
+        lines.push(format!(
+            "  {} {}={} rev={} writer={}",
+            signal.id, signal.kind, signal.value, signal.revision, signal.last_writer
+        ));
+    }
+    lines.push("Effects".to_owned());
+    for effect in &snapshot.effects {
+        lines.push(format!(
+            "  {} activation={} deps={} start={} cleanup={} gen={}",
+            effect.id,
+            effect.activation,
+            effect.dependencies,
+            effect.start,
+            effect.cleanup,
+            effect.generation
+        ));
+    }
+    lines.push("Motion sources".to_owned());
+    for motion in &snapshot.motions {
+        lines.push(format!(
+            "  {} {} value={:.4} target={:.4} velocity={:?} elapsed={}ms duration={:?} repeat={} active={}",
+            motion.id,
+            motion.kind,
+            motion.value,
+            motion.target,
+            motion.velocity,
+            motion.elapsed_ms,
+            motion.duration_ms,
+            motion.repeating,
+            motion.active
+        ));
+    }
+    lines.push("Motion timelines".to_owned());
+    for timeline in &snapshot.timelines {
+        lines.push(format!(
+            "  {} state={} elapsed={}ms duration={:?} iterations={:?} reverse={} tracks={}",
+            timeline.id,
+            timeline.state,
+            timeline.elapsed_ms,
+            timeline.duration_ms,
+            timeline.iterations,
+            timeline.autoreverse,
+            timeline.track_count
+        ));
+    }
+    lines.push("Timers".to_owned());
+    for timer in &snapshot.timers {
+        lines.push(format!(
+            "  {} remaining={}ms/{}ms paused={}/{}/{} callback={} gen={}",
+            timer.id,
+            timer.remaining_ms,
+            timer.delay_ms,
+            timer.declaration_paused,
+            timer.interaction_paused,
+            timer.view_paused,
+            timer.callback,
+            timer.generation
+        ));
+    }
+    lines.push("Element refs".to_owned());
+    for reference in &snapshot.element_refs {
+        lines.push(format!("  {} -> node {}", reference.id, reference.node));
+    }
+    lines.push("Virtual collections".to_owned());
+    for collection in &snapshot.virtual_collections {
+        lines.push(format!(
+            "  {} items={} realized={}:{:?} requested={}:{:?} visible={:?} viewport={:.1} top={}:{} sticky={:?} scrolled={} bottom={} follow_tail={}",
+            collection.id,
+            collection.item_count,
+            collection.realized_count,
+            collection.realized_range,
+            collection.requested_count,
+            collection.requested_range,
+            collection.visible_range,
+            collection.viewport_height,
+            collection.scroll_item,
+            collection.scroll_offset,
+            collection.sticky_header,
+            collection.is_scrolled,
+            collection.bottom_align,
+            collection.follow_tail
+        ));
+    }
+    if !snapshot.pointer_captures.is_empty() {
+        lines.push(format!("Pointer captures: {:?}", snapshot.pointer_captures));
+    }
+}
+
+#[cfg(feature = "dev-reload")]
+fn count_nodes(node: &InspectorNode) -> usize {
+    1 + node.children.iter().map(count_nodes).sum::<usize>()
+}
+
+#[cfg(feature = "dev-reload")]
+fn append_node_lines(node: &InspectorNode, depth: usize, lines: &mut Vec<String>) {
+    let source = node.source.as_ref().map_or_else(String::new, |source| {
+        format!(" @ {}:{}:{}", source.module, source.line, source.column)
+    });
+    lines.push(format!(
+        "{}{} {}{}",
+        "  ".repeat(depth),
+        node.path,
+        node.kind,
+        source
+    ));
+    let indent = "  ".repeat(depth.saturating_add(1));
+    if let Some(key) = &node.key {
+        lines.push(format!("{indent}key={key}"));
+    }
+    if !node.props.is_empty() {
+        lines.push(format!("{indent}props={:?}", node.props));
+    }
+    if !node.attributes.is_empty() {
+        lines.push(format!("{indent}attributes={:?}", node.attributes));
+    }
+    if !node.handlers.is_empty() {
+        lines.push(format!("{indent}handlers={:?}", node.handlers));
+    }
+    if !node.motions.is_empty() {
+        lines.push(format!("{indent}motions={:?}", node.motions));
+    }
+    lines.push(format!("{indent}computed_style={:?}", node.style));
+    for child in &node.children {
+        append_node_lines(child, depth.saturating_add(1), lines);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        ComponentInstancePath, ComponentStateSchema, EventPropagation, HostCallback, StateField,
+        ValueSchema,
+    };
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn inspector_reports_host_handler_label_without_opaque_details() {
+        let root = UiNode::text("Host").with_host_handler(
+            "click",
+            HostCallback::new("widget.select", |_, _, _| EventPropagation::Handled),
+        );
+        let inspected = inspect_node(&root, "root");
+        assert_eq!(inspected.handlers, vec!["click:Target=host:widget.select"]);
+    }
+
+    #[test]
+    fn snapshot_captures_source_and_redacts_sensitive_state() {
+        let mut runtime = UiRuntimeState::new();
+        let path = ComponentInstancePath::root("Login", "root");
+        let schema = ComponentStateSchema::new(BTreeMap::from([(
+            "token".to_owned(),
+            StateField::new(ValueSchema::string(), UiValue::String("secret".to_owned()))
+                .sensitive(true),
+        )]))
+        .unwrap();
+        let mut transaction = runtime.component_state.begin_render();
+        transaction.mount(path, &schema).unwrap();
+        runtime.component_state.commit_render(transaction);
+        let root = UiNode::text("Login").with_source(SourceLocation {
+            module: "ui/main.rhai".to_owned(),
+            line: 4,
+            column: 9,
+        });
+        let engine = crate::RuntimeEngine::new();
+        let theme = crate::load_theme_source(
+            engine.engine(),
+            "theme.rhai",
+            include_str!("../../../registry/themes/default_dark.rhai"),
+        )
+        .unwrap();
+        let snapshot = InspectorSnapshot::capture(
+            Some(&root),
+            &runtime,
+            &theme,
+            &ComponentRegistry::default(),
+            Vec::new(),
+        );
+        assert_eq!(snapshot.root.unwrap().source.unwrap().line, 4);
+        assert!(snapshot.state[0].fields["token"].sensitive);
+        assert_eq!(
+            snapshot.state[0].fields["token"].value,
+            UiValue::String("<sensitive>".to_owned())
+        );
+        assert_eq!(
+            display_value(&snapshot.state[0].fields["token"].value, true),
+            "<redacted>"
+        );
+    }
+
+    #[test]
+    fn trace_buffer_is_bounded_and_ordered() {
+        let mut traces = TraceBuffer::new(2);
+        for index in 0..3 {
+            traces.push(
+                RuntimeTraceKind::Event,
+                "root",
+                format!("event-{index}"),
+                None,
+                false,
+            );
+        }
+        let snapshot = traces.snapshot();
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot[0].sequence, 2);
+        assert_eq!(snapshot[1].sequence, 3);
+    }
+
+    #[test]
+    fn sensitive_trace_payload_is_redacted_before_storage() {
+        let mut traces = TraceBuffer::new(1);
+        traces.push(
+            RuntimeTraceKind::State,
+            "login",
+            "token changed",
+            Some(UiValue::String("secret".to_owned())),
+            true,
+        );
+        assert_eq!(
+            traces.snapshot()[0].payload,
+            Some(UiValue::String("<sensitive>".to_owned()))
+        );
+    }
+
+    fn install_virtual_metrics_probe(runtime: &UiRuntimeState, component: &ComponentInstancePath) {
+        runtime.virtual_requests.request(
+            crate::VirtualCollectionId {
+                component: component.clone(),
+                key: "rows".to_owned(),
+            },
+            [4, 5],
+        );
+    }
+
+    #[test]
+    fn snapshot_includes_runtime_mechanism_identity_and_state() {
+        let component = ComponentInstancePath::root("View", "main");
+        let mut runtime = UiRuntimeState::new();
+        let now = Instant::now();
+        let clock = crate::ManualRuntimeClock::new(now);
+        runtime.clock = clock.clock();
+        let signal_id =
+            crate::SignalId::new(component.clone(), "progress", crate::SignalKind::Float).unwrap();
+        runtime.signals.reconcile(
+            &component,
+            BTreeMap::from([(
+                signal_id.clone(),
+                crate::signal::SignalDescriptor::new(crate::SignalValue::Float(0.25)),
+            )]),
+        );
+        let signal = crate::NativeSignal::new(signal_id);
+        runtime
+            .signals
+            .write_from(
+                &signal,
+                crate::SignalValue::Float(0.5),
+                crate::SignalWriter::Script,
+            )
+            .unwrap();
+
+        let mut callback = crate::ScriptCallback::try_from_fn_ptr(
+            rhai::FnPtr::new("fired").unwrap(),
+            crate::ScriptGeneration::initial(),
+        )
+        .unwrap();
+        callback.bind_component_if_unset(component.clone(), BTreeMap::new());
+        let timer = crate::TimerDescriptor::new(
+            crate::TimerId::new(component.clone(), "refresh").unwrap(),
+            Duration::from_secs(1),
+            false,
+            callback,
+            UiValue::Null,
+        )
+        .unwrap();
+        runtime.timers.reconcile(
+            &component,
+            BTreeMap::from([(timer.id().clone(), timer)]),
+            now,
+        );
+        let mut transition =
+            crate::MotionTransition::new(crate::MotionProperty::Opacity, 0.0, 1.0, 1_000);
+        transition.easing = crate::MotionEasing::Linear;
+        runtime
+            .motions
+            .start(
+                component.clone(),
+                crate::MotionSource::Transition(transition),
+                now,
+            )
+            .unwrap();
+        clock.advance(Duration::from_millis(250));
+
+        let mut retained = crate::RetainedUiTree::new();
+        retained.reconcile(UiNode::text("target")).unwrap();
+        let node = retained.root_id().unwrap();
+        let reference = crate::ElementRefId::new(component.clone(), "target").unwrap();
+        runtime
+            .element_refs
+            .reconcile(&component, BTreeMap::from([(reference, node)]));
+        runtime.pointer_capture.capture(7, node);
+        let bounds = crate::GeometryBounds::new(0.0, 0.0, 10.0, 10.0).unwrap();
+        runtime.geometry.update(
+            node,
+            crate::ElementGeometry {
+                layout: bounds,
+                visual: bounds,
+                clip: None,
+            },
+        );
+        install_virtual_metrics_probe(&runtime, &component);
+
+        let engine = crate::RuntimeEngine::new();
+        let theme = crate::load_theme_source(
+            engine.engine(),
+            "theme.rhai",
+            include_str!("../../../registry/themes/default_dark.rhai"),
+        )
+        .unwrap();
+        let snapshot = InspectorSnapshot::capture(
+            retained.root(),
+            &runtime,
+            &theme,
+            &ComponentRegistry::default(),
+            Vec::new(),
+        );
+        assert_eq!(snapshot.signals[0].revision, 1);
+        assert_eq!(snapshot.signals[0].last_writer, "Script");
+        assert_eq!(snapshot.timers[0].callback, "fired");
+        assert_eq!(snapshot.clock_elapsed_ms, 250);
+        assert_eq!(snapshot.motions[0].kind, "transition");
+        assert!((snapshot.motions[0].value - 0.25).abs() < f64::EPSILON);
+        assert_eq!(snapshot.motions[0].duration_ms, Some(1_000));
+        assert_eq!(snapshot.element_refs[0].node, node.get());
+        assert_eq!(snapshot.virtual_collections[0].requested_range, 4..6);
+        assert_eq!(snapshot.geometry_nodes, 1);
+        assert_eq!(snapshot.pointer_captures.get(&7), Some(&node.get()));
+    }
+}

@@ -1,0 +1,15 @@
+[package]
+name = "nanobot-gpu"
+version = "0.1.0"
+edition = "2021"
+license = "Proprietary"
+description = "nanobot GPU render slot: the process-wide shared wgpu device, offscreen targets and zero-copy surface compositing that any harness renderer (product or plugin) draws through"
+
+[dependencies]
+gpui = { workspace = true }
+gpui-wgpu = { workspace = true }
+# One wgpu for the whole workspace: the renderer's target view, the gpui context
+# handle and any product renderer must agree, or the texture sharing cannot
+# typecheck. That agreement is the point of this crate.
+wgpu = { workspace = true }
+pollster = { workspace = true }

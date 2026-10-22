@@ -1,0 +1,82 @@
+use std::collections::BTreeMap;
+
+use gpui::AnyElement;
+
+use crate::overlay_element::WindowOverlayCoordinator;
+use crate::renderer::{GpuiNodeRenderer, OwnedColorResolver, WindowRenderResources};
+use crate::{
+    AssetRegistry, InteractionState, MotionKey, NodeEventDispatcher, PrimitiveRegistry, UiNode,
+};
+
+#[derive(Clone)]
+pub(crate) struct NodeSlotRuntime {
+    pub now: std::time::Instant,
+    pub clock: crate::RuntimeClock,
+    pub colors: OwnedColorResolver,
+    pub primitives: PrimitiveRegistry,
+    pub assets: AssetRegistry,
+    pub dispatcher: NodeEventDispatcher,
+    pub overlays: WindowOverlayCoordinator,
+    pub motions: BTreeMap<MotionKey, f64>,
+    pub motion_preference: crate::MotionPreference,
+    pub motion_quality: crate::MotionQuality,
+    pub signals: crate::SignalRegistry,
+    pub geometry: crate::GeometryRegistry,
+    pub pointer_capture: crate::PointerCaptureRegistry,
+    pub focus_handles: BTreeMap<crate::NodeId, gpui::FocusHandle>,
+    pub scroll_handles: BTreeMap<crate::NodeId, gpui::ScrollHandle>,
+    pub scroll_anchors: BTreeMap<crate::NodeId, gpui::ScrollAnchor>,
+    pub virtual_requests: crate::VirtualRequestRegistry,
+    pub text_selection: crate::renderer::TextSelectionRegistry,
+    pub host_focus: Option<gpui::FocusHandle>,
+    pub direction: crate::TextDirection,
+    pub locale: String,
+    pub number: Option<crate::NumberMetadata>,
+    pub ambient_text_color: Option<crate::Rgba8>,
+    pub base_path: String,
+    pub view_id: String,
+    pub retained_roots: BTreeMap<String, crate::NodeId>,
+    pub retained_links: BTreeMap<crate::NodeId, Vec<crate::RetainedChildLink>>,
+}
+
+impl NodeSlotRuntime {
+    pub(crate) fn render(&self, node: &UiNode, slot: &str) -> AnyElement {
+        let resources = WindowRenderResources {
+            now: self.now,
+            clock: &self.clock,
+            motion_preference: self.motion_preference,
+            motion_quality: self.motion_quality,
+            assets: &self.assets,
+            dispatcher: &self.dispatcher,
+            overlays: &self.overlays,
+            motions: &self.motions,
+            signals: &self.signals,
+            geometry: &self.geometry,
+            pointer_capture: &self.pointer_capture,
+            focus_handles: &self.focus_handles,
+            scroll_handles: &self.scroll_handles,
+            scroll_anchors: &self.scroll_anchors,
+            virtual_requests: &self.virtual_requests,
+            text_selection: &self.text_selection,
+            host_focus: self.host_focus.as_ref(),
+            direction: self.direction,
+            locale: &self.locale,
+            number: self.number.as_ref(),
+            ambient_text_color: self.ambient_text_color,
+            root_path: &self.base_path,
+            view_id: &self.view_id,
+        };
+        GpuiNodeRenderer::render_subtree_with_window_runtime_at(
+            node,
+            &self.colors,
+            &InteractionState::default(),
+            &self.primitives,
+            &resources,
+            &format!("{}/{slot}", self.base_path),
+            crate::renderer::RetainedSubtree {
+                root: self.retained_roots.get(slot).copied(),
+                links: &self.retained_links,
+            },
+        )
+    }
+}

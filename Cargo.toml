@@ -8,7 +8,15 @@ members = [
     "crates/nanobot-skills",
     "crates/nanobot-llm",
     "crates/nanobot-boot",
+    # Shell layer (gpui / wgpu): the kernel above stays GUI-free, these do not.
+    "crates/nanobot-gpu",
+    "crates/nanobot-rhai",
+    "crates/nanobot-ui",
 ]
+# The vendored gpui stack is consumed through the [patch.crates-io] table at
+# the end of this file; without the exclusion cargo would absorb the vendor
+# crates as members of THIS workspace (same reason workbench-rs excludes it).
+exclude = [".vendor"]
 
 [workspace.package]
 version = "0.1.0"
@@ -26,6 +34,9 @@ nanobot-skills = { path = "crates/nanobot-skills", version = "0.1.0" }
 nanobot-tools = { path = "crates/nanobot-tools", version = "0.1.0" }
 nanobot-agent = { path = "crates/nanobot-agent", version = "0.1.0" }
 nanobot-boot = { path = "crates/nanobot-boot", version = "0.1.0" }
+nanobot-gpu = { path = "crates/nanobot-gpu", version = "0.1.0" }
+nanobot-rhai = { path = "crates/nanobot-rhai", version = "0.1.0" }
+nanobot-ui = { path = "crates/nanobot-ui", version = "0.1.0" }
 
 # Common
 serde = { version = "1", features = ["derive"] }
@@ -42,8 +53,50 @@ reqwest = { version = "0.12", default-features = false, features = ["stream", "j
 eventsource-stream = { version = "0.2", default-features = false }
 wasm-bindgen-futures = "0.4"
 
+# Shell layer: gpui frontend (vendored gpui-ce fork; features mirror
+# workbench-rs so both workspaces resolve the same crate configuration).
+#
+# These are **version-only** dependencies on purpose. `[patch.crates-io]` only
+# applies from the workspace root, so the vendor path is supplied by whichever
+# root is building: nanobot's own table (standalone builds) or the consuming
+# workspace's table (rcad-pro points at workbench-rs/.vendor). Giving them a
+# `path` here would pin nanobot's own copy into every build and collide with the
+# consumer's patch source (design NR7).
+gpui = { package = "gpui-ce", version = "=0.2.2", features = [
+    "custom-gpu",
+    "wgpu-surfaces",
+] }
+gpui-wgpu = { package = "gpui_ce_wgpu", version = "=0.1.0", features = [
+    "custom-gpu",
+    "wgpu-surfaces",
+] }
+gpui-platform = { package = "gpui_ce_platform", version = "=0.1.0", features = [
+    "windows-wgpu",
+] }
+gpui-component = { package = "gpui_ce_components", version = "=0.2.0" }
+gpui-rhai = { version = "=0.1.5" }
+# One wgpu for the whole workspace (29.0.3): the renderer's target view, the
+# gpui context handle and any product renderer must agree, or the texture
+# sharing cannot typecheck (that is the point of nanobot-gpu).
+wgpu = "29.0.3"
+# Blocking adapter/device request on the platforms where the slot creates a
+# standalone device (gpui's renderer is not wgpu-backed there).
+pollster = "0.4"
+glam = { version = "0.29", features = ["serde"] }
+rhai = { version = "=1.26.0", features = ["internals", "metadata", "serde"] }
+# SVG rendering for script panels; `system-fonts` is what makes
+# `fontdb::Database::load_system_fonts` exist (see nanobot-rhai's note).
+usvg = { version = "=0.45.1", default-features = false, features = [
+    "text",
+    "system-fonts",
+] }
+
 [profile.dev]
 opt-level = 1
+# Incremental compilation accumulates ~20 GB of cache for the vendored gpui
+# tree and has filled the build volume more than once. The framework workspace
+# builds the way CI does.
+incremental = false
 
 [profile.dev.package."*"]
 opt-level = 2
@@ -53,3 +106,42 @@ opt-level = 2
 lto = "thin"
 codegen-units = 1
 strip = "debuginfo"
+
+# Vendor single source (design NR7 / 10.4 P0-3): this table is the same content
+# as rcad-pro's root [patch.crates-io] (which points at workbench-rs/.vendor)
+# and as workbench-rs/Cargo.toml's own table. [patch] only applies from the
+# workspace root, so any workspace consuming these crates must carry it. The
+# trees are asserted byte-identical by tools/nanobot-vendor-check.py.
+[patch.crates-io]
+gpui-rhai = { path = ".vendor/gpui-rhai" }
+gpui-ce = { path = ".vendor/gpui-ce/crates/gpui" }
+gpui-component-story = { path = ".vendor/gpui-component/crates/story" }
+gpui-component-story-web = { path = ".vendor/gpui-component/crates/story-web" }
+gpui_ce_apple = { path = ".vendor/gpui-ce/crates/gpui_apple" }
+gpui_ce_collections = { path = ".vendor/gpui-ce/crates/gpui_collections" }
+gpui_ce_components = { path = ".vendor/gpui-component/crates/ui" }
+gpui_ce_components_assets = { path = ".vendor/gpui-component/crates/assets" }
+gpui_ce_components_base = { path = ".vendor/gpui-component/crates/base" }
+gpui_ce_components_fps = { path = ".vendor/gpui-component/crates/fps" }
+gpui_ce_components_macros = { path = ".vendor/gpui-component/crates/macros" }
+gpui_ce_components_shell = { path = ".vendor/gpui-component/crates/shell" }
+gpui_ce_components_webview = { path = ".vendor/gpui-component/crates/webview" }
+gpui_ce_derive_refineable = { path = ".vendor/gpui-ce/crates/gpui_derive_refineable" }
+gpui_ce_elements = { path = ".vendor/gpui-ce/crates/gpui_elements" }
+gpui_ce_linux = { path = ".vendor/gpui-ce/crates/gpui_linux" }
+gpui_ce_macos = { path = ".vendor/gpui-ce/crates/gpui_macos" }
+gpui_ce_macros = { path = ".vendor/gpui-ce/crates/gpui_macros" }
+gpui_ce_media = { path = ".vendor/gpui-ce/crates/gpui_media" }
+gpui_ce_path = { path = ".vendor/gpui-ce/crates/gpui_path" }
+gpui_ce_platform = { path = ".vendor/gpui-ce/crates/gpui_platform" }
+gpui_ce_refineable = { path = ".vendor/gpui-ce/crates/gpui_refineable" }
+gpui_ce_render = { path = ".vendor/gpui-ce/crates/gpui_render" }
+gpui_ce_scheduler = { path = ".vendor/gpui-ce/crates/gpui_scheduler" }
+gpui_ce_shared_string = { path = ".vendor/gpui-ce/crates/gpui_shared_string" }
+gpui_ce_sum_tree = { path = ".vendor/gpui-ce/crates/gpui_sum_tree" }
+gpui_ce_tokio = { path = ".vendor/gpui-ce/crates/gpui_tokio" }
+gpui_ce_util = { path = ".vendor/gpui-ce/crates/gpui_ce_util" }
+gpui_ce_web = { path = ".vendor/gpui-ce/crates/gpui_web" }
+gpui_ce_wgpu = { path = ".vendor/gpui-ce/crates/gpui_wgpu" }
+gpui_ce_windows = { path = ".vendor/gpui-ce/crates/gpui_windows" }
+gpui_ce_zed_util = { path = ".vendor/gpui-ce/crates/gpui_zed_util" }
