@@ -159,6 +159,7 @@ pub struct HarnessBuilder {
     tool_executor: Option<Arc<dyn ToolExecutor>>,
     plan_verifier: Option<Arc<dyn PlanVerifier>>,
     approval_policy: Option<Arc<dyn ApprovalPolicy>>,
+    persona: Option<String>,
     skills: Vec<SkillManifest>,
 }
 
@@ -175,6 +176,7 @@ impl HarnessBuilder {
             tool_executor: None,
             plan_verifier: None,
             approval_policy: None,
+            persona: None,
             skills: Vec::new(),
         }
     }
@@ -252,6 +254,14 @@ impl HarnessBuilder {
         self
     }
 
+    /// The product's standing instructions (persona section of the system
+    /// prompt). When unset the framework's built-in default is used; a product
+    /// supplies its own because the domain identity belongs to the product.
+    pub fn with_persona(mut self, persona: impl Into<String>) -> Self {
+        self.persona = Some(persona.into());
+        self
+    }
+
     /// Skill manifests to enable at assembly time. Each enablement is
     /// isolated: a manifest that fails (or panics) is skipped and noted, not
     /// fatal.
@@ -273,6 +283,7 @@ impl HarnessBuilder {
             tool_executor,
             plan_verifier,
             approval_policy,
+            persona,
             skills,
         } = self;
 
@@ -376,6 +387,9 @@ impl HarnessBuilder {
         }
         if let Some(verifier) = plan_verifier {
             agent.set_plan_verifier(verifier);
+        }
+        if let Some(persona) = persona {
+            agent.set_persona(persona);
         }
 
         // The skill runner with a root context. Each enablement is isolated:

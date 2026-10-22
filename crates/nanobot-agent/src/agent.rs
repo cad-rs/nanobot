@@ -179,6 +179,10 @@ struct AgentInner {
     /// skills can append their persona sections (design-harness 14.2). The
     /// agent stays free of any plugin type.
     prompt_assembler: Mutex<Option<Arc<dyn Fn(String) -> String + Send + Sync>>>,
+    /// The product's standing instructions (the persona section of the system
+    /// prompt). Absent -> [`PERSONA`], the built-in default. A product sets
+    /// this so the framework carries no domain identity of its own.
+    persona: Mutex<Option<String>>,
     /// The product's plan grader: grades the declared intent against the
     /// post-execution state (design-harness 14.3). Absent -> a plan with an
     /// intent passes (nothing to check against).
@@ -211,7 +215,11 @@ enum PlanVerdict {
     },
 }
 
-/// The agent's standing instructions (design-harness 14.2, persona section).
+/// The built-in persona, used when the product supplies none.
+///
+/// This is a *default*, not the framework's opinion about the domain: a
+/// harness product installs its own standing instructions with
+/// [`Agent::set_persona`], because the domain identity belongs to the product.
 const PERSONA: &str = "\
 You are ocad, a CAD design agent working on one open part document.
 You change the document only by calling the provided tools; you never emit
@@ -276,6 +284,7 @@ impl Agent {
                 plan_checkpoint: Mutex::new(None),
                 plan_start_seq: Mutex::new(None),
                 prompt_assembler: Mutex::new(None),
+                persona: Mutex::new(None),
                 plan_verifier: Mutex::new(None),
             }),
         }
@@ -294,12 +303,23 @@ impl Agent {
         *self.inner.prompt_assembler.lock().unwrap() = Some(Arc::new(assembler));
     }
 
+    /// Set the product's standing instructions (the persona section).
+    ///
+    /// The persona is the *first* section of the system prompt: the domain
+    /// identity ("you are a chip design agent working on one open design"),
+    /// followed by what the product wants the model to treat as its job.
+    /// Unset, the built-in default ([`PERSONA`]) is used. Skills and the
+    /// prompt assembler still append after it, so this replaces the identity
+    /// only — it does not disable plugin contributions.
+    pub fn set_persona(&self, persona: impl Into<String>) {
+        *self.inner.persona.lock().unwrap() = Some(persona.into());
+    }
+
     /// Set the plan verifier (the product's intent grader). Without one, a
     /// plan that declares an intent passes — there is nothing to check against.
     pub fn set_plan_verifier(&self, verifier: Arc<dyn PlanVerifier>) {
         *self.inner.plan_verifier.lock().unwrap() = Some(verifier);
     }
-
 
     /// The system prompt the model receives this turn (design-harness 14.2).
     ///
@@ -316,7 +336,15 @@ impl Agent {
     /// the evaluated result. The check section carries the latest verdicts so
     /// the model can see what already failed.
     fn build_system_prompt(&self) -> String {
-        let mut prompt = String::from(PERSONA);
+        // The persona comes from the product when it set one; the built-in
+        // default is a fallback, not a framework opinion about the domain.
+        let mut prompt = self
+            .inner
+            .persona
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| PERSONA.to_string());
 
         let executor = self.inner.tool_executor.lock().unwrap().clone();
         if let Some(subject) = executor.as_ref().and_then(|e| e.describe_subject()) {
