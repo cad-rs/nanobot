@@ -20,10 +20,10 @@ Extraction is incremental. See the migration path in the architecture doc:
 |---|---|
 | `nanobot-cordis` | **landed** — plugin kernel (moved from `ocad-cordis`, zero deps) |
 | `nanobot-llm` | **landed** — LLM adapter seam (moved from `ocad-llm`) |
-| `nanobot-session` | pending — event-sourced session (strip the CAD proposal events, add `Extension`) |
-| `nanobot-tools` | pending — tool registry + 3 waterfalls (strip the CAD tool bodies) |
-| `nanobot-agent` | pending — loop/plan (move `EngineExecutor` back to the product) |
-| `nanobot-skills` | pending — skill runner (strip the CAD builtins) |
+| `nanobot-session` | **landed** — event log + seq + projection + JSONL + fork; base vocabulary + `Extension` for product events |
+| `nanobot-tools` | **landed** — ToolRegistry + three waterfalls + ApprovalPolicy + generalized ToolContract |
+| `nanobot-agent` | **landed** — turn/step loop, plan state machine, PlanVerifier seam |
+| `nanobot-skills` | **landed** — skill runner (manifest -> listeners), ships no skills |
 | `nanobot-boot` | pending — `Harness` assembly + CLI + selfcheck + project container |
 | `nanobot-gpu` | pending — wgpu↔gpui render slot (mechanism out of `ocad-viewport`) |
 | `nanobot-rhai` | pending — Rhai script plugin host |
