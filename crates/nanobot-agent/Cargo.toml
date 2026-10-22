@@ -1,0 +1,22 @@
+[package]
+name = "nanobot-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "nanobot agent handle: Inbox / turn-step driver / plan state machine / prompt section assembly"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+nanobot-llm = { workspace = true }
+nanobot-session = { workspace = true }
+nanobot-tools = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+futures-core = { workspace = true }
+futures-util = { workspace = true }
+
+[dev-dependencies]
+futures-executor = "0.3"

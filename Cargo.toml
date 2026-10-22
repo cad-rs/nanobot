@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/nanobot-cordis",
     "crates/nanobot-session",
+    "crates/nanobot-agent",
     "crates/nanobot-tools",
     "crates/nanobot-skills",
     "crates/nanobot-llm",
@@ -19,11 +20,16 @@ repository = "https://github.com/cad-rs/nanobot"
 # published to crates.io directly).
 nanobot-cordis = { path = "crates/nanobot-cordis", version = "0.1.0" }
 nanobot-llm = { path = "crates/nanobot-llm", version = "0.1.0" }
+nanobot-session = { path = "crates/nanobot-session", version = "0.1.0" }
+nanobot-skills = { path = "crates/nanobot-skills", version = "0.1.0" }
+nanobot-tools = { path = "crates/nanobot-tools", version = "0.1.0" }
+nanobot-agent = { path = "crates/nanobot-agent", version = "0.1.0" }
 
 # Common
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+futures-executor = "0.3"
 futures-core = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 bytes = "1"

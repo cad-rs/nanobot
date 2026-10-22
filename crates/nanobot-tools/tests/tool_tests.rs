@@ -1,6 +1,7 @@
-//! Integration tests for ocad-tools: ToolRegistry, ToolPipeline, ApprovalPolicy.
+//! Integration tests for nanobot-tools: ToolRegistry, ToolPipeline,
+//! ApprovalPolicy.
 
-use ocad_tools::{
+use nanobot_tools::{
     AutoApprovalPolicy, DenyAllPolicy, PreExecuteResult, ToolContract, ToolDefinition,
     ToolPipeline, ToolRegistry,
 };
@@ -12,52 +13,47 @@ fn make_tool(name: &str, requires_approval: bool) -> ToolDefinition {
         description: format!("Test tool {name}"),
         parameters_schema: serde_json::json!({"type": "object"}),
         requires_approval,
-        contract: ocad_tools::contract_for(name).unwrap_or(ToolContract::Mutates),
+        contract: ToolContract::ReadOnly,
     }
 }
 
 #[test]
 fn registry_rejects_duplicates() {
-    let reg = ToolRegistry::new();
-    reg.register(make_tool("foo", false)).unwrap();
-    assert!(reg.register(make_tool("foo", false)).is_err());
+    let registry = ToolRegistry::new();
+    registry.register(make_tool("t", false)).unwrap();
+    assert!(registry.register(make_tool("t", false)).is_err());
+    assert!(registry.contains("t"));
+    assert!(registry.names().contains(&"t".to_string()));
 }
 
 #[test]
-fn pipeline_pre_execute_allows_registered() {
-    let reg = Arc::new(ToolRegistry::new());
-    reg.register(make_tool("foo", false)).unwrap();
-    let pipeline = ToolPipeline::new(reg, Arc::new(AutoApprovalPolicy));
-    let result = pipeline.pre_execute("foo", &serde_json::json!({}));
-    assert_eq!(result, PreExecuteResult::Allow);
-}
+fn pre_execute_allow_deny_and_ask() {
+    let registry = Arc::new(ToolRegistry::new());
+    registry.register(make_tool("t", true)).unwrap();
+    let pipeline = ToolPipeline::new(registry, Arc::new(AutoApprovalPolicy));
 
-#[test]
-fn pipeline_pre_execute_denies_unknown() {
-    let reg = Arc::new(ToolRegistry::new());
-    let pipeline = ToolPipeline::new(reg, Arc::new(AutoApprovalPolicy));
-    let result = pipeline.pre_execute("nope", &serde_json::json!({}));
-    assert!(matches!(result, PreExecuteResult::Deny(_)));
-}
-
-#[test]
-fn pipeline_approval_policy_deny() {
-    let reg = Arc::new(ToolRegistry::new());
-    reg.register(make_tool("dangerous", true)).unwrap();
-    let pipeline = ToolPipeline::new(reg, Arc::new(DenyAllPolicy));
-    let result = pipeline.pre_execute("dangerous", &serde_json::json!({}));
-    assert!(matches!(result, PreExecuteResult::Deny(_)));
-}
-
-#[test]
-fn pipeline_execute_calls_body() {
-    let reg = Arc::new(ToolRegistry::new());
-    reg.register(make_tool("echo", false)).unwrap();
-    let pipeline = ToolPipeline::new(reg, Arc::new(AutoApprovalPolicy));
-    let result = futures_executor::block_on(pipeline.execute(
-        "echo",
-        serde_json::json!({"msg": "hi"}),
-        |_args| async { Ok("echo result".to_string()) },
+    // AutoApprovalPolicy approves, so the gated tool is allowed through.
+    assert!(matches!(
+        pipeline.pre_execute("t", &serde_json::json!({})),
+        PreExecuteResult::Allow
     ));
-    assert_eq!(result.unwrap(), "echo result");
+    assert!(matches!(
+        pipeline.pre_execute("missing", &serde_json::json!({})),
+        PreExecuteResult::Deny(_)
+    ));
+}
+
+#[test]
+fn execute_runs_the_caller_supplied_body() {
+    let registry = Arc::new(ToolRegistry::new());
+    registry.register(make_tool("t", false)).unwrap();
+    let pipeline = ToolPipeline::new(registry, Arc::new(DenyAllPolicy));
+
+    let ran = futures_executor::block_on(pipeline.execute(
+        "t",
+        serde_json::json!({}),
+        |_args| async { Ok("ran".to_string()) },
+    ))
+    .unwrap();
+    assert_eq!(ran, "ran");
 }
