@@ -1,0 +1,13 @@
+[package]
+name = "nanobot-skills"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "nanobot skill runner: manifest -> listener composition with fiber unload semantics"
+
+[dependencies]
+nanobot-cordis = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = "0.8"
+thiserror = { workspace = true }
