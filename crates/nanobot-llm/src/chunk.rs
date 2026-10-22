@@ -7,10 +7,15 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::adapter::Usage;
+
 /// A single streaming delta from an LLM provider.
 ///
-/// The three variants cover the standard streaming content types:
-/// reasoning (chain-of-thought), plain text, and tool-call invocations.
+/// The variants cover the standard streaming content types: reasoning
+/// (chain-of-thought), plain text, tool-call invocations, and the token
+/// accounting a provider reports at the end of a response. Usage rides the same
+/// stream as content so a consumer that assembles the response also gets the
+/// numbers to bill and budget with.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum StreamChunk {
     /// Incremental reasoning / chain-of-thought text.
@@ -19,6 +24,8 @@ pub enum StreamChunk {
     Text(String),
     /// A tool-call delta (index, id, name, arguments fragment).
     ToolCall(ToolCallDelta),
+    /// Token accounting for the response so far (providers send it last).
+    Usage(Usage),
 }
 
 /// Incremental update for a single tool call.

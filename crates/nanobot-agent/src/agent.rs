@@ -179,10 +179,36 @@ struct AgentInner {
     /// skills can append their persona sections (design-harness 14.2). The
     /// agent stays free of any plugin type.
     prompt_assembler: Mutex<Option<Arc<dyn Fn(String) -> String + Send + Sync>>>,
+    /// The product's standing instructions (the persona section of the system
+    /// prompt). Absent -> [`PERSONA`], the built-in default. A product sets
+    /// this so the framework carries no domain identity of its own.
+    persona: Mutex<Option<String>>,
+    /// The wire model id sent to the provider and recorded on `RequestHeader`.
+    /// Absent -> `"default"`, which is also the adapter key: a product that
+    /// talks to a real provider sets the real id so the record is truthful and
+    /// the accounting can be attributed.
+    model: Mutex<Option<String>>,
     /// The product's plan grader: grades the declared intent against the
     /// post-execution state (design-harness 14.3). Absent -> a plan with an
     /// intent passes (nothing to check against).
     plan_verifier: Mutex<Option<Arc<dyn PlanVerifier>>>,
+}
+
+/// The adapter key the agent asks for when the product sets no model.
+const DEFAULT_MODEL: &str = "default";
+
+/// Convert the wire accounting type into the session's.
+///
+/// The two types are separate on purpose: `nanobot-llm` owns the provider
+/// vocabulary (and must stay below `nanobot-session` in the dependency order),
+/// while `nanobot-session` owns the neutral, provider-free event vocabulary.
+/// The conversion therefore lives here, in the one crate that depends on both.
+fn to_session_usage(usage: nanobot_llm::Usage) -> nanobot_session::Usage {
+    nanobot_session::Usage {
+        prompt_tokens: usage.prompt_tokens,
+        completion_tokens: usage.completion_tokens,
+        total_tokens: usage.total_tokens,
+    }
 }
 
 /// How many steps one turn may take before it is cut off.
@@ -211,7 +237,11 @@ enum PlanVerdict {
     },
 }
 
-/// The agent's standing instructions (design-harness 14.2, persona section).
+/// The built-in persona, used when the product supplies none.
+///
+/// This is a *default*, not the framework's opinion about the domain: a
+/// harness product installs its own standing instructions with
+/// [`Agent::set_persona`], because the domain identity belongs to the product.
 const PERSONA: &str = "\
 You are ocad, a CAD design agent working on one open part document.
 You change the document only by calling the provided tools; you never emit
@@ -276,6 +306,8 @@ impl Agent {
                 plan_checkpoint: Mutex::new(None),
                 plan_start_seq: Mutex::new(None),
                 prompt_assembler: Mutex::new(None),
+                persona: Mutex::new(None),
+                model: Mutex::new(None),
                 plan_verifier: Mutex::new(None),
             }),
         }
@@ -294,12 +326,40 @@ impl Agent {
         *self.inner.prompt_assembler.lock().unwrap() = Some(Arc::new(assembler));
     }
 
+    /// Set the product's standing instructions (the persona section).
+    ///
+    /// The persona is the *first* section of the system prompt: the domain
+    /// identity ("you are a chip design agent working on one open design"),
+    /// followed by what the product wants the model to treat as its job.
+    /// Unset, the built-in default ([`PERSONA`]) is used. Skills and the
+    /// prompt assembler still append after it, so this replaces the identity
+    /// only — it does not disable plugin contributions.
+    pub fn set_persona(&self, persona: impl Into<String>) {
+        *self.inner.persona.lock().unwrap() = Some(persona.into());
+    }
+
+    /// Set the wire model id (what the provider is asked for, and what
+    /// `RequestHeader` records). Unset, the agent asks for the adapter key
+    /// `"default"`.
+    pub fn set_model(&self, model: impl Into<String>) {
+        *self.inner.model.lock().unwrap() = Some(model.into());
+    }
+
+    /// The model id requests are made with.
+    fn wire_model(&self) -> String {
+        self.inner
+            .model
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string())
+    }
+
     /// Set the plan verifier (the product's intent grader). Without one, a
     /// plan that declares an intent passes — there is nothing to check against.
     pub fn set_plan_verifier(&self, verifier: Arc<dyn PlanVerifier>) {
         *self.inner.plan_verifier.lock().unwrap() = Some(verifier);
     }
-
 
     /// The system prompt the model receives this turn (design-harness 14.2).
     ///
@@ -316,7 +376,15 @@ impl Agent {
     /// the evaluated result. The check section carries the latest verdicts so
     /// the model can see what already failed.
     fn build_system_prompt(&self) -> String {
-        let mut prompt = String::from(PERSONA);
+        // The persona comes from the product when it set one; the built-in
+        // default is a fallback, not a framework opinion about the domain.
+        let mut prompt = self
+            .inner
+            .persona
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| PERSONA.to_string());
 
         let executor = self.inner.tool_executor.lock().unwrap().clone();
         if let Some(subject) = executor.as_ref().and_then(|e| e.describe_subject()) {
@@ -332,6 +400,7 @@ impl Agent {
                 check_id,
                 passed,
                 details,
+                ..
             } = &entry.event
             {
                 let verdict = format!(
@@ -670,6 +739,12 @@ impl Agent {
             check_id: "plan:intent".to_string(),
             passed,
             details: detail.clone(),
+            // The graded measurements, structured: a UI can list what held and
+            // what did not without re-parsing the summary line.
+            payload: Some(serde_json::json!({
+                "verdict": if passed { "passed" } else { "failed" },
+                "detail": detail,
+            })),
         });
 
         if passed {
@@ -839,8 +914,9 @@ impl Agent {
                     .collect();
 
                 // Build LLM request.
+                let wire_model = self.wire_model();
                 let request = LlmRequest {
-                    model: "default".to_string(),
+                    model: wire_model.clone(),
                     messages,
                     tools: tool_defs,
                     temperature: None,
@@ -885,6 +961,10 @@ impl Agent {
                     self.inner.session.append(SessionEvent::CheckResult {
                         check_id: "llm:stream".to_string(),
                         passed: false,
+                        payload: Some(serde_json::json!({
+                            "error": detail,
+                            "kind": "stream",
+                        })),
                         details: detail,
                     });
                     turn_reason = TurnEndReason::Error;
@@ -893,6 +973,14 @@ impl Agent {
 
                 // Process any remaining text from the assembler.
                 if let Some(block) = assembler.finish() {
+                    // Record the request itself: which model answered and what
+                    // it cost. This is the only event carrying token usage, so
+                    // dropping it would make the session unbillable.
+                    self.inner.session.append(SessionEvent::RequestHeader {
+                        model: wire_model,
+                        usage: block.usage.map(to_session_usage),
+                    });
+
                     if !block.text.is_empty() {
                         self.inner.session.append(SessionEvent::AssistantMessage {
                             content: block.text,
@@ -1047,6 +1135,20 @@ impl Agent {
                         self.inner.session.append(SessionEvent::CheckResult {
                             check_id,
                             passed: outcome.accepted,
+                            // The invariants the gate recorded, in full: this is
+                            // what lets a check panel or an agent filter on the
+                            // failing invariant instead of reading the summary.
+                            payload: Some(serde_json::json!({
+                                "invariants": outcome
+                                    .checks
+                                    .iter()
+                                    .map(|check| serde_json::json!({
+                                        "invariant": check.invariant,
+                                        "passed": check.passed,
+                                        "detail": check.detail,
+                                    }))
+                                    .collect::<Vec<_>>(),
+                            })),
                             details: check_details,
                         });
                     }
