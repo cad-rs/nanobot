@@ -360,6 +360,50 @@ impl Session {
 
         new_session
     }
+
+    /// Fork this session from a *prefix*: the new session replays events up to
+    /// and including `up_to_seq`.
+    ///
+    /// [`Session::fork`] copies the whole log; this lets a caller branch from an
+    /// earlier point, which is the "try two directions from here" case. The
+    /// fork marker records where the branch was taken.
+    pub fn fork_from(&self, new_id: impl Into<String>, up_to_seq: u32) -> Session {
+        let new_session = Session::new(new_id);
+        let events: Vec<LogEntry> = self
+            .events()
+            .into_iter()
+            .filter(|entry| entry.seq <= up_to_seq)
+            .collect();
+
+        new_session.append(SessionEvent::SessionForked {
+            parent_session: self.id().to_string(),
+            parent_seq: up_to_seq,
+        });
+        for entry in events {
+            new_session.append(entry.event);
+        }
+        new_session
+    }
+
+    /// Rewind this session to `to_seq`, recording the revert on the log.
+    ///
+    /// Dropped events leave both the log and the projected model history. The
+    /// revert is appended as [`SessionEvent::SessionReverted`] so the rollback
+    /// is itself auditable — a reviewer can see that the session was rewound and
+    /// where to. Appending also drives the persistence subscription, so the
+    /// file catches up immediately (a bare [`Session::truncate_to`] would wait
+    /// for the next append).
+    ///
+    /// Returns how many events were dropped.
+    pub fn revert_to(&self, to_seq: u32) -> u32 {
+        let before = self.len() as u32;
+        self.truncate_to(to_seq);
+        let reverted = before.saturating_sub(self.len() as u32);
+        if reverted > 0 {
+            self.append(SessionEvent::SessionReverted { to_seq, reverted });
+        }
+        reverted
+    }
 }
 
 // Re-export TurnEndReason so it is accessible from the crate root.
