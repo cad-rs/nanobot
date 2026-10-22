@@ -117,10 +117,19 @@ pub enum SessionEvent {
     /// A verifier check was initiated.
     CheckRun { check_id: String },
     /// A verifier check completed.
+    ///
+    /// `details` stays the human-readable summary (what a UI shows and what the
+    /// model reads). `payload` carries the same result *structurally* when the
+    /// producer has it — the invariants that held or failed, with their
+    /// measurements — so a consumer can filter, sort or page findings instead of
+    /// parsing prose. It is optional: a check that has nothing structured to say
+    /// omits it, and old logs (written before the field existed) still parse.
     CheckResult {
         check_id: String,
         passed: bool,
         details: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payload: Option<serde_json::Value>,
     },
 
     // -- approval --
@@ -204,5 +213,64 @@ impl SessionEvent {
             // reports that this was an extension event.
             SessionEvent::Extension { .. } => "extension",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_result_payload_is_optional_and_backward_compatible() {
+        // A log written before the field existed must still parse: the session
+        // log is an audit artifact, not a cache that can be regenerated.
+        let old = r#"{"type":"check_result","check_id":"write:build_sfq","passed":true,"details":"1/1 held"}"#;
+        match serde_json::from_str::<SessionEvent>(old).expect("old logs still parse") {
+            SessionEvent::CheckResult {
+                payload, details, ..
+            } => {
+                assert!(payload.is_none());
+                assert_eq!(details, "1/1 held");
+            }
+            other => panic!("expected a check result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_result_carries_structured_invariants() {
+        let event = SessionEvent::CheckResult {
+            check_id: "write:build_sfq".to_string(),
+            passed: false,
+            details: "0/1 write invariants held".to_string(),
+            payload: Some(serde_json::json!({
+                "invariants": [
+                    {"invariant": "report_bound", "passed": false, "detail": "subject mismatch"}
+                ]
+            })),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("report_bound"), "{json}");
+
+        // The structured payload survives a round trip, so a consumer can read
+        // the failing invariant without parsing the summary.
+        let back: SessionEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, event);
+        let payload = match back {
+            SessionEvent::CheckResult { payload, .. } => payload.unwrap(),
+            other => panic!("expected a check result, got {other:?}"),
+        };
+        assert_eq!(payload["invariants"][0]["invariant"], "report_bound");
+    }
+
+    #[test]
+    fn a_payload_free_check_result_omits_the_field() {
+        let event = SessionEvent::CheckResult {
+            check_id: "custom".to_string(),
+            passed: true,
+            details: "nothing structured to say".to_string(),
+            payload: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(!json.contains("payload"), "{json}");
     }
 }

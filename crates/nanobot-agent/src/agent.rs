@@ -400,6 +400,7 @@ impl Agent {
                 check_id,
                 passed,
                 details,
+                ..
             } = &entry.event
             {
                 let verdict = format!(
@@ -738,6 +739,12 @@ impl Agent {
             check_id: "plan:intent".to_string(),
             passed,
             details: detail.clone(),
+            // The graded measurements, structured: a UI can list what held and
+            // what did not without re-parsing the summary line.
+            payload: Some(serde_json::json!({
+                "verdict": if passed { "passed" } else { "failed" },
+                "detail": detail,
+            })),
         });
 
         if passed {
@@ -954,6 +961,10 @@ impl Agent {
                     self.inner.session.append(SessionEvent::CheckResult {
                         check_id: "llm:stream".to_string(),
                         passed: false,
+                        payload: Some(serde_json::json!({
+                            "error": detail,
+                            "kind": "stream",
+                        })),
                         details: detail,
                     });
                     turn_reason = TurnEndReason::Error;
@@ -1124,6 +1135,20 @@ impl Agent {
                         self.inner.session.append(SessionEvent::CheckResult {
                             check_id,
                             passed: outcome.accepted,
+                            // The invariants the gate recorded, in full: this is
+                            // what lets a check panel or an agent filter on the
+                            // failing invariant instead of reading the summary.
+                            payload: Some(serde_json::json!({
+                                "invariants": outcome
+                                    .checks
+                                    .iter()
+                                    .map(|check| serde_json::json!({
+                                        "invariant": check.invariant,
+                                        "passed": check.passed,
+                                        "detail": check.detail,
+                                    }))
+                                    .collect::<Vec<_>>(),
+                            })),
                             details: check_details,
                         });
                     }
