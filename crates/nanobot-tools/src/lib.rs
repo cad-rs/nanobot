@@ -21,11 +21,13 @@
 pub mod approval;
 pub mod contract;
 pub mod error;
+pub mod mcp;
 pub mod registry;
 pub mod waterfall;
 
 pub use approval::{ApprovalPolicy, AutoApprovalPolicy, DenyAllPolicy, UiApprovalPolicy};
 pub use contract::ToolContract;
 pub use error::ToolError;
+pub use mcp::{McpClient, McpError, McpTool};
 pub use registry::{ToolDefinition, ToolRegistry};
 pub use waterfall::{PostExecuteResult, PreExecuteResult, ToolPipeline};
