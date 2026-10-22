@@ -25,6 +25,7 @@
 pub mod adapter;
 pub mod assembler;
 pub mod chunk;
+pub mod cost;
 pub mod error;
 pub mod openai;
 pub mod runtime;
@@ -35,6 +36,7 @@ pub use adapter::{
 };
 pub use assembler::{AssembledToolCall, BlockAssembler, ResponseBlock};
 pub use chunk::{StreamChunk, ToolCallDelta};
+pub use cost::{BudgetDecision, ModelAccount, Pricing, UsageAccount};
 pub use error::LlmError;
 pub use openai::OpenAiCompatibleAdapter;
 pub use runtime::LlmRuntime;
