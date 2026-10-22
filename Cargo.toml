@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/nanobot-cordis",
     "crates/nanobot-session",
+    "crates/nanobot-tools",
     "crates/nanobot-skills",
     "crates/nanobot-llm",
 ]
