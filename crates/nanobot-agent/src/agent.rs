@@ -183,10 +183,32 @@ struct AgentInner {
     /// prompt). Absent -> [`PERSONA`], the built-in default. A product sets
     /// this so the framework carries no domain identity of its own.
     persona: Mutex<Option<String>>,
+    /// The wire model id sent to the provider and recorded on `RequestHeader`.
+    /// Absent -> `"default"`, which is also the adapter key: a product that
+    /// talks to a real provider sets the real id so the record is truthful and
+    /// the accounting can be attributed.
+    model: Mutex<Option<String>>,
     /// The product's plan grader: grades the declared intent against the
     /// post-execution state (design-harness 14.3). Absent -> a plan with an
     /// intent passes (nothing to check against).
     plan_verifier: Mutex<Option<Arc<dyn PlanVerifier>>>,
+}
+
+/// The adapter key the agent asks for when the product sets no model.
+const DEFAULT_MODEL: &str = "default";
+
+/// Convert the wire accounting type into the session's.
+///
+/// The two types are separate on purpose: `nanobot-llm` owns the provider
+/// vocabulary (and must stay below `nanobot-session` in the dependency order),
+/// while `nanobot-session` owns the neutral, provider-free event vocabulary.
+/// The conversion therefore lives here, in the one crate that depends on both.
+fn to_session_usage(usage: nanobot_llm::Usage) -> nanobot_session::Usage {
+    nanobot_session::Usage {
+        prompt_tokens: usage.prompt_tokens,
+        completion_tokens: usage.completion_tokens,
+        total_tokens: usage.total_tokens,
+    }
 }
 
 /// How many steps one turn may take before it is cut off.
@@ -285,6 +307,7 @@ impl Agent {
                 plan_start_seq: Mutex::new(None),
                 prompt_assembler: Mutex::new(None),
                 persona: Mutex::new(None),
+                model: Mutex::new(None),
                 plan_verifier: Mutex::new(None),
             }),
         }
@@ -313,6 +336,23 @@ impl Agent {
     /// only — it does not disable plugin contributions.
     pub fn set_persona(&self, persona: impl Into<String>) {
         *self.inner.persona.lock().unwrap() = Some(persona.into());
+    }
+
+    /// Set the wire model id (what the provider is asked for, and what
+    /// `RequestHeader` records). Unset, the agent asks for the adapter key
+    /// `"default"`.
+    pub fn set_model(&self, model: impl Into<String>) {
+        *self.inner.model.lock().unwrap() = Some(model.into());
+    }
+
+    /// The model id requests are made with.
+    fn wire_model(&self) -> String {
+        self.inner
+            .model
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string())
     }
 
     /// Set the plan verifier (the product's intent grader). Without one, a
@@ -867,8 +907,9 @@ impl Agent {
                     .collect();
 
                 // Build LLM request.
+                let wire_model = self.wire_model();
                 let request = LlmRequest {
-                    model: "default".to_string(),
+                    model: wire_model.clone(),
                     messages,
                     tools: tool_defs,
                     temperature: None,
@@ -921,6 +962,14 @@ impl Agent {
 
                 // Process any remaining text from the assembler.
                 if let Some(block) = assembler.finish() {
+                    // Record the request itself: which model answered and what
+                    // it cost. This is the only event carrying token usage, so
+                    // dropping it would make the session unbillable.
+                    self.inner.session.append(SessionEvent::RequestHeader {
+                        model: wire_model,
+                        usage: block.usage.map(to_session_usage),
+                    });
+
                     if !block.text.is_empty() {
                         self.inner.session.append(SessionEvent::AssistantMessage {
                             content: block.text,

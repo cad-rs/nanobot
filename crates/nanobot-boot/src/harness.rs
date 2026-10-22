@@ -160,6 +160,7 @@ pub struct HarnessBuilder {
     plan_verifier: Option<Arc<dyn PlanVerifier>>,
     approval_policy: Option<Arc<dyn ApprovalPolicy>>,
     persona: Option<String>,
+    model: Option<String>,
     skills: Vec<SkillManifest>,
 }
 
@@ -177,6 +178,7 @@ impl HarnessBuilder {
             plan_verifier: None,
             approval_policy: None,
             persona: None,
+            model: None,
             skills: Vec::new(),
         }
     }
@@ -262,6 +264,15 @@ impl HarnessBuilder {
         self
     }
 
+    /// The wire model id the agent asks the provider for, and the id recorded
+    /// on `RequestHeader`. When unset the agent asks for the adapter key
+    /// `"default"`, which a real provider will not recognise — a product
+    /// talking to a real model sets this.
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
+        self
+    }
+
     /// Skill manifests to enable at assembly time. Each enablement is
     /// isolated: a manifest that fails (or panics) is skipped and noted, not
     /// fatal.
@@ -284,6 +295,7 @@ impl HarnessBuilder {
             plan_verifier,
             approval_policy,
             persona,
+            model,
             skills,
         } = self;
 
@@ -390,6 +402,9 @@ impl HarnessBuilder {
         }
         if let Some(persona) = persona {
             agent.set_persona(persona);
+        }
+        if let Some(model) = model {
+            agent.set_model(model);
         }
 
         // The skill runner with a root context. Each enablement is isolated:

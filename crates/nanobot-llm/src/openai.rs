@@ -4,7 +4,7 @@
 //! The same code path serves native (hyper) and wasm (browser fetch via
 //! `wasm-streams`) — no platform-conditional compilation.
 
-use crate::adapter::{AdapterStream, LlmAdapter, LlmRequest, Role};
+use crate::adapter::{AdapterStream, LlmAdapter, LlmRequest, Role, Usage};
 use crate::chunk::{StreamChunk, ToolCallDelta};
 use crate::error::LlmError;
 use eventsource_stream::Eventsource;
@@ -101,6 +101,10 @@ impl OpenAiCompatibleAdapter {
             "model": request.model,
             "messages": messages,
             "stream": true,
+            // Ask for the token accounting: without it the response carries no
+            // usage and a harness cannot bill or budget. Providers that do not
+            // know the field ignore it.
+            "stream_options": { "include_usage": true },
         });
 
         if !request.tools.is_empty() {
@@ -134,6 +138,26 @@ impl OpenAiCompatibleAdapter {
     /// Parse one SSE `data` payload into a `StreamChunk`.
     fn parse_chunk(data: &str) -> Result<StreamChunk, LlmError> {
         let value: serde_json::Value = serde_json::from_str(data)?;
+
+        // The accounting chunk carries `usage` and an *empty* choices array, so
+        // it must be handled before the choices are required — otherwise a
+        // provider that honours `include_usage` breaks the stream.
+        if let Some(usage) = value.get("usage").filter(|u| !u.is_null()) {
+            return Ok(StreamChunk::Usage(Usage {
+                prompt_tokens: usage
+                    .get("prompt_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as u32,
+                completion_tokens: usage
+                    .get("completion_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as u32,
+                total_tokens: usage
+                    .get("total_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as u32,
+            }));
+        }
 
         let choices = value
             .get("choices")
@@ -279,6 +303,39 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn a_usage_chunk_with_empty_choices_is_parsed_not_rejected() {
+        // Providers honouring `include_usage` send a final chunk whose choices
+        // array is empty. Treating that as a protocol error would break every
+        // such provider, so the accounting is read before choices are required.
+        let chunk = OpenAiCompatibleAdapter::parse_chunk(
+            r#"{"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":5,"total_tokens":16}}"#,
+        )
+        .expect("a usage-only chunk is valid");
+        assert_eq!(
+            chunk,
+            StreamChunk::Usage(Usage {
+                prompt_tokens: 11,
+                completion_tokens: 5,
+                total_tokens: 16,
+            })
+        );
+    }
+
+    #[test]
+    fn the_request_asks_for_usage() {
+        let body = OpenAiCompatibleAdapter::new("https://example.test/v1/", "k").build_body(
+            &LlmRequest {
+                model: "m".to_string(),
+                messages: vec![],
+                tools: vec![],
+                temperature: None,
+                max_tokens: None,
+            },
+        );
+        assert_eq!(body["stream_options"]["include_usage"], true, "{body}");
+    }
+
     fn a_tool_call_is_sent_as_the_assistant_tool_calls_payload() {
         let body = body_for(vec![Message::tool_call(
             "call_1",
