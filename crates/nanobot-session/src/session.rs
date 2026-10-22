@@ -274,6 +274,21 @@ impl Session {
         self.inner.events.lock().unwrap().len()
     }
 
+    /// Restore the log from persisted entries (build-time recovery).
+    ///
+    /// Entries are taken as-is — seq and timestamp preserved — so re-saving a
+    /// hydrated log is byte-identical to the file it came from. Subscribers
+    /// are not notified: hydration happens before persistence is attached,
+    /// when nothing is watching yet.
+    pub fn hydrate(&self, entries: Vec<LogEntry>) {
+        let mut next_seq = 0u32;
+        for entry in &entries {
+            next_seq = next_seq.max(entry.seq.saturating_add(1));
+        }
+        *self.inner.next_seq.lock().unwrap() = next_seq;
+        *self.inner.events.lock().unwrap() = entries;
+    }
+
     /// Check whether the log is empty.
     pub fn is_empty(&self) -> bool {
         self.len() == 0

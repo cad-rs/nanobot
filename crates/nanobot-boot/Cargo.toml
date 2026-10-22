@@ -1,0 +1,35 @@
+[package]
+name = "nanobot-boot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "nanobot-boot: harness assembly + harness.toml identity + CLI/selfcheck + the generic project container (GUI-free)"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+nanobot-cordis = { workspace = true }
+nanobot-llm = { workspace = true }
+nanobot-session = { workspace = true }
+nanobot-skills = { workspace = true }
+nanobot-tools = { workspace = true }
+nanobot-agent = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true }
+uuid = { workspace = true }
+crc32fast = { workspace = true }
+# The selfcheck and the CLI smoke modes drive the agent loop headlessly
+# (futures_executor::block_on); the async runtime stays the host's.
+futures-executor = { workspace = true }
+
+# wasm32-unknown-unknown has no OS entropy source. uuid's `js` feature routes
+# v4 randomness through crypto.getRandomValues; without it uuid aborts the
+# wasm compile. Target-scoped, so native builds keep the OS RNG path.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+uuid = { version = "1.0", features = ["v4", "serde", "js"] }
+
+[dev-dependencies]
+uuid = { workspace = true }

@@ -73,4 +73,14 @@ impl ToolRegistry {
     pub fn names(&self) -> Vec<String> {
         self.tools.lock().unwrap().keys().cloned().collect()
     }
+
+    /// How many definitions the registry carries.
+    pub fn len(&self) -> usize {
+        self.tools.lock().unwrap().len()
+    }
+
+    /// Whether the registry carries no definitions.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
