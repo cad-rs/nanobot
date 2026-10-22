@@ -43,7 +43,6 @@ pub struct PlanProposal {
     pub steps: serde_json::Value,
 }
 
-
 /// The session event: the framework's base vocabulary plus the
 /// [`SessionEvent::Extension`] variant for product-defined events.
 ///
@@ -155,6 +154,14 @@ pub enum SessionEvent {
         parent_seq: u32,
     },
 
+    /// This session was rewound to `to_seq`; `reverted` is how many events
+    /// were dropped.
+    ///
+    /// The marker is appended rather than the log silently rewritten, so the
+    /// revert itself is on the record: a reviewer can see that the session was
+    /// rolled back and where to.
+    SessionReverted { to_seq: u32, reverted: u32 },
+
     /// Per-model-request header (model, usage, cache info).
     RequestHeader { model: String, usage: Option<Usage> },
 
@@ -208,6 +215,7 @@ impl SessionEvent {
             SessionEvent::ApprovalDecision { .. } => "approval_decision",
             SessionEvent::GeometryRevision { .. } => "geometry_revision",
             SessionEvent::SessionForked { .. } => "session_forked",
+            SessionEvent::SessionReverted { .. } => "session_reverted",
             SessionEvent::RequestHeader { .. } => "request_header",
             // The product's own kind lives in the payload; the framework only
             // reports that this was an extension event.
