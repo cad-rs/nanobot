@@ -232,6 +232,24 @@ impl LlmAdapter for OpenAiCompatibleAdapter {
                             .await;
                         match resp {
                             Ok(r) => {
+                                // A non-2xx response is a transport-level
+                                // failure, not an empty turn: without this the
+                                // body is parsed as SSE and a 404/401/429 either
+                                // breaks the stream with a confusing
+                                // "missing choices" error or yields a silent
+                                // empty turn the harness cannot distinguish from
+                                // the model saying nothing.
+                                let status = r.status();
+                                if !status.is_success() {
+                                    let body = r.text().await.unwrap_or_default();
+                                    return Some((
+                                        Err(LlmError::Http(format!(
+                                            "HTTP {status}: {}",
+                                            truncate_body(&body)
+                                        ))),
+                                        Stage::Done,
+                                    ));
+                                }
                                 let byte_stream: ByteStream<'a> = Box::pin(r.bytes_stream());
                                 let es = byte_stream.eventsource();
                                 Some((Ok(StreamChunk::Text(String::new())), Stage::Streaming(es)))
@@ -286,6 +304,16 @@ enum Stage<'a> {
     Done,
 }
 
+/// Keep an error payload bounded: the point is the status code and a short
+/// excerpt for the log, not a whole provider error page.
+fn truncate_body(body: &str) -> String {
+    let mut out: String = body.chars().take(200).collect();
+    if body.chars().count() > 200 {
+        out.push('…');
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,7 +330,6 @@ mod tests {
         })
     }
 
-    #[test]
     #[test]
     fn a_usage_chunk_with_empty_choices_is_parsed_not_rejected() {
         // Providers honouring `include_usage` send a final chunk whose choices
@@ -324,18 +351,18 @@ mod tests {
 
     #[test]
     fn the_request_asks_for_usage() {
-        let body = OpenAiCompatibleAdapter::new("https://example.test/v1/", "k").build_body(
-            &LlmRequest {
+        let body =
+            OpenAiCompatibleAdapter::new("https://example.test/v1/", "k").build_body(&LlmRequest {
                 model: "m".to_string(),
                 messages: vec![],
                 tools: vec![],
                 temperature: None,
                 max_tokens: None,
-            },
-        );
+            });
         assert_eq!(body["stream_options"]["include_usage"], true, "{body}");
     }
 
+    #[test]
     fn a_tool_call_is_sent_as_the_assistant_tool_calls_payload() {
         let body = body_for(vec![Message::tool_call(
             "call_1",
