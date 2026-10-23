@@ -20,3 +20,6 @@ thiserror.workspace = true
 
 [dev-dependencies]
 futures-executor = "0.3"
+# The OpenAI-compatible adapter is reqwest-based, so its integration tests need
+# a reactor to drive the request. Test-only.
+tokio = { version = "1", features = ["rt", "net", "time"] }
