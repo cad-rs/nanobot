@@ -5,6 +5,7 @@
 //! - `Inbox` — dual-queue message buffer (next-turn + next-step)
 //! - `Plan` — eventized plan state machine
 //! - `CancellationToken` — per-turn cancellation
+//! - `JobQueue` — work that outlives a turn (multi-fidelity verification)
 //!
 //! The agent loop drives the turn/step cycle:
 //! ```text
@@ -28,9 +29,13 @@
 pub mod agent;
 pub mod cancellation;
 pub mod inbox;
+pub mod job;
 pub mod plan;
 
-pub use agent::{Agent, AgentState, PlanVerifier, RestorePoint, ToolExecutor, WriteCheck, WriteOutcome};
+pub use agent::{
+    Agent, AgentState, PlanVerifier, RestorePoint, ToolExecutor, WriteCheck, WriteOutcome,
+};
 pub use cancellation::CancellationToken;
 pub use inbox::Inbox;
+pub use job::{Job, JobContext, JobEvent, JobQueue, JobResult, JobRunner, JobSpec, JobState};
 pub use plan::{Plan, PlanState};
