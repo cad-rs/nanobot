@@ -5,6 +5,14 @@ edition = "2021"
 license = "Proprietary"
 description = "nanobot GPU render slot: the process-wide shared wgpu device, offscreen targets and zero-copy surface compositing that any harness renderer (product or plugin) draws through"
 
+[features]
+default = ["custom-gpu"]
+# Forwards to `gpui/custom-gpu`, which is what makes `SurfaceSource::Texture` (and
+# `WgpuContextHandle::from_window`) available on macOS. The slot's own cfgs key off
+# this so they mean "gpui can share a texture surface here", not "some unrelated
+# crate has a feature by this name".
+custom-gpu = ["gpui/custom-gpu"]
+
 [dependencies]
 gpui = { workspace = true }
 gpui-wgpu = { workspace = true }

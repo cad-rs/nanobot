@@ -273,6 +273,13 @@ impl Application {
     where
         F: 'static + FnOnce(&mut App),
     {
+        #[cfg(all(
+            feature = "hot-patching",
+            debug_assertions,
+            not(target_family = "wasm")
+        ))]
+        dioxus_devtools::connect_subsecond();
+
         let this = self.0.clone();
         let platform = self.0.borrow().platform.clone();
         platform.run(Box::new(move || {
@@ -653,7 +660,7 @@ impl SystemWindowTabController {
         let next_index = (current_index + 1) % tabs.len();
 
         let _ = &tabs[next_index].handle.update(cx, |_, window, _| {
-            window.activate_window();
+            window.activate();
         });
     }
 
@@ -672,7 +679,7 @@ impl SystemWindowTabController {
         };
 
         let _ = &tabs[previous_index].handle.update(cx, |_, window, _| {
-            window.activate_window();
+            window.activate();
         });
     }
 }

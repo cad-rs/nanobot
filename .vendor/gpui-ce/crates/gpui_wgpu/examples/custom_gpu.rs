@@ -3,13 +3,18 @@
 //! The control owns its buffers, pipeline, and offscreen target. GPUI owns the
 //! device and queue, so those resources are recreated after device loss.
 //!
-//! Run with `--features custom-gpu` on supported targets.
+//! Run with `--features custom-gpu` on supported targets. macOS windows also
+//! need the WGPU renderer:
+//!
+//! ```sh
+//! cargo run -p gpui_ce_wgpu --example custom_gpu --features custom-gpu,gpui_platform/macos-wgpu
+//! ```
 
 #[cfg(any(
     target_family = "wasm",
     target_os = "linux",
     target_os = "freebsd",
-    target_os = "windows"
+    target_os = "macos"
 ))]
 mod custom_gpu {
     use std::borrow::Cow;
@@ -315,7 +320,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             self.render_gpu(window);
             let mut root = div().size_full();
             if let Some(target) = self.target.as_ref() {
-                root = root.child(target.surface().size_full());
+                root = root.child(target.surface());
             }
             root
         }
@@ -349,7 +354,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     target_family = "wasm",
     target_os = "linux",
     target_os = "freebsd",
-    target_os = "windows"
+    target_os = "macos"
 ))]
 fn main() {
     custom_gpu::run();
@@ -359,8 +364,8 @@ fn main() {
     target_family = "wasm",
     target_os = "linux",
     target_os = "freebsd",
-    target_os = "windows"
+    target_os = "macos"
 )))]
 fn main() {
-    eprintln!("custom_gpu is supported on Linux, FreeBSD, Windows, and WASM targets only");
+    eprintln!("custom_gpu is supported on Linux, FreeBSD, macOS, and WASM targets only");
 }

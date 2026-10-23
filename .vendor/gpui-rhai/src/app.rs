@@ -4373,7 +4373,7 @@ impl ScriptHostView {
                         },
                         |handle| {
                             handle
-                                .update(cx, |_, window, _| window.activate_window())
+                                .update(cx, |_, window, _| window.activate())
                                 .map_err(|error| ScriptFailure::plain(error.to_string()))
                         },
                     )
