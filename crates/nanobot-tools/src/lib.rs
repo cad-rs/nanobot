@@ -24,7 +24,10 @@ pub mod error;
 pub mod registry;
 pub mod waterfall;
 
-pub use approval::{ApprovalPolicy, AutoApprovalPolicy, DenyAllPolicy, UiApprovalPolicy};
+pub use approval::{
+    glob_match, ApprovalEffect, ApprovalOutcome, ApprovalPolicy, ApprovalRule, AutoApprovalPolicy,
+    DenyAllPolicy, RuleBasedApprovalPolicy, UiApprovalPolicy,
+};
 pub use contract::ToolContract;
 pub use error::ToolError;
 pub use registry::{ToolDefinition, ToolRegistry};
