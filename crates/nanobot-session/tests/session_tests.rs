@@ -233,3 +233,83 @@ fn persistence_roundtrip() {
     assert_eq!(loaded.len(), 1);
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn fork_from_a_prefix_replays_only_that_prefix() {
+    let s = Session::new("parent");
+    s.append(SessionEvent::TurnStart { turn: 0 }); // seq 0
+    s.append(SessionEvent::UserMessage {
+        content: "a".into(),
+        selection_ref: None,
+    }); // seq 1
+    s.append(SessionEvent::UserMessage {
+        content: "b".into(),
+        selection_ref: None,
+    }); // seq 2
+
+    let forked = s.fork_from("child", 1);
+    let events = forked.events();
+    assert!(
+        matches!(events[0].event, SessionEvent::SessionForked { .. }),
+        "the fork marker comes first: {:?}",
+        events[0].event
+    );
+    let user: Vec<_> = events
+        .iter()
+        .filter(|e| matches!(e.event, SessionEvent::UserMessage { .. }))
+        .collect();
+    assert_eq!(user.len(), 1, "only the prefix is replayed: {events:?}");
+    match &user[0].event {
+        SessionEvent::UserMessage { content, .. } => assert_eq!(content, "a"),
+        other => panic!("unexpected event: {other:?}"),
+    }
+    // The parent is untouched by the fork.
+    assert_eq!(s.len(), 3);
+}
+
+#[test]
+fn revert_records_the_rollback_on_the_log() {
+    let s = Session::new("revert");
+    s.append(SessionEvent::TurnStart { turn: 0 }); // seq 0
+    s.append(SessionEvent::UserMessage {
+        content: "keep".into(),
+        selection_ref: None,
+    }); // seq 1
+    s.append(SessionEvent::ToolCall {
+        id: "c1".into(),
+        name: "x".into(),
+        arguments: serde_json::json!({}),
+        seq: 0,
+    }); // seq 2
+
+    let reverted = s.revert_to(1);
+    assert_eq!(reverted, 1);
+    let events = s.events();
+    assert_eq!(events.len(), 3, "prefix + the revert marker: {events:?}");
+    assert!(
+        matches!(
+            events.last().unwrap().event,
+            SessionEvent::SessionReverted {
+                to_seq: 1,
+                reverted: 1
+            }
+        ),
+        "the revert is on the record: {:?}",
+        events.last().unwrap().event
+    );
+    // The rolled-back tool call leaves the projected model history too.
+    assert!(
+        s.derive_messages()
+            .iter()
+            .all(|m| !matches!(m, ProjectedMessage::ToolCall { .. })),
+        "a reverted tool call must not stay in the model's history"
+    );
+}
+
+#[test]
+fn revert_past_the_end_is_a_noop() {
+    let s = Session::new("revert_noop");
+    s.append(SessionEvent::TurnStart { turn: 0 });
+    assert_eq!(s.revert_to(99), 0);
+    assert_eq!(s.len(), 1);
+}
