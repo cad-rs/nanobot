@@ -88,7 +88,8 @@ impl Gpu {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,
             force_fallback_adapter: false,
-        }))?;
+        }))
+        .ok()?;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("nanobot-gpu-device"),
             required_features: wgpu::Features::empty(),
@@ -129,18 +130,19 @@ thread_local! {
 /// textures and render targets on the returned device. Returns `None` until
 /// gpui's renderer is ready; callers skip the frame and retry rather than
 /// treating it as an error.
+///
+/// The renderer's own device is preferred wherever gpui's renderer is
+/// wgpu-backed (Windows/Web, and macOS under the opt-in `macos-wgpu` backend):
+/// a standalone device cannot composite into a surface the renderer owns, so
+/// `paint_surface` would silently show the clear color. Everywhere else the
+/// slot creates a standalone device.
 pub fn shared_gpu(window: &Window) -> Option<Rc<Gpu>> {
     SHARED_GPU.with(|cell| {
         let mut slot = cell.borrow_mut();
         if matches!(&*slot, GpuSlot::NotTried) {
-            #[cfg(any(target_family = "wasm", target_os = "windows"))]
-            {
-                if let Some(gpu) = Gpu::from_window(window) {
-                    *slot = GpuSlot::Ready(Rc::new(gpu));
-                }
-            }
-            #[cfg(not(any(target_family = "wasm", target_os = "windows")))]
-            {
+            if let Some(gpu) = context_from_window(window) {
+                *slot = GpuSlot::Ready(Rc::new(gpu));
+            } else {
                 match Gpu::new() {
                     Some(gpu) => *slot = GpuSlot::Ready(Rc::new(gpu)),
                     None => {
@@ -155,6 +157,31 @@ pub fn shared_gpu(window: &Window) -> Option<Rc<Gpu>> {
             _ => None,
         }
     })
+}
+
+/// The renderer's own device, where gpui's renderer is wgpu-backed.
+///
+/// On macOS this needs the opt-in wgpu backend (`gpui_platform/macos-wgpu`)
+/// *and* `custom-gpu`; with the default Metal backend there is no wgpu context
+/// to take, so this returns `None` and the slot falls back to a standalone
+/// device.
+#[cfg(any(
+    target_family = "wasm",
+    target_os = "windows",
+    all(target_os = "macos", feature = "custom-gpu")
+))]
+fn context_from_window(window: &Window) -> Option<Gpu> {
+    Gpu::from_window(window)
+}
+
+/// Nowhere else: the caller creates a standalone device.
+#[cfg(not(any(
+    target_family = "wasm",
+    target_os = "windows",
+    all(target_os = "macos", feature = "custom-gpu")
+)))]
+fn context_from_window(_window: &Window) -> Option<Gpu> {
+    None
 }
 
 /// One frame of zero-copy compositing: draws `target` into `bounds`.
@@ -315,8 +342,10 @@ mod tests {
 
     #[test]
     fn requirements_carry_the_renderer_limits() {
-        let mut limits = wgpu::Limits::default();
-        limits.max_storage_buffers_per_shader_stage = 5;
+        let limits = wgpu::Limits {
+            max_storage_buffers_per_shader_stage: 5,
+            ..Default::default()
+        };
         let requirements = gpu_requirements(Some(limits));
         let carried = requirements
             .limits

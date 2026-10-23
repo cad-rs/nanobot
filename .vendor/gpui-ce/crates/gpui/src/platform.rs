@@ -892,7 +892,9 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         detail: Option<&str>,
         answers: &[PromptButton],
     ) -> Option<oneshot::Receiver<usize>>;
-    fn activate(&self);
+    /// Request activation, optionally using an externally supplied token.
+    /// Returns whether a request was sent, not whether focus was granted.
+    fn activate(&self, token: Option<&str>) -> bool;
     /// Requests that the operating system draw attention to this window.
     fn request_attention(&self) {}
     fn is_active(&self) -> bool;
@@ -994,7 +996,12 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
 
     /// Returns the GPU context for this window's renderer.
     /// The returned `Box` contains `(Arc<wgpu::Device>, Arc<wgpu::Queue>)`.
-    #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "windows"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "windows",
+        target_os = "macos"
+    ))]
     fn gpu_context(&self) -> Option<Box<dyn std::any::Any>> {
         None
     }
@@ -1002,7 +1009,12 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// Returns typed backend-specific GPU context information for custom
     /// controls. The value is intentionally type-erased in this crate so the
     /// core UI crate does not depend on a rendering backend.
-    #[cfg(any(target_family = "wasm", target_os = "linux", target_os = "freebsd", target_os = "windows"))]
+    #[cfg(any(
+        target_family = "wasm",
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "macos"
+    ))]
     fn gpu_context_info(&self) -> Option<Box<dyn std::any::Any>> {
         None
     }
@@ -1013,7 +1025,12 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// captured the device from `gpu_context` should stop submitting while
     /// this is `Some(true)` and re-acquire the device once it reads
     /// `Some(false)` again.
-    #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "windows"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "windows",
+        target_os = "macos"
+    ))]
     fn gpu_device_lost(&self) -> Option<bool> {
         None
     }
