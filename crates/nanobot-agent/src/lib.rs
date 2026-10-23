@@ -27,6 +27,7 @@
 //! event log, making the log the single source of truth for plan state.
 
 pub mod agent;
+pub mod batch;
 pub mod cancellation;
 pub mod inbox;
 pub mod job;
@@ -35,6 +36,7 @@ pub mod plan;
 pub use agent::{
     Agent, AgentState, PlanVerifier, RestorePoint, ToolExecutor, WriteCheck, WriteOutcome,
 };
+pub use batch::{Axis, BatchOutcome, BatchSpec, Variant, VariantOutcome};
 pub use cancellation::CancellationToken;
 pub use inbox::Inbox;
 pub use job::{Job, JobContext, JobEvent, JobQueue, JobResult, JobRunner, JobSpec, JobState};
