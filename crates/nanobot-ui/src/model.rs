@@ -353,6 +353,70 @@ pub trait SessionView: Clone + 'static {
     fn build_workspace(&self, viewport: <Self::Viewport as ViewportSlot>::Handle) -> Self::Workspace;
 }
 
+/// One sidebar group of a product-supplied projection.
+#[derive(Clone, Debug)]
+pub struct SidebarGroup {
+    /// The group's heading, rendered when a projection is active.
+    pub label: String,
+    /// The sessions in the group, in render order.
+    pub sessions: Vec<SessionId>,
+}
+
+impl SidebarGroup {
+    pub fn new(label: impl Into<String>, sessions: Vec<SessionId>) -> Self {
+        Self {
+            label: label.into(),
+            sessions,
+        }
+    }
+}
+
+/// An alternative sidebar arrangement ("one sidebar, two roots" — the design
+/// harness's design-rooted vs session-rooted view of the same project graph).
+///
+/// The product owns grouping and labels; the framework owns rendering and
+/// selection (a click still switches sessions, and sessions the projection
+/// never named stay reachable under a trailing group — a projection is a
+/// view, not a strainer). `resolve_sidebar_groups` is the contract: one flat
+/// group when no projection is set, the product's groups otherwise.
+pub trait SidebarProjection<S: SessionView> {
+    fn groups(&self, store: &SessionStore<S>) -> Vec<SidebarGroup>;
+}
+
+/// The sidebar's groups: the projection's when one is supplied, otherwise one
+/// flat group of the open project's sessions in order (the default view).
+pub fn resolve_sidebar_groups<S: SessionView>(
+    store: &SessionStore<S>,
+    projection: Option<&dyn SidebarProjection<S>>,
+) -> Vec<(String, Vec<S>)> {
+    let sessions: Vec<S> = store.open_project_sessions().to_vec();
+    let Some(projection) = projection else {
+        return vec![(store.open_project().name.clone(), sessions)];
+    };
+    let mut groups: Vec<(String, Vec<S>)> = Vec::new();
+    let mut listed: Vec<SessionId> = Vec::new();
+    for group in projection.groups(store) {
+        let members: Vec<S> = group
+            .sessions
+            .iter()
+            .filter_map(|id| store.session(id).cloned())
+            .collect();
+        if members.is_empty() {
+            continue;
+        }
+        listed.extend(members.iter().map(|s| s.id().clone()));
+        groups.push((group.label, members));
+    }
+    let rest: Vec<S> = sessions
+        .into_iter()
+        .filter(|s| !listed.contains(s.id()))
+        .collect();
+    if !rest.is_empty() {
+        groups.push((String::from("\u{5176}\u{4ed6}"), rest));
+    }
+    groups
+}
+
 /// One project: the unit that groups sessions.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Project<S> {

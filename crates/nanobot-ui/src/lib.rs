@@ -24,9 +24,9 @@ pub mod shell;
 pub mod widgets;
 
 pub use model::{
-    plan_progress, Block, BlockKind, BranchMarker, Conversation, PlanDecision, PlanPhase,
-    PlanStep, Project, ProjectId, SessionId, SessionStatus, SessionStore, SessionView, StepStatus,
-    ToolState, WorkspaceView,
+    plan_progress, resolve_sidebar_groups, Block, BlockKind, BranchMarker, Conversation,
+    PlanDecision, PlanPhase, PlanStep, Project, ProjectId, SessionId, SessionStatus, SessionStore,
+    SessionView, SidebarGroup, SidebarProjection, StepStatus, ToolState, WorkspaceView,
 };
 pub use panels::{PanelArea, PanelDef, PanelHost, PanelSource, ScriptRuntime};
 pub use poll::poll_periodically;
@@ -318,6 +318,57 @@ mod tests {
             Some(SessionId::new("s2")),
             "the index's active session is restored"
         );
+    }
+
+    #[test]
+    fn without_a_projection_the_sidebar_is_one_flat_group() {
+        let store = two_project_store();
+        let groups = resolve_sidebar_groups(&store, None);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, "project p1");
+        assert_eq!(
+            groups[0].1.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
+            vec![SessionId::new("s1"), SessionId::new("s2")]
+        );
+    }
+
+    #[test]
+    fn a_projection_groups_the_sidebar_and_strays_stay_reachable() {
+        use std::rc::Rc;
+
+        struct DesignRooted;
+        impl SidebarProjection<TestSession> for DesignRooted {
+            fn groups(&self, store: &SessionStore<TestSession>) -> Vec<SidebarGroup> {
+                // Deliberately partial and order-shuffled: s2 under "design
+                // beta", s1 never named, an unknown id dropped.
+                let _ = store;
+                vec![
+                    SidebarGroup::new("design beta", vec![SessionId::new("s2")]),
+                    SidebarGroup::new("design gamma", vec![SessionId::new("gone")]),
+                ]
+            }
+        }
+
+        let store = two_project_store();
+        let groups = resolve_sidebar_groups(
+            &store,
+            Some(&DesignRooted as &dyn SidebarProjection<TestSession>),
+        );
+        let titles = groups
+            .iter()
+            .map(|(label, _)| label.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(titles, vec!["design beta", "其他"]);
+        assert_eq!(
+            groups[0].1.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
+            vec![SessionId::new("s2")]
+        );
+        assert_eq!(
+            groups[1].1.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
+            vec![SessionId::new("s1")],
+            "the projection is a view, not a strainer"
+        );
+        let _ = Rc::new(());
     }
 
     #[test]

@@ -71,6 +71,9 @@ pub struct HarnessShell<S: SessionView> {
     /// its engine dispatch table.
     on_undo: Option<Rc<RefCell<dyn Fn(&SessionId)>>>,
     on_redo: Option<Rc<RefCell<dyn Fn(&SessionId)>>>,
+    /// An optional product projection of the sidebar (design-rooted groups
+    /// instead of the flat session list). `None` = the default view.
+    sidebar_projection: Option<Rc<dyn crate::model::SidebarProjection<S>>>,
     on_save: Option<Rc<RefCell<dyn Fn(&SessionId)>>>,
     on_load: Option<Rc<RefCell<dyn Fn(&SessionId)>>>,
     on_import: Option<Rc<RefCell<dyn Fn(&SessionId)>>>,
@@ -98,6 +101,7 @@ impl<S: SessionView> HarnessShell<S> {
             composer: None,
             on_message_sent: None,
             on_plan_decision: None,
+            sidebar_projection: None,
             on_undo: None,
             on_redo: None,
             on_save: None,
@@ -183,6 +187,21 @@ impl<S: SessionView> HarnessShell<S> {
         F: Fn(&SessionId, PlanDecision) + 'static,
     {
         self.on_plan_decision = Some(Rc::new(RefCell::new(callback)));
+    }
+
+    /// Supply (or replace) the sidebar's projection. `None` restores the
+    /// default flat session list. Callers must notify: the sidebar renders on
+    /// the next frame.
+    pub fn set_sidebar_projection(
+        &mut self,
+        projection: Option<Rc<dyn crate::model::SidebarProjection<S>>>,
+    ) {
+        self.sidebar_projection = projection;
+    }
+
+    /// Whether a product projection is active (what a toggle renders).
+    pub fn has_sidebar_projection(&self) -> bool {
+        self.sidebar_projection.is_some()
     }
 
     pub fn set_on_undo<F>(&mut self, callback: F)
@@ -733,8 +752,23 @@ impl<S: SessionView> HarnessShell<S> {
             project_tree = project_tree.child(project_row);
 
             if selected_project {
-                for session in &sessions {
-                    project_tree = project_tree.child(self.session_row(session, p, cx));
+                for (label, members) in crate::model::resolve_sidebar_groups(
+                    &self.store.borrow(),
+                    self.sidebar_projection.as_deref(),
+                ) {
+                    if self.sidebar_projection.is_some() {
+                        project_tree = project_tree.child(
+                            div()
+                                .px_2()
+                                .pt_1()
+                                .text_xs()
+                                .text_color(p.muted)
+                                .child(label),
+                        );
+                    }
+                    for session in &members {
+                        project_tree = project_tree.child(self.session_row(session, p, cx));
+                    }
                 }
             }
         }
