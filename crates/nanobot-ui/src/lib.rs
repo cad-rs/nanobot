@@ -227,6 +227,110 @@ mod tests {
         )
     }
 
+    /// A minimal container manifest for the `from_manifest` bridge.
+    #[derive(Clone, serde::Serialize, serde::Deserialize)]
+    struct TestManifest {
+        info: nanobot_boot::container::ProjectInfo,
+        index: nanobot_boot::container::SessionIndex,
+    }
+
+    impl nanobot_boot::container::Manifest for TestManifest {
+        fn validate(&self) -> Result<(), nanobot_boot::BootError> {
+            Ok(())
+        }
+        fn checksum(&self) -> Option<u32> {
+            None
+        }
+        fn set_checksum(&mut self, _checksum: Option<u32>) {}
+        fn sessions(&self) -> &nanobot_boot::container::SessionIndex {
+            &self.index
+        }
+        fn sessions_mut(&mut self) -> &mut nanobot_boot::container::SessionIndex {
+            &mut self.index
+        }
+        fn project_info(&self) -> &nanobot_boot::container::ProjectInfo {
+            &self.info
+        }
+        fn project_info_mut(&mut self) -> &mut nanobot_boot::container::ProjectInfo {
+            &mut self.info
+        }
+    }
+
+    fn test_manifest(
+        name: &str,
+        entries: Vec<(&str, nanobot_boot::container::SessionStatus)>,
+        active: Option<&str>,
+    ) -> TestManifest {
+        use nanobot_boot::container::{ProjectInfo, SessionEntry, SessionIndex};
+        TestManifest {
+            info: ProjectInfo::new(name),
+            index: SessionIndex {
+                active: active.map(str::to_string),
+                entries: entries
+                    .into_iter()
+                    .map(|(id, status)| SessionEntry {
+                        id: id.to_string(),
+                        title: format!("title {id}"),
+                        status,
+                        document: None,
+                    })
+                    .collect(),
+            },
+        }
+    }
+
+    #[test]
+    fn from_manifest_builds_one_project_from_the_session_index() {
+        use nanobot_boot::container::{
+            Manifest as _, ProjectPaths, SessionStatus as ContainerStatus,
+        };
+        let manifest = test_manifest(
+            "demo",
+            vec![
+                ("s1", ContainerStatus::Active),
+                ("s2", ContainerStatus::AwaitingReview),
+            ],
+            Some("s2"),
+        );
+        let paths = ProjectPaths::new("/tmp/does-not-exist");
+        let store = SessionStore::from_manifest(&manifest, &paths, |entry, _| {
+            let mut session = TestSession::new(&entry.id);
+            session.title = entry.title.clone();
+            session.status = SessionStatus::from(entry.status);
+            session
+        });
+
+        assert_eq!(
+            store.open_project_id(),
+            &ProjectId::new(manifest.project_info().uuid.clone()),
+            "the project's id is the container's uuid"
+        );
+        assert_eq!(store.open_project().name, "demo");
+        let sessions = store.open_project_sessions();
+        assert_eq!(
+            sessions.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
+            vec![SessionId::new("s1"), SessionId::new("s2")],
+            "entry order is the index's"
+        );
+        assert_eq!(sessions[1].status, SessionStatus::AwaitingReview);
+        assert_eq!(
+            store.open_project().session_index,
+            Some(SessionId::new("s2")),
+            "the index's active session is restored"
+        );
+    }
+
+    #[test]
+    fn from_manifest_opens_an_empty_index_as_an_empty_project() {
+        use nanobot_boot::container::ProjectPaths;
+        let manifest = test_manifest("empty", Vec::new(), None);
+        let paths = ProjectPaths::new("/tmp/does-not-exist");
+        let store =
+            SessionStore::from_manifest(&manifest, &paths, |entry, _| TestSession::new(&entry.id));
+        assert!(store.open_project_sessions().is_empty());
+        assert_eq!(store.open_project().session_index, None);
+    }
+
     #[test]
     fn the_shell_opens_the_project_at_its_session_index() {
         let shell = HarnessShell::new(two_project_store());

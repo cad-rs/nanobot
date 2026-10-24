@@ -89,6 +89,19 @@ impl SessionStatus {
     }
 }
 
+/// The container's session status maps 1:1 onto the shell's (the shell owns
+/// the UI wording; see [`SessionStatus::label`]).
+impl From<nanobot_boot::container::SessionStatus> for SessionStatus {
+    fn from(status: nanobot_boot::container::SessionStatus) -> Self {
+        match status {
+            nanobot_boot::container::SessionStatus::Active => Self::Active,
+            nanobot_boot::container::SessionStatus::Running => Self::Running,
+            nanobot_boot::container::SessionStatus::AwaitingReview => Self::AwaitingReview,
+            nanobot_boot::container::SessionStatus::Archived => Self::Archived,
+        }
+    }
+}
+
 /// One step of a session's plan.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct PlanStep {
@@ -438,5 +451,51 @@ impl<S: SessionView> SessionStore<S> {
         };
         *existing = session;
         true
+    }
+
+    /// Build the store from a boot container's manifest: one project, its
+    /// session index loaded through `loader`.
+    ///
+    /// The bridge a product shell needs on startup: the framework owns the
+    /// manifest, the paths and the session index (the container); the product
+    /// knows how to turn one [`nanobot_boot::container::SessionEntry`] plus
+    /// the project paths into its own session (usually by loading that
+    /// session's event log under `paths`). Entry order is the index's; the
+    /// index's active session, when present, becomes the project's session
+    /// index. A project with an empty index still opens — the shell shows it
+    /// empty.
+    pub fn from_manifest<M, F>(
+        manifest: &M,
+        paths: &nanobot_boot::container::ProjectPaths,
+        loader: F,
+    ) -> Self
+    where
+        M: nanobot_boot::container::Manifest,
+        F: Fn(&nanobot_boot::container::SessionEntry, &nanobot_boot::container::ProjectPaths) -> S,
+    {
+        let info = manifest.project_info();
+        let index = manifest.sessions();
+        let sessions: Vec<S> = index
+            .entries
+            .iter()
+            .map(|entry| loader(entry, paths))
+            .collect();
+        let session_index = index.active.as_ref().and_then(|id| {
+            let want = SessionId::new(id.clone());
+            sessions
+                .iter()
+                .find(|session| session.id() == &want)
+                .map(|_| want)
+        });
+        let project_id = ProjectId::new(info.uuid.clone());
+        Self::new(
+            vec![Project {
+                id: project_id.clone(),
+                name: info.name.clone(),
+                sessions,
+                session_index,
+            }],
+            project_id,
+        )
     }
 }
