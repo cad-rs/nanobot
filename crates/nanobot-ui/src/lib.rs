@@ -19,7 +19,9 @@
 
 pub mod model;
 pub mod panels;
+pub mod poll;
 pub mod shell;
+pub mod widgets;
 
 pub use model::{
     plan_progress, Block, BlockKind, BranchMarker, Conversation, PlanDecision, PlanPhase,
@@ -27,7 +29,9 @@ pub use model::{
     ToolState, WorkspaceView,
 };
 pub use panels::{PanelArea, PanelDef, PanelHost, PanelSource, ScriptRuntime};
+pub use poll::poll_periodically;
 pub use shell::HarnessShell;
+pub use widgets::{button, line, picker, short_hash, show, truncate, HashedRef};
 
 #[cfg(test)]
 mod tests {
