@@ -222,8 +222,31 @@ impl JobQueue {
     /// Submit a job. It starts queued; a worker picks it up.
     #[must_use]
     pub fn submit(self: &Arc<Self>, spec: JobSpec) -> Job {
+        let id = self.allocate_id();
+        self.submit_with_id(id, spec)
+    }
+
+    /// Allocate the next job id without submitting.
+    ///
+    /// For callers that must key something on the id *before* the job can be
+    /// picked up — a product plane that persists a job record, say: allocate,
+    /// write the record, then submit with [`Self::submit_with_id`]. A worker
+    /// can start the moment [`Self::submit_with_id`] is called, so anything
+    /// written after that point races the first worker.
+    #[must_use]
+    pub fn allocate_id(&self) -> String {
         let n = self.next.fetch_add(1, Ordering::SeqCst);
-        let id = format!("job-{n}");
+        format!("job-{n}")
+    }
+
+    /// Submit a job carrying an id from [`Self::allocate_id`].
+    ///
+    /// Otherwise identical to [`Self::submit`].
+    ///
+    /// # Panics
+    ///
+    /// Panics (debug builds) if `id` is already in use in this queue.
+    pub fn submit_with_id(self: &Arc<Self>, id: String, spec: JobSpec) -> Job {
         let job = Job {
             id: id.clone(),
             kind: spec.kind.clone(),
@@ -239,6 +262,7 @@ impl JobQueue {
         let cancel = Arc::new(AtomicBool::new(false));
         {
             let mut inner = self.inner.lock().unwrap();
+            debug_assert!(!inner.jobs.contains_key(&id), "duplicate job id {id}");
             inner.jobs.insert(id.clone(), job.clone());
             inner.cancel_flags.insert(id.clone(), cancel);
             inner.ready.push_back(id.clone());
@@ -504,6 +528,31 @@ mod tests {
         assert!(done.started_at_ms.is_some() && done.finished_at_ms.is_some());
         // Progress was reported mid-run.
         assert!(done.headline().contains("succeeded"));
+    }
+
+    #[test]
+    fn a_job_submitted_with_an_allocated_id_keeps_it() {
+        let queue = JobQueue::new(
+            Arc::new(SlowRunner {
+                calls: Arc::new(AtomicUsize::new(0)),
+                work_ms: 1,
+            }),
+            1,
+        );
+        let first = queue.allocate_id();
+        let second = queue.allocate_id();
+        assert_ne!(first, second, "allocation is monotonic");
+
+        let job =
+            queue.submit_with_id(first.clone(), JobSpec::new("margin", serde_json::json!({})));
+        assert_eq!(job.id, first);
+        for _ in 0..200 {
+            if queue.get(&first).is_some_and(|j| j.state.is_terminal()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(queue.get(&first).unwrap().state, JobState::Succeeded);
     }
 
     #[test]
