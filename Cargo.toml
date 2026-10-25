@@ -49,6 +49,8 @@ uuid = { version = "1.0", features = ["v4", "serde"] }
 crc32fast = "1.5"
 futures-executor = "0.3"
 web-time = "1"
+# Offline license verification (PR E); pure Rust, no C dependency.
+ed25519-dalek = { version = "2", default-features = false }
 futures-core = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 bytes = "1"
