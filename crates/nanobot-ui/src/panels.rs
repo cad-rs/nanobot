@@ -70,6 +70,10 @@ pub struct PanelDef<S: SessionView> {
     pub area: PanelArea,
     pub order: i32,
     pub source: PanelSource<S>,
+    /// The plugin that contributed this panel, when a script plugin did.
+    /// The plugins panel uses it to disable a plugin at runtime (removing
+    /// exactly its panels); product panels have none.
+    pub source_plugin: Option<String>,
 }
 
 impl<S: SessionView> Clone for PanelDef<S> {
@@ -83,6 +87,7 @@ impl<S: SessionView> Clone for PanelDef<S> {
                 PanelSource::Product(render) => PanelSource::Product(render.clone()),
                 PanelSource::Script(path) => PanelSource::Script(path.clone()),
             },
+            source_plugin: self.source_plugin.clone(),
         }
     }
 }
@@ -108,6 +113,7 @@ impl<S: SessionView> PanelDef<S> {
             area,
             order,
             source: PanelSource::Product(render),
+            source_plugin: None,
         }
     }
 
@@ -124,7 +130,15 @@ impl<S: SessionView> PanelDef<S> {
             area,
             order,
             source: PanelSource::Script(script),
+            source_plugin: None,
         }
+    }
+
+    /// Names the plugin this panel came from (the plugins panel's disable
+    /// removes exactly these).
+    pub fn with_plugin(mut self, plugin: impl Into<String>) -> Self {
+        self.source_plugin = Some(plugin.into());
+        self
     }
 }
 
@@ -275,15 +289,28 @@ impl<S: SessionView> PanelHost<S> {
             let Some(area) = PanelArea::parse(&panel.area) else {
                 continue;
             };
-            self.register(PanelDef::script(
-                panel.id.clone(),
-                panel.title.clone(),
-                area,
-                order,
-                panel.script.clone(),
-            ));
+            self.register(
+                PanelDef::script(
+                    panel.id.clone(),
+                    panel.title.clone(),
+                    area,
+                    order,
+                    panel.script.clone(),
+                )
+                .with_plugin(&panel.plugin),
+            );
             order += 1;
         }
+    }
+
+    /// Disables a plugin at runtime: removes exactly the panels it
+    /// contributed. Returns how many went away (the plugins panel shows
+    /// this; zero for an already-disabled or unknown plugin).
+    pub fn remove_plugin(&mut self, plugin: &str) -> usize {
+        let before = self.panels.len();
+        self.panels
+            .retain(|panel| panel.source_plugin.as_deref() != Some(plugin));
+        before - self.panels.len()
     }
 
     /// Mounts the script panel and returns its element.

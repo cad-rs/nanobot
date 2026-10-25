@@ -651,4 +651,94 @@ mod tests {
         assert_eq!(crate::shell::avatar_letter("  李四"), '李');
         assert_eq!(crate::shell::avatar_letter(""), 'U');
     }
+
+    #[test]
+    fn a_plugins_panel_registers_once_and_disable_removes_exactly_that_plugins_panels() {
+        let mut shell = HarnessShell::new(two_project_store());
+        shell.panel_host().register(PanelDef::product(
+            "product.panel",
+            "产品面板",
+            PanelArea::Right,
+            0,
+            Rc::new(|_shell, _ws, _window, _cx| gpui::div().into_any_element()),
+        ));
+
+        let loaded = nanobot_rhai::LoadedPlugins {
+            plugins_loaded: vec!["acme.chart".into(), "acme.log".into()],
+            panels: vec![
+                nanobot_rhai::PanelRegistration {
+                    plugin: "acme.chart".into(),
+                    id: "acme.chart.panel".into(),
+                    title: "温度曲线".into(),
+                    script: std::path::PathBuf::from("/tmp/chart.rhai"),
+                    area: "right".into(),
+                },
+                nanobot_rhai::PanelRegistration {
+                    plugin: "acme.log".into(),
+                    id: "acme.log.panel".into(),
+                    title: "日志".into(),
+                    script: std::path::PathBuf::from("/tmp/log.rhai"),
+                    area: "bottom".into(),
+                },
+            ],
+            views: vec![],
+            commands: vec![],
+            toolbar: vec![],
+            notes: vec![],
+            plugins_rejected: vec![("acme.bad".into(), "api_version 9 not supported".into())],
+        };
+        // The product attaches the panels, then shares the load result.
+        shell.attach_plugins(&loaded.panels);
+        shell.set_plugins(&loaded);
+        let bottom: Vec<String> = shell
+            .panel_host()
+            .panels_in(PanelArea::Bottom)
+            .iter()
+            .map(|panel| panel.id.clone())
+            .collect();
+        assert!(
+            bottom.contains(&"harness.plugins".to_string()),
+            "the plugins panel registered: {bottom:?}"
+        );
+        assert_eq!(
+            shell.plugins().map(|entries| entries.to_vec()),
+            Some(vec![
+                crate::shell::PluginEntry { id: "acme.chart".into(), enabled: true },
+                crate::shell::PluginEntry { id: "acme.log".into(), enabled: true },
+            ])
+        );
+
+        // Disabling one plugin removes exactly its panel; the product panel
+        // and the other plugin's panel stay.
+        let removed = shell.disable_plugin("acme.chart");
+        assert_eq!(removed, 1);
+        let right: Vec<String> = shell
+            .panel_host()
+            .panels_in(PanelArea::Right)
+            .iter()
+            .map(|panel| panel.id.clone())
+            .collect();
+        assert_eq!(right, vec!["product.panel".to_string()]);
+        assert!(
+            shell
+                .panel_host()
+                .panels()
+                .iter()
+                .any(|panel| panel.id == "acme.log.panel"),
+            "the other plugin's panel survives"
+        );
+        assert_eq!(
+            shell.plugins().unwrap().iter().find(|e| e.id == "acme.chart").unwrap().enabled,
+            false
+        );
+
+        // Re-sharing keeps the disabled state; registration stays singular.
+        shell.set_plugins(&loaded);
+        assert_eq!(shell.panel_host().panels_in(PanelArea::Bottom).len(), 3);
+        assert_eq!(
+            shell.plugins().unwrap().iter().find(|e| e.id == "acme.chart").unwrap().enabled,
+            false,
+            "the user's disable survives a snapshot refresh"
+        );
+    }
 }
