@@ -97,25 +97,7 @@ pub fn checks(harness: &Harness) -> Vec<Check> {
     // 4. Persistence round trip (probe: needs project paths; native only —
     // the web has no file to read back, so the probe skips there).
     match harness.events_path() {
-        #[cfg(not(target_family = "wasm"))]
-        Some(events) => {
-            let found = nanobot_session::persistence::load(&events)
-                .map(|entries| {
-                    entries
-                        .iter()
-                        .any(|entry| is_user_message(&entry.event, SELFCHECK_TURN))
-                })
-                .unwrap_or(false);
-            checks.push(Check::new(
-                "持久化: 事件日志落盘可回读",
-                found,
-                format!("path={}", events.display()),
-            ));
-        }
-        Some(_) => checks.push(Check::skip(
-            "持久化: 事件日志落盘可回读",
-            "wasm 没有可回读的项目文件",
-        )),
+        Some(events) => checks.push(persistence_probe(&events)),
         None => checks.push(Check::skip(
             "持久化: 事件日志落盘可回读",
             "未配置项目路径",
@@ -155,6 +137,33 @@ pub fn checks(harness: &Harness) -> Vec<Check> {
 
 /// Prints the checks and returns the process exit code (0 = nothing failed;
 /// SKIPs do not fail).
+/// The persistence probe's read-back half. Native reads the JSONL log; the
+/// web has no project file, so the probe skips (probe semantics: a missing
+/// prerequisite is a SKIP, never a FAIL).
+#[cfg(not(target_family = "wasm"))]
+fn persistence_probe(events: &Path) -> Check {
+    let found = nanobot_session::persistence::load(events)
+        .map(|entries| {
+            entries
+                .iter()
+                .any(|entry| is_user_message(&entry.event, SELFCHECK_TURN))
+        })
+        .unwrap_or(false);
+    Check::new(
+        "持久化: 事件日志落盘可回读",
+        found,
+        format!("path={}", events.display()),
+    )
+}
+
+#[cfg(target_family = "wasm")]
+fn persistence_probe(_events: &Path) -> Check {
+    Check::skip(
+        "持久化: 事件日志落盘可回读",
+        "wasm 没有可回读的项目文件",
+    )
+}
+
 pub fn report(checks: &[Check]) -> i32 {
     let failed = checks.iter().filter(|c| !c.ok && !c.skipped).count();
     let skipped = checks.iter().filter(|c| c.skipped).count();
