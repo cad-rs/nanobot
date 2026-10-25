@@ -135,6 +135,16 @@ impl<S: SessionView> HarnessShell<S> {
             on_sign_in: None,
             on_sign_out: None,
         };
+        // Framework chrome: the diagnostics panel is always there (it reads
+        // nothing but shell state), the settings panel joins when the app
+        // layer shares a store.
+        shell.panel_host.register(PanelDef::product(
+            "harness.diagnostics",
+            "诊断",
+            PanelArea::Bottom,
+            1,
+            Rc::new(diagnostics_panel),
+        ));
         let session_id = shell.store.borrow().open_project().session_index.clone();
         if let Some(session_id) = session_id {
             if shell.store.borrow().session(&session_id).is_some() {
@@ -1546,6 +1556,82 @@ fn plan_progress_of<W: WorkspaceView>(ws: &W) -> (usize, usize) {
 /// replaced).
 pub(crate) fn avatar_letter(name: &str) -> char {
     name.trim().chars().next().unwrap_or('U')
+}
+
+/// The framework's diagnostics panel body, registered by
+/// [`HarnessShell::new`] — framework chrome like workbench-rs's
+/// DiagnosticsPanel. It reads nothing but shell state: identity, store
+/// shape, panel/script health, viewport liveness, settings wiring.
+fn diagnostics_panel<S: SessionView>(
+    shell: &HarnessShell<S>,
+    _workspace: &S::Workspace,
+    _window: &mut Window,
+    cx: &mut Context<HarnessShell<S>>,
+) -> AnyElement {
+    let p = palette(cx);
+    let store = shell.store.borrow();
+    let rows: [(&str, String); 9] = [
+        ("产品", shell.product_name.clone()),
+        ("主题", shell.theme().as_str().to_string()),
+        ("项目数", store.projects().len().to_string()),
+        (
+            "会话数",
+            format!(
+                "{}（打开项目 {}）",
+                store.open_project_sessions().len(),
+                store.open_project().name
+            ),
+        ),
+        ("面板数", shell.panel_host.len().to_string()),
+        (
+            "脚本面板",
+            format!(
+                "已挂载 {}，错误 {}",
+                shell.panel_host.mounted_scripts(),
+                shell.panel_host.script_errors().len()
+            ),
+        ),
+        ("视口帧", shell.painted_frames().to_string()),
+        (
+            "设置",
+            shell
+                .settings()
+                .and_then(|store| {
+                    store.lock().ok().and_then(|s| {
+                        s.path().map(|path| path.display().to_string())
+                    })
+                })
+                .unwrap_or_else(|| "未连接".to_string()),
+        ),
+        (
+            "账号",
+            shell
+                .account()
+                .map(|account| account.display_name.clone())
+                .unwrap_or_else(|| "访客".to_string()),
+        ),
+    ];
+    div()
+        .flex()
+        .flex_wrap()
+        .gap_x_4()
+        .gap_y_1()
+        .px_1()
+        .children(rows.map(|(label, value)| {
+            div()
+                .flex()
+                .flex_row()
+                .gap_1()
+                .child(div().text_xs().text_color(p.muted).child(format!("{label}")))
+                .child(
+                    div()
+                        .text_xs()
+                        .min_w_0()
+                        .child(crate::widgets::truncate(&value, 48)),
+                )
+                .into_any_element()
+        }))
+        .into_any_element()
 }
 
 /// The framework's settings panel body, registered by
