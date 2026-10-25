@@ -615,4 +615,26 @@ mod tests {
         shell.set_settings(Some(Arc::new(Mutex::new(named))));
         assert_eq!(shell.theme(), crate::theme::ThemeKind::Light);
     }
+
+    #[test]
+    fn the_account_chip_shows_the_identity_or_a_guest() {
+        let mut shell = HarnessShell::new(two_project_store());
+        assert!(shell.account().is_none(), "a shell starts as a guest");
+
+        shell.set_account(Some(
+            nanobot_boot::Account::new("u1", "Alice").with_plan("pro"),
+        ));
+        assert_eq!(shell.account().map(|a| a.id.clone()), Some("u1".to_string()));
+        assert_eq!(shell.account().and_then(|a| a.plan.clone()), Some("pro".to_string()));
+
+        shell.set_account(None);
+        assert!(shell.account().is_none(), "signing out clears the chip");
+    }
+
+    #[test]
+    fn avatar_letters_come_from_the_display_name() {
+        assert_eq!(crate::shell::avatar_letter("Alice"), 'A');
+        assert_eq!(crate::shell::avatar_letter("  李四"), '李');
+        assert_eq!(crate::shell::avatar_letter(""), 'U');
+    }
 }

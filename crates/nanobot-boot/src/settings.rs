@@ -51,21 +51,11 @@ pub fn user_config_dir(harness_id: &str) -> PathBuf {
 
 /// The user settings store. Shared behind a mutex by the harness; owned by
 /// whoever calls `set` (on a UI, that is the UI thread).
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Settings {
     values: BTreeMap<String, Value>,
     path: Option<PathBuf>,
     dirty: bool,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            values: BTreeMap::new(),
-            path: None,
-            dirty: false,
-        }
-    }
 }
 
 impl Settings {

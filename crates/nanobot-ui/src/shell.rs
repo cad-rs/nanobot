@@ -32,6 +32,7 @@ use gpui_component::{
     input::{Input, InputEvent, InputState},
     ActiveTheme as _, StyledExt as _,
 };
+use nanobot_boot::account::Account;
 use nanobot_boot::Settings;
 use nanobot_gpu::{ViewportInput, ViewportProjection, ViewportSlot};
 
@@ -95,6 +96,13 @@ pub struct HarnessShell<S: SessionView> {
     /// The theme the shell renders in. Tracked so a toggle knows its
     /// starting point even without a settings store.
     theme: ThemeKind,
+    /// The identity the account provider reports (`None` = a guest). The
+    /// framework renders the chip; the product's callbacks decide what
+    /// signing in and out mean (its own dialog, a license import) — the
+    /// framework never authenticates.
+    account: Option<Account>,
+    on_sign_in: Option<Rc<RefCell<dyn Fn()>>>,
+    on_sign_out: Option<Rc<RefCell<dyn Fn()>>>,
 }
 
 impl<S: SessionView> HarnessShell<S> {
@@ -123,6 +131,9 @@ impl<S: SessionView> HarnessShell<S> {
             panel_host: PanelHost::default(),
             settings: None,
             theme: ThemeKind::Dark,
+            account: None,
+            on_sign_in: None,
+            on_sign_out: None,
         };
         let session_id = shell.store.borrow().open_project().session_index.clone();
         if let Some(session_id) = session_id {
@@ -298,6 +309,36 @@ impl<S: SessionView> HarnessShell<S> {
             Some(store) => crate::theme::set_theme(store, kind, Some(window), cx),
             None => crate::theme::apply(kind, Some(window), cx),
         }
+    }
+
+    /// The identity the sidebar's account chip shows (`None` = a guest).
+    /// Feed it from the harness's account provider whenever the app layer
+    /// learns the snapshot changed.
+    pub fn set_account(&mut self, account: Option<Account>) {
+        self.account = account;
+    }
+
+    /// The identity the chip currently shows.
+    pub fn account(&self) -> Option<&Account> {
+        self.account.as_ref()
+    }
+
+    /// What the chip's sign-in affordance does (the product opens its own
+    /// dialog — cloud sign-in, license import; the framework never
+    /// authenticates). Without a callback the affordance is inert.
+    pub fn set_on_sign_in<F>(&mut self, callback: F)
+    where
+        F: Fn() + 'static,
+    {
+        self.on_sign_in = Some(Rc::new(RefCell::new(callback)));
+    }
+
+    /// What the chip's sign-out affordance does.
+    pub fn set_on_sign_out<F>(&mut self, callback: F)
+    where
+        F: Fn() + 'static,
+    {
+        self.on_sign_out = Some(Rc::new(RefCell::new(callback)));
     }
 
     pub fn store(&self) -> Ref<'_, SessionStore<S>> {
@@ -883,17 +924,7 @@ impl<S: SessionView> HarnessShell<S> {
             .flex_row()
             .items_center()
             .gap_2()
-            .child(
-                div()
-                    .w(px(24.))
-                    .h(px(24.))
-                    .rounded(px(12.))
-                    .bg(p.accent.opacity(0.3))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(div().text_xs().text_color(p.accent).child("U".to_string())),
-            )
+            .child(self.account_chip(p, cx))
             .child(div().flex_1())
             .child(
                 div()
@@ -926,6 +957,79 @@ impl<S: SessionView> HarnessShell<S> {
                             .h(px(16.)),
                     ),
             )
+    }
+
+    /// The sidebar footer's account chip: the identity the account provider
+    /// reports (avatar letter, name, plan badge) or a guest with a sign-in
+    /// affordance. Clicking a signed-in chip signs out. The shell renders
+    /// the chip; the product's callbacks decide what either action means.
+    fn account_chip(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        match self.account.clone() {
+            Some(account) => {
+                let plan = account.plan.clone();
+                let mut chip = div()
+                    .id("harness-account")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .min_w_0()
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |shell, _event, _window, _cx| {
+                        if let Some(sign_out) = shell.on_sign_out.clone() {
+                            (sign_out.borrow())();
+                        }
+                    }))
+                    .child(
+                        div()
+                            .w(px(24.))
+                            .h(px(24.))
+                            .rounded(px(12.))
+                            .bg(p.accent.opacity(0.3))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(p.accent)
+                                    .child(avatar_letter(&account.display_name).to_string()),
+                            ),
+                    )
+                    .child(div().text_xs().min_w_0().child(crate::widgets::truncate(
+                        &account.display_name,
+                        10,
+                    )));
+                if let Some(plan) = plan {
+                    chip = chip.child(badge(&plan, p.accent));
+                }
+                chip
+            }
+            None => div()
+                .id("harness-account-guest")
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .cursor_pointer()
+                .on_click(cx.listener(move |shell, _event, _window, _cx| {
+                    if let Some(sign_in) = shell.on_sign_in.clone() {
+                        (sign_in.borrow())();
+                    }
+                }))
+                .child(
+                    div()
+                        .w(px(24.))
+                        .h(px(24.))
+                        .rounded(px(12.))
+                        .bg(p.muted.opacity(0.2))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(div().text_xs().text_color(p.muted).child("?".to_string())),
+                )
+                .child(div().text_xs().text_color(p.muted).child("访客 · 点击登录")),
+        }
     }
 
     fn session_row(&self, session: &S, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1435,6 +1539,13 @@ mod assets {
 /// `(done, total)` of a workspace's plan.
 fn plan_progress_of<W: WorkspaceView>(ws: &W) -> (usize, usize) {
     plan_progress(&ws.plan())
+}
+
+/// The avatar letter the account chip shows: the display name's first
+/// character (`U` for the empty name, matching the placeholder the chip
+/// replaced).
+pub(crate) fn avatar_letter(name: &str) -> char {
+    name.trim().chars().next().unwrap_or('U')
 }
 
 /// The framework's settings panel body, registered by

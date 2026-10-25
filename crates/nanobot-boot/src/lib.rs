@@ -20,6 +20,11 @@
 //! - [`settings`] — the user-scoped settings store (`ui.theme` and friends:
 //!   flat dotted keys, write-through, never fatal to load). Settings belong
 //!   to the user, not the project, so they survive a project switch.
+//! - [`account`] — the account concept: [`AccountProvider`] is the product's
+//!   authentication seam (cloud sign-in, license seat, OS identity — the
+//!   framework never authenticates), [`Account`] the identity snapshot,
+//!   [`Harness::check_entitlement`] the gated-capability question whose
+//!   denials land on the session log as auditable `CheckResult`s.
 //!
 //! Provenance: the assembly was lifted from the ocad design harness
 //! (`apps/ocad/src/agent_host.rs::assemble`), the container from the ocad
@@ -28,6 +33,7 @@
 //! Discipline: this crate stays GUI-free — no `gpui*`, no `wgpu`, no rcad /
 //! ocad dependencies — so CLI, tests, and MCP servers can consume the kernel.
 
+pub mod account;
 pub mod canonical;
 pub mod cli;
 pub mod container;
@@ -37,6 +43,10 @@ pub mod harness_toml;
 pub mod selfcheck;
 pub mod settings;
 
+pub use account::{
+    denial_events, Account, AccountProvider, AnonymousProvider, EntitlementDecision,
+    SharedAccountProvider, StaticProvider, TURN_CAPABILITY,
+};
 pub use cli::{Cli, CliMode};
 pub use container::{
     validate_relative_path, ChecksumState, Manifest, PackageRef, PackageSelection, Project,

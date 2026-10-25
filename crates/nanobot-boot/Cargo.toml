@@ -21,6 +21,8 @@ thiserror = { workspace = true }
 toml = { workspace = true }
 uuid = { workspace = true }
 crc32fast = { workspace = true }
+# StaticProvider reads the clock; web-time keeps wasm builds working.
+web-time = { workspace = true }
 # The selfcheck and the CLI smoke modes drive the agent loop headlessly
 # (futures_executor::block_on); the async runtime stays the host's.
 futures-executor = { workspace = true }
