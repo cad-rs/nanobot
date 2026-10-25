@@ -17,6 +17,9 @@
 //!   [`Manifest`] contract, and [`Project`] (open / create / save / session
 //!   index with canonical-CRC32 sealing). The manifest type is the
 //!   product's; the container is the framework's.
+//! - [`settings`] — the user-scoped settings store (`ui.theme` and friends:
+//!   flat dotted keys, write-through, never fatal to load). Settings belong
+//!   to the user, not the project, so they survive a project switch.
 //!
 //! Provenance: the assembly was lifted from the ocad design harness
 //! (`apps/ocad/src/agent_host.rs::assemble`), the container from the ocad
@@ -32,6 +35,7 @@ pub mod error;
 pub mod harness;
 pub mod harness_toml;
 pub mod selfcheck;
+pub mod settings;
 
 pub use cli::{Cli, CliMode};
 pub use container::{
@@ -42,3 +46,4 @@ pub use container::{
 pub use error::BootError;
 pub use harness::{run_one_turn, Harness, HarnessBuilder, CLEAN_MARKER};
 pub use harness_toml::{ApprovalMode, HarnessProfile, ProviderConfig, HARNESS_TOML};
+pub use settings::{Settings, SETTINGS_FILE};

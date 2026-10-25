@@ -23,7 +23,7 @@
 //! the log without the marker and reports [`Harness::crash_recovered`].
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use nanobot_agent::{Agent, PlanVerifier, ToolExecutor};
 use nanobot_cordis::Context;
@@ -36,6 +36,7 @@ use nanobot_tools::{ApprovalPolicy, AutoApprovalPolicy, DenyAllPolicy, ToolDefin
 use crate::container::ProjectPaths;
 use crate::error::BootError;
 use crate::harness_toml::{ApprovalMode, HarnessProfile};
+use crate::settings::{Settings, SETTINGS_FILE};
 
 /// The marker [`Drop`] writes into the conversation directory. Its absence
 /// at the next `build()` — with a log present — is what
@@ -52,6 +53,8 @@ pub struct Harness {
     profile: HarnessProfile,
     profile_source: Option<PathBuf>,
     paths: Option<ProjectPaths>,
+    settings: Arc<Mutex<Settings>>,
+    settings_file: PathBuf,
     session_id: String,
     tool_count: usize,
     has_tool_executor: bool,
@@ -100,6 +103,19 @@ impl Harness {
             .map(|p| p.audit().join(format!("{}.jsonl", self.session_id)))
     }
 
+    /// The user settings store, shared with the shell's settings panel.
+    /// Changes write through; [`Drop`] persists anything still pending. The
+    /// store is user-scoped (`~/.config/<harness id>/`), not project-scoped —
+    /// the theme survives a project switch.
+    pub fn settings(&self) -> Arc<Mutex<Settings>> {
+        self.settings.clone()
+    }
+
+    /// The file the user settings persist to.
+    pub fn settings_path(&self) -> &Path {
+        &self.settings_file
+    }
+
     /// How many tool definitions the registry carries.
     pub fn tool_count(&self) -> usize {
         self.tool_count
@@ -134,6 +150,12 @@ impl Harness {
 
 impl Drop for Harness {
     fn drop(&mut self) {
+        // Pending settings changes are persisted on the way out — the same
+        // close-out discipline as the clean marker. A store nobody touched
+        // writes nothing.
+        if let Ok(mut settings) = self.settings.lock() {
+            let _ = settings.save_if_dirty();
+        }
         // A normal exit marks the session clean. A crash (process exit
         // without drop) leaves the marker absent — the next build() reads
         // the absence as "recover".
@@ -153,6 +175,7 @@ pub struct HarnessBuilder {
     paths: Option<ProjectPaths>,
     profile: HarnessProfile,
     profile_source: Option<PathBuf>,
+    settings_path: Option<PathBuf>,
     adapters: Vec<(String, Arc<dyn LlmAdapter>)>,
     registry: Option<Arc<ToolRegistry>>,
     tool_definitions: Vec<ToolDefinition>,
@@ -171,6 +194,7 @@ impl HarnessBuilder {
             paths: None,
             profile: HarnessProfile::default(),
             profile_source: None,
+            settings_path: None,
             adapters: Vec::new(),
             registry: None,
             tool_definitions: Vec::new(),
@@ -209,6 +233,15 @@ impl HarnessBuilder {
     /// reports it).
     pub fn with_harness_profile_source(mut self, path: PathBuf) -> Self {
         self.profile_source = Some(path);
+        self
+    }
+
+    /// Where the user settings persist. When unset, the conventional
+    /// user-scoped file for the profile's identity is used
+    /// (`~/.config/<harness id>/settings.json`). Products pin this in tests
+    /// so an assembly never touches the real user config directory.
+    pub fn with_settings_path(mut self, path: PathBuf) -> Self {
+        self.settings_path = Some(path);
         self
     }
 
@@ -288,6 +321,7 @@ impl HarnessBuilder {
             paths,
             profile,
             profile_source,
+            settings_path,
             adapters,
             registry,
             tool_definitions,
@@ -300,6 +334,18 @@ impl HarnessBuilder {
         } = self;
 
         let mut notes: Vec<String> = Vec::new();
+
+        // User settings: user-scoped (keyed by the harness identity, not the
+        // project) and never fatal to load — a corrupt file resets and lands
+        // in the notes.
+        let settings_file = settings_path.unwrap_or_else(|| {
+            crate::settings::user_config_dir(&profile.id).join(SETTINGS_FILE)
+        });
+        let (settings, settings_error) = Settings::load(&settings_file);
+        if let Some(error) = settings_error {
+            notes.push(error);
+        }
+        let settings = Arc::new(Mutex::new(settings));
 
         let session = Session::new(session_id.clone());
 
@@ -446,6 +492,8 @@ impl HarnessBuilder {
             profile,
             profile_source,
             paths,
+            settings,
+            settings_file,
             session_id,
             tool_count,
             has_tool_executor,
@@ -584,6 +632,47 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(paths.root());
+    }
+
+    #[test]
+    fn settings_ride_on_the_harness_and_persist_on_drop() {
+        let dir = std::env::temp_dir().join(format!("nb-harness-settings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join("settings.json");
+
+        {
+            let harness = Harness::builder()
+                .with_session_id("sess-settings")
+                .with_settings_path(file.clone())
+                .build()
+                .expect("build");
+            assert_eq!(harness.settings_path(), file.as_path());
+            harness
+                .settings()
+                .lock()
+                .unwrap()
+                .set("ui.theme", serde_json::json!("light"))
+                .expect("set");
+        }
+        // The harness dropped: the changed setting is on disk.
+        assert!(file.is_file(), "drop persists a changed setting");
+        let (settings, error) = Settings::load(&file);
+        assert!(error.is_none());
+        assert_eq!(settings.get_str("ui.theme", "dark"), "light");
+
+        // A rebuild on the same file sees the user's value.
+        let harness = Harness::builder()
+            .with_session_id("sess-settings")
+            .with_settings_path(file.clone())
+            .build()
+            .expect("rebuild");
+        assert_eq!(
+            harness.settings().lock().unwrap().get_str("ui.theme", "dark"),
+            "light",
+            "the user's setting survives a rebuild"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
