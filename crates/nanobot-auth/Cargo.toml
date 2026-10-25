@@ -15,9 +15,12 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 web-time.workspace = true
+ed25519-dalek.workspace = true
 
 [dev-dependencies]
 # reqwest needs a reactor; the tests drive it on a current-thread runtime.
 # Test-only — the kernel's discipline (no tokio runtime entry points) holds
 # for the crate itself, matching nanobot-llm.
 tokio = { version = "1", features = ["rt", "net", "time", "macros"] }
+# The sign-license example draws its key from the OS entropy source.
+getrandom = "0.2"
