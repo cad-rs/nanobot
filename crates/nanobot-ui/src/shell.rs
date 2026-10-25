@@ -20,6 +20,7 @@
 use std::cell::{Ref, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use gpui::{
     div, img, prelude::*, px, AnyElement, App, ColorExt as _, Context, Div, Entity, Hsla, Stateful,
@@ -31,6 +32,7 @@ use gpui_component::{
     input::{Input, InputEvent, InputState},
     ActiveTheme as _, StyledExt as _,
 };
+use nanobot_boot::Settings;
 use nanobot_gpu::{ViewportInput, ViewportProjection, ViewportSlot};
 
 use crate::model::{
@@ -38,6 +40,7 @@ use crate::model::{
     SessionId, SessionStatus, SessionStore, SessionView, StepStatus, ToolState, WorkspaceView,
 };
 use crate::panels::{PanelArea, PanelDef, PanelHost};
+use crate::theme::ThemeKind;
 
 /// Pane widths: the workspace is the primary surface (flex), the viewport is the
 /// secondary panel, and the dock hosts the auxiliary panels.
@@ -85,6 +88,13 @@ pub struct HarnessShell<S: SessionView> {
     selected_block: Option<u64>,
     /// Product panels and script-plugin panels.
     panel_host: PanelHost<S>,
+    /// The user settings store, when the app layer shared it. Presence is
+    /// what registers the framework's settings panel and makes theme choices
+    /// persist; without it the theme still switches, in memory only.
+    settings: Option<Arc<Mutex<Settings>>>,
+    /// The theme the shell renders in. Tracked so a toggle knows its
+    /// starting point even without a settings store.
+    theme: ThemeKind,
 }
 
 impl<S: SessionView> HarnessShell<S> {
@@ -111,6 +121,8 @@ impl<S: SessionView> HarnessShell<S> {
             selected_entity: None,
             selected_block: None,
             panel_host: PanelHost::default(),
+            settings: None,
+            theme: ThemeKind::Dark,
         };
         let session_id = shell.store.borrow().open_project().session_index.clone();
         if let Some(session_id) = session_id {
@@ -237,6 +249,55 @@ impl<S: SessionView> HarnessShell<S> {
         F: Fn(&SessionId) + 'static,
     {
         self.on_import = Some(Rc::new(RefCell::new(callback)));
+    }
+
+    /// Shares the harness's user settings with the shell. Presence registers
+    /// the framework's settings panel (bottom dock: theme choice, settings
+    /// file path) and makes theme choices persist through `ui.theme`; the
+    /// sidebar's gear button becomes a theme quick-toggle either way.
+    /// Registering twice adds nothing.
+    pub fn set_settings(&mut self, settings: Option<Arc<Mutex<Settings>>>) {
+        if let Some(store) = &settings {
+            self.theme =
+                store.lock().map(|s| crate::theme::kind_from_settings(&s)).unwrap_or(self.theme);
+            const SETTINGS_PANEL_ID: &str = "harness.settings";
+            if !self
+                .panel_host
+                .panels()
+                .iter()
+                .any(|panel| panel.id == SETTINGS_PANEL_ID)
+            {
+                self.panel_host.register(PanelDef::product(
+                    SETTINGS_PANEL_ID,
+                    "设置",
+                    PanelArea::Bottom,
+                    0,
+                    Rc::new(settings_panel),
+                ));
+            }
+        }
+        self.settings = settings;
+    }
+
+    /// The shared settings store, when the app layer provided one.
+    pub fn settings(&self) -> Option<Arc<Mutex<Settings>>> {
+        self.settings.clone()
+    }
+
+    /// The theme the shell renders in.
+    pub fn theme(&self) -> ThemeKind {
+        self.theme
+    }
+
+    /// Switches the theme: remembers it on the shell, persists it through
+    /// the settings store when one is shared, and applies it to every themed
+    /// surface (the global theme change refreshes the window).
+    fn switch_theme(&mut self, kind: ThemeKind, window: &mut Window, cx: &mut Context<Self>) {
+        self.theme = kind;
+        match &self.settings {
+            Some(store) => crate::theme::set_theme(store, kind, Some(window), cx),
+            None => crate::theme::apply(kind, Some(window), cx),
+        }
     }
 
     pub fn store(&self) -> Ref<'_, SessionStore<S>> {
@@ -811,7 +872,7 @@ impl<S: SessionView> HarnessShell<S> {
             .child(self.sidebar_footer(p, cx))
     }
 
-    fn sidebar_footer(&self, p: Palette, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn sidebar_footer(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex_none()
             .px_2()
@@ -853,7 +914,12 @@ impl<S: SessionView> HarnessShell<S> {
                     .p_1()
                     .rounded(px(4.))
                     .cursor_pointer()
-                    .on_click(move |_, _, _| {})
+                    .on_click(cx.listener(move |shell, _event, window, cx| {
+                        // The gear is the theme quick-toggle; the settings
+                        // panel (bottom dock) is the explicit surface.
+                        let next = shell.theme().toggled();
+                        shell.switch_theme(next, window, cx);
+                    }))
                     .child(
                         img(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/settings.svg"))
                             .w(px(16.))
@@ -1370,6 +1436,58 @@ mod assets {
 fn plan_progress_of<W: WorkspaceView>(ws: &W) -> (usize, usize) {
     plan_progress(&ws.plan())
 }
+
+/// The framework's settings panel body, registered by
+/// [`HarnessShell::set_settings`]: the theme choice plus the settings file
+/// path. The dock region supplies the captioned chrome around it.
+fn settings_panel<S: SessionView>(
+    shell: &HarnessShell<S>,
+    _workspace: &S::Workspace,
+    _window: &mut Window,
+    cx: &mut Context<HarnessShell<S>>,
+) -> AnyElement {
+    let p = palette(cx);
+    let current = shell.theme();
+    let path = shell.settings().and_then(|store| {
+        store
+            .lock()
+            .ok()
+            .and_then(|settings| settings.path().map(|path| path.display().to_string()))
+    });
+
+    let theme_button =
+        |kind: ThemeKind, label: &'static str, cx: &mut Context<HarnessShell<S>>| {
+            let color = if current == kind { p.accent } else { p.muted };
+            crate::widgets::button(
+                format!("harness-theme-{}", kind.as_str()),
+                label,
+                color,
+                cx,
+                cx.listener(move |shell, _event, window, cx| {
+                    shell.switch_theme(kind, window, cx);
+                }),
+            )
+        };
+
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .px_1()
+        .child(div().text_xs().text_color(p.muted).child("主题"))
+        .child(theme_button(ThemeKind::Dark, "深色", cx))
+        .child(theme_button(ThemeKind::Light, "浅色", cx))
+        .child(div().flex_1())
+        .child(div().text_xs().text_color(p.muted).child(
+            crate::widgets::truncate(
+                &path.unwrap_or_else(|| "内存模式（未连接设置存储）".to_string()),
+                64,
+            ),
+        ))
+        .into_any_element()
+}
+
 
 fn plan_rows(plan: &[PlanStep], p: Palette) -> impl IntoElement {
     let mut rows = div().flex().flex_col().gap_1();
