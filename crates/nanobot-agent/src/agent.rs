@@ -160,6 +160,9 @@ pub struct Agent {
     inner: Arc<AgentInner>,
 }
 
+/// The `prompt/assemble` bridge: system prompt in, assembled system prompt out.
+type PromptAssembler = Arc<dyn Fn(String) -> String + Send + Sync>;
+
 struct AgentInner {
     session: Session,
     llm: LlmRuntime,
@@ -178,7 +181,7 @@ struct AgentInner {
     /// Hook the app layer uses to run the `prompt/assemble` waterfall, so
     /// skills can append their persona sections (design-harness 14.2). The
     /// agent stays free of any plugin type.
-    prompt_assembler: Mutex<Option<Arc<dyn Fn(String) -> String + Send + Sync>>>,
+    prompt_assembler: Mutex<Option<PromptAssembler>>,
     /// The product's standing instructions (the persona section of the system
     /// prompt). Absent -> [`PERSONA`], the built-in default. A product sets
     /// this so the framework carries no domain identity of its own.

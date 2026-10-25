@@ -394,8 +394,14 @@ impl HarnessBuilder {
 
         // Recovery detection runs BEFORE persistence attaches: the
         // persistence subscription re-saves the (initially empty) log, which
-        // would erase the very file recovery needs to read.
+        // would erase the very file recovery needs to read. Native only:
+        // on the web there is no project file to recover — the host owns
+        // persistence (boot's project container is a native-shape concept).
+        #[cfg(not(target_family = "wasm"))]
         let mut recovered = false;
+        #[cfg(target_family = "wasm")]
+        let recovered = false;
+        #[cfg(not(target_family = "wasm"))]
         if let Some(paths) = &paths {
             let events = paths.conversation(&session_id).join("events.jsonl");
             let marker = paths.conversation(&session_id).join(CLEAN_MARKER);

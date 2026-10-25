@@ -177,7 +177,7 @@ impl McpClient {
             }
             let value: Value =
                 serde_json::from_str(line).map_err(|e| McpError::Protocol(e.to_string()))?;
-            if value.get("id").and_then(Value::as_u64) != Some(id.into()) {
+            if value.get("id").and_then(Value::as_u64) != Some(id) {
                 // A notification or another request's response; keep reading.
                 continue;
             }
@@ -244,7 +244,7 @@ mod tests {
         } else {
             r#"printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"hi"}],"isError":false}}\n' "$id" ;;"#
         };
-        let script = r#"while IFS= read -r line; do
+        r#"while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
   [ -z "$id" ] && continue
   case "$line" in
@@ -257,8 +257,7 @@ mod tests {
   esac
 done
 "#
-        .replace("__TOOLS_CALL__", tools_call);
-        script
+        .replace("__TOOLS_CALL__", tools_call)
     }
 
     #[test]

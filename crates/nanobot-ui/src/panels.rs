@@ -47,18 +47,18 @@ impl PanelArea {
     }
 }
 
+/// The product panel factory: the shell (shared selection state) and the
+/// active workspace in, the panel's element out.
+pub type ProductPanelFactory<S> = Rc<
+    dyn Fn(&HarnessShell<S>, &<S as SessionView>::Workspace, &mut Window, &mut Context<HarnessShell<S>>)
+        -> AnyElement,
+>;
+
 /// What a panel renders.
 pub enum PanelSource<S: SessionView> {
     /// A product-registered element factory. It receives the shell (for shared
     /// selection state) and the active session's workspace.
-    Product(Rc<
-        dyn Fn(
-            &HarnessShell<S>,
-            &S::Workspace,
-            &mut Window,
-            &mut Context<HarnessShell<S>>,
-        ) -> AnyElement,
-    >),
+    Product(ProductPanelFactory<S>),
     /// A script panel: a `gpui-rhai` view mounted on first show.
     Script(PathBuf),
 }
@@ -98,14 +98,7 @@ impl<S: SessionView> PanelDef<S> {
         title: impl Into<String>,
         area: PanelArea,
         order: i32,
-        render: Rc<
-            dyn Fn(
-                &HarnessShell<S>,
-                &S::Workspace,
-                &mut Window,
-                &mut Context<HarnessShell<S>>,
-            ) -> AnyElement,
-        >,
+        render: ProductPanelFactory<S>,
     ) -> Self {
         Self {
             id: id.into(),

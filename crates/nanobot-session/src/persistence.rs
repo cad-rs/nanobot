@@ -36,6 +36,7 @@ pub fn save(path: &Path, entries: &[LogEntry]) -> std::io::Result<()> {
 ///
 /// OPFS rejects dot-prefixed directory names, so the state directory is
 /// `_ocad` rather than `.ocad` (same convention as `ocad-engine`).
+#[cfg(target_arch = "wasm32")]
 fn opfs_path(path: &Path) -> String {
     let s = path.to_string_lossy();
     s.replace(".ocad", "_ocad")

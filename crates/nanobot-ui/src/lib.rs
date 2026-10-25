@@ -444,7 +444,7 @@ mod tests {
 
     #[test]
     fn update_session_content_only_touches_the_open_project() {
-        let mut shell = HarnessShell::new(two_project_store());
+        let shell = HarnessShell::new(two_project_store());
         assert!(!shell.update_session_content(&SessionId::new("s3"), TestSession::new("s3")));
         assert!(shell.update_session_content(&SessionId::new("s2"), TestSession::new("s2")));
         assert_eq!(
@@ -727,17 +727,16 @@ mod tests {
                 .any(|panel| panel.id == "acme.log.panel"),
             "the other plugin's panel survives"
         );
-        assert_eq!(
-            shell.plugins().unwrap().iter().find(|e| e.id == "acme.chart").unwrap().enabled,
-            false
+        assert!(
+            !shell.plugins().unwrap().iter().find(|e| e.id == "acme.chart").unwrap().enabled,
+            "the disabled plugin flips its badge"
         );
 
         // Re-sharing keeps the disabled state; registration stays singular.
         shell.set_plugins(&loaded);
         assert_eq!(shell.panel_host().panels_in(PanelArea::Bottom).len(), 3);
-        assert_eq!(
-            shell.plugins().unwrap().iter().find(|e| e.id == "acme.chart").unwrap().enabled,
-            false,
+        assert!(
+            !shell.plugins().unwrap().iter().find(|e| e.id == "acme.chart").unwrap().enabled,
             "the user's disable survives a snapshot refresh"
         );
     }
