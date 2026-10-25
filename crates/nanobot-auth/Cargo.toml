@@ -1,0 +1,23 @@
+[package]
+name = "nanobot-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "nanobot auth backends for the AccountProvider seam: OAuth2 device flow (RFC 8628) and helpers for the token lifecycle"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+nanobot-boot = { workspace = true }
+reqwest = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+web-time.workspace = true
+
+[dev-dependencies]
+# reqwest needs a reactor; the tests drive it on a current-thread runtime.
+# Test-only — the kernel's discipline (no tokio runtime entry points) holds
+# for the crate itself, matching nanobot-llm.
+tokio = { version = "1", features = ["rt", "net", "time", "macros"] }
