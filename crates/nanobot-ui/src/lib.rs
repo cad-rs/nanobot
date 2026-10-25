@@ -585,9 +585,16 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         let mut shell = HarnessShell::new(two_project_store());
-        assert!(
-            shell.panel_host().panels_in(PanelArea::Bottom).is_empty(),
-            "without a settings store the shell registers nothing"
+        let before: Vec<String> = shell
+            .panel_host()
+            .panels_in(PanelArea::Bottom)
+            .iter()
+            .map(|panel| panel.id.clone())
+            .collect();
+        assert_eq!(
+            before,
+            vec!["harness.diagnostics".to_string()],
+            "the diagnostics panel is framework chrome, always present"
         );
 
         let settings = Arc::new(Mutex::new(nanobot_boot::Settings::in_memory()));
@@ -598,12 +605,19 @@ mod tests {
             .iter()
             .map(|panel| panel.id.clone())
             .collect();
-        assert_eq!(bottom, vec!["harness.settings".to_string()]);
+        assert_eq!(
+            bottom,
+            vec![
+                "harness.settings".to_string(),
+                "harness.diagnostics".to_string()
+            ],
+            "settings (order 0) lands before diagnostics (order 1)"
+        );
         assert!(shell.settings().is_some());
 
         // Sharing again must not duplicate the panel.
         shell.set_settings(Some(settings));
-        assert_eq!(shell.panel_host().panels_in(PanelArea::Bottom).len(), 1);
+        assert_eq!(shell.panel_host().panels_in(PanelArea::Bottom).len(), 2);
 
         // A stored theme name becomes the shell's tracked theme; the panel
         // highlights it on the next frame.
