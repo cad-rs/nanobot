@@ -33,6 +33,7 @@ use nanobot_session::{Session, SessionEvent};
 use nanobot_skills::{PromptAssemble, SkillManifest, SkillRunner};
 use nanobot_tools::{ApprovalPolicy, AutoApprovalPolicy, DenyAllPolicy, ToolDefinition, ToolPipeline, ToolRegistry, UiApprovalPolicy};
 
+use crate::account::{Account, AccountProvider, AnonymousProvider, EntitlementDecision, SharedAccountProvider, TURN_CAPABILITY};
 use crate::container::ProjectPaths;
 use crate::error::BootError;
 use crate::harness_toml::{ApprovalMode, HarnessProfile};
@@ -55,6 +56,7 @@ pub struct Harness {
     paths: Option<ProjectPaths>,
     settings: Arc<Mutex<Settings>>,
     settings_file: PathBuf,
+    account_provider: SharedAccountProvider,
     session_id: String,
     tool_count: usize,
     has_tool_executor: bool,
@@ -114,6 +116,33 @@ impl Harness {
     /// The file the user settings persist to.
     pub fn settings_path(&self) -> &Path {
         &self.settings_file
+    }
+
+    /// The identity snapshot from the account provider (`None` = not signed
+    /// in; the default [`AnonymousProvider`] never signs in).
+    pub fn account(&self) -> Option<Account> {
+        self.account_provider.account()
+    }
+
+    /// The account provider itself (products with their own gating copy the
+    /// seam: ask, then audit the denial the same way).
+    pub fn account_provider(&self) -> &SharedAccountProvider {
+        &self.account_provider
+    }
+
+    /// Whether `capability` may run. A denial is **auditable, not silent**:
+    /// it lands on the session log as `CheckResult { check_id:
+    /// "account:<capability>" }` with the reason in `details` and structure
+    /// in `payload`, so an operator replaying the log sees every refusal
+    /// next to the checks that passed.
+    pub fn check_entitlement(&self, capability: &str) -> EntitlementDecision {
+        let decision = self.account_provider.check(capability);
+        if let EntitlementDecision::Denied { reason } = &decision {
+            for event in crate::account::denial_events(capability, reason) {
+                self.agent.session().append(event);
+            }
+        }
+        decision
     }
 
     /// How many tool definitions the registry carries.
@@ -176,6 +205,7 @@ pub struct HarnessBuilder {
     profile: HarnessProfile,
     profile_source: Option<PathBuf>,
     settings_path: Option<PathBuf>,
+    account_provider: Option<SharedAccountProvider>,
     adapters: Vec<(String, Arc<dyn LlmAdapter>)>,
     registry: Option<Arc<ToolRegistry>>,
     tool_definitions: Vec<ToolDefinition>,
@@ -195,6 +225,7 @@ impl HarnessBuilder {
             profile: HarnessProfile::default(),
             profile_source: None,
             settings_path: None,
+            account_provider: None,
             adapters: Vec::new(),
             registry: None,
             tool_definitions: Vec::new(),
@@ -242,6 +273,14 @@ impl HarnessBuilder {
     /// so an assembly never touches the real user config directory.
     pub fn with_settings_path(mut self, path: PathBuf) -> Self {
         self.settings_path = Some(path);
+        self
+    }
+
+    /// The account backend (the product's authentication seam). When unset,
+    /// [`AnonymousProvider`] applies: not signed in, every capability
+    /// allowed — the behaviour every existing consumer already has.
+    pub fn with_account_provider(mut self, provider: Arc<dyn AccountProvider>) -> Self {
+        self.account_provider = Some(provider);
         self
     }
 
@@ -322,6 +361,7 @@ impl HarnessBuilder {
             profile,
             profile_source,
             settings_path,
+            account_provider,
             adapters,
             registry,
             tool_definitions,
@@ -334,6 +374,9 @@ impl HarnessBuilder {
         } = self;
 
         let mut notes: Vec<String> = Vec::new();
+
+        let account_provider =
+            account_provider.unwrap_or_else(|| Arc::new(AnonymousProvider));
 
         // User settings: user-scoped (keyed by the harness identity, not the
         // project) and never fatal to load — a corrupt file resets and lands
@@ -494,6 +537,7 @@ impl HarnessBuilder {
             paths,
             settings,
             settings_file,
+            account_provider,
             session_id,
             tool_count,
             has_tool_executor,
@@ -511,7 +555,14 @@ impl Default for HarnessBuilder {
 
 /// Convenience used by the selfcheck: drives one user turn through the
 /// harness's agent, headlessly (the loop runs on the local executor).
+///
+/// The turn is gated on [`crate::account::TURN_CAPABILITY`]: a denied
+/// account records the refusal on the session log (a failed
+/// `account:agent.turn` check) and the turn does not run.
 pub fn run_one_turn(harness: &Harness, message: &str) {
+    if !harness.check_entitlement(TURN_CAPABILITY).is_allowed() {
+        return;
+    }
     harness.agent.followup(message.to_string());
     futures_executor::block_on(harness.agent.run());
 }
@@ -673,6 +724,72 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_denied_turn_is_refused_auditably() {
+        use crate::account::{Account, StaticProvider, TURN_CAPABILITY};
+
+        let provider = StaticProvider::new(Account::new("lic-9", "Expired Site").with_expiry_ms(1))
+            .with_now_ms(2);
+
+        let harness = Harness::builder()
+            .with_session_id("sess-denied")
+            .with_account_provider(Arc::new(provider))
+            .build()
+            .expect("assembly");
+        assert_eq!(
+            harness.account().map(|account| account.id),
+            Some("lic-9".to_string())
+        );
+
+        let before = harness.agent.session().len();
+        run_one_turn(&harness, "should not run");
+        assert_eq!(
+            harness.agent.session().len(),
+            before + 2,
+            "a denied turn appends exactly its audit pair (run + failed result)"
+        );
+
+        // The refusal is on the log in the check vocabulary.
+        let events = harness.agent.session().events();
+        let last = events.last().expect("audit events").event.clone();
+        match last {
+            SessionEvent::CheckResult { check_id, passed, details, .. } => {
+                assert_eq!(check_id, format!("account:{TURN_CAPABILITY}"));
+                assert!(!passed);
+                assert!(details.contains("expired"), "the reason is the prose: {details}");
+            }
+            other => panic!("expected a CheckResult denial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_allowed_account_leaves_the_turn_untouched() {
+        use crate::account::{Account, StaticProvider};
+
+        let provider = StaticProvider::new(Account::new("u1", "Alice"));
+        let harness = Harness::builder()
+            .with_session_id("sess-allowed")
+            .with_account_provider(Arc::new(provider))
+            .build()
+            .expect("assembly");
+
+        run_one_turn(&harness, "hello");
+        assert!(
+            !harness.agent.session().is_empty(),
+            "an allowed account runs the turn exactly as before"
+        );
+        // And no account checks were recorded — allowals are not events.
+        assert!(
+            !harness
+                .agent
+                .session()
+                .events()
+                .iter()
+                .any(|entry| matches!(entry.event, SessionEvent::CheckResult { ref check_id, .. } if check_id.starts_with("account:"))),
+            "allowals leave no audit noise"
+        );
     }
 
     #[test]
