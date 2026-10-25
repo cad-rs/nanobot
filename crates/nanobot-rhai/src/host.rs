@@ -200,7 +200,6 @@ pub fn build_load_engine(plugin_dir: PathBuf, collected: SharedCollected) -> rha
         );
     }
     {
-        let plugin_dir = plugin_dir;
         let collected = collected.clone();
         engine.register_fn(
             "register_view",

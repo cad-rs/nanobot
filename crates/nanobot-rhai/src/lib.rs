@@ -111,7 +111,7 @@ fn job(task, args) {
             ENTRY,
             &[("chart.rhai", "fn main() { text(\"chart\") }")],
         );
-        let loaded = load_all(&[parent.clone()]);
+        let loaded = load_all(std::slice::from_ref(&parent));
         assert!(loaded.plugins_rejected.is_empty(), "{:?}", loaded.plugins_rejected);
         assert_eq!(loaded.plugins_loaded, vec!["com.example.demo".to_string()]);
         assert_eq!(loaded.panels.len(), 1);

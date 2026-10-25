@@ -47,7 +47,16 @@ use crate::theme::ThemeKind;
 /// secondary panel, and the dock hosts the auxiliary panels.
 const SIDEBAR_W: f32 = 240.0;
 const VIEWPORT_W: f32 = 520.0;
-const DOCK_W: f32 = 280.0;
+
+/// A shell callback keyed by session (activate / undo / redo / save / load /
+/// import all share the shape).
+type SessionCallback = Rc<RefCell<dyn Fn(&SessionId)>>;
+
+/// The composer's submit callback.
+type MessageCallback = Rc<RefCell<dyn Fn(&SessionId, &str)>>;
+
+/// A contingent-plan decision callback.
+type PlanDecisionCallback = Rc<RefCell<dyn Fn(&SessionId, PlanDecision)>>;
 
 /// The harness shell: the session list plus the active session's workspace.
 pub struct HarnessShell<S: SessionView> {
@@ -63,24 +72,24 @@ pub struct HarnessShell<S: SessionView> {
     product_name: String,
     /// Callback invoked when a session is activated (switched to). The app layer
     /// uses this to bind an agent to the session.
-    on_session_activated: Option<Rc<RefCell<dyn Fn(&SessionId)>>>,
+    on_session_activated: Option<SessionCallback>,
     /// The message composer. `None` in headless mode, where no window exists to
     /// host the input entity.
     composer: Option<Entity<InputState>>,
     /// Callback invoked when the user submits the composer.
-    on_message_sent: Option<Rc<RefCell<dyn Fn(&SessionId, &str)>>>,
+    on_message_sent: Option<MessageCallback>,
     /// Callback invoked when the user decides a contingent plan.
-    on_plan_decision: Option<Rc<RefCell<dyn Fn(&SessionId, PlanDecision)>>>,
+    on_plan_decision: Option<PlanDecisionCallback>,
     /// Undo/redo and container save/load/import: the app layer forwards them to
     /// its engine dispatch table.
-    on_undo: Option<Rc<RefCell<dyn Fn(&SessionId)>>>,
-    on_redo: Option<Rc<RefCell<dyn Fn(&SessionId)>>>,
+    on_undo: Option<SessionCallback>,
+    on_redo: Option<SessionCallback>,
     /// An optional product projection of the sidebar (design-rooted groups
     /// instead of the flat session list). `None` = the default view.
     sidebar_projection: Option<Rc<dyn crate::model::SidebarProjection<S>>>,
-    on_save: Option<Rc<RefCell<dyn Fn(&SessionId)>>>,
-    on_load: Option<Rc<RefCell<dyn Fn(&SessionId)>>>,
-    on_import: Option<Rc<RefCell<dyn Fn(&SessionId)>>>,
+    on_save: Option<SessionCallback>,
+    on_load: Option<SessionCallback>,
+    on_import: Option<SessionCallback>,
     /// Keeps the composer's submit subscription alive.
     _composer_sub: Option<Subscription>,
     /// The currently selected entity (three-way linking with the conversation).
@@ -479,7 +488,7 @@ impl<S: SessionView> HarnessShell<S> {
         };
         self.viewports
             .get(id)
-            .map(|handle| S::Viewport::painted_frames(handle))
+            .map(S::Viewport::painted_frames)
             .unwrap_or(0)
     }
 
@@ -1183,7 +1192,7 @@ impl<S: SessionView> HarnessShell<S> {
             .child(self.viewport_slot(window, cx))
     }
 
-    fn viewport_slot(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn viewport_slot(&self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(ws) = self.workspace.as_ref() else {
             return div().size_full().into_any_element();
         };
@@ -1668,7 +1677,7 @@ fn plugins_panel<S: SessionView>(
                         .min_w_0()
                         .child(crate::widgets::truncate(&id, 36)),
                 )
-                .child(crate::shell::badge(&badge_text, color));
+                .child(crate::shell::badge(badge_text, color));
             if entry.enabled {
                 row = row.child(crate::widgets::button(
                     format!("harness-plugin-disable-{}", id),
@@ -1771,7 +1780,7 @@ fn diagnostics_panel<S: SessionView>(
                 .flex()
                 .flex_row()
                 .gap_1()
-                .child(div().text_xs().text_color(p.muted).child(format!("{label}")))
+                .child(div().text_xs().text_color(p.muted).child(label.to_string()))
                 .child(
                     div()
                         .text_xs()

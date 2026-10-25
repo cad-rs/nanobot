@@ -18,8 +18,9 @@ use futures_util::StreamExt;
 type ByteStream<'a> = futures_core::stream::BoxStream<'a, Result<bytes::Bytes, reqwest::Error>>;
 
 #[cfg(target_family = "wasm")]
-type ByteStream<'a> =
-    std::pin::Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + 'a>>;
+type ByteStream<'a> = std::pin::Pin<
+    Box<dyn futures_core::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + 'a>,
+>;
 
 /// OpenAI-compatible chat completions adapter.
 ///

@@ -33,6 +33,21 @@ type WaterfallListener = Arc<
         + Sync,
 >;
 
+/// The sync passthrough a waterfall chains through.
+type Passthrough = Arc<
+    dyn Fn(Box<dyn Any + Send + Sync>) -> Box<dyn Any + Send + Sync> + Send + Sync,
+>;
+
+/// The typed `next` the async waterfall hands its listeners.
+type AsyncNext = Box<
+    dyn Fn(Box<dyn Any + Send + Sync>) -> Pin<Box<dyn std::future::Future<Output = Box<dyn Any + Send + Sync>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// The future an async waterfall listener resolves with.
+type BoxFuture = Pin<Box<dyn std::future::Future<Output = Box<dyn Any + Send + Sync>> + Send>>;
+
 type AsyncWaterfallListener = Arc<
     dyn Fn(
             Box<dyn Any + Send + Sync>,
@@ -55,14 +70,19 @@ type AsyncWaterfallListener = Arc<
 /// stores via `Arc`. This allows `Context` to own one `Events` and hand
 /// out clones to children, while disposables capture `Arc<Mutex<...>>`
 /// handles that remain valid for `'static`.
+type EmitListeners = Arc<Mutex<HashMap<(&'static str, TypeId), Vec<EmitListener>>>>;
+type SerialListeners = Arc<Mutex<HashMap<(&'static str, TypeId, TypeId), Vec<SerialListener>>>>;
+type WaterfallListeners =
+    Arc<Mutex<HashMap<(&'static str, TypeId, TypeId), Vec<WaterfallListener>>>>;
+type AsyncWaterfallListeners =
+    Arc<Mutex<HashMap<(&'static str, TypeId, TypeId), Vec<AsyncWaterfallListener>>>>;
+
 #[derive(Clone, Default)]
 pub struct Events {
-    emit_listeners: Arc<Mutex<HashMap<(&'static str, TypeId), Vec<EmitListener>>>>,
-    serial_listeners: Arc<Mutex<HashMap<(&'static str, TypeId, TypeId), Vec<SerialListener>>>>,
-    waterfall_listeners:
-        Arc<Mutex<HashMap<(&'static str, TypeId, TypeId), Vec<WaterfallListener>>>>,
-    async_waterfall_listeners:
-        Arc<Mutex<HashMap<(&'static str, TypeId, TypeId), Vec<AsyncWaterfallListener>>>>,
+    emit_listeners: EmitListeners,
+    serial_listeners: SerialListeners,
+    waterfall_listeners: WaterfallListeners,
+    async_waterfall_listeners: AsyncWaterfallListeners,
 }
 
 impl Events {
@@ -239,9 +259,7 @@ impl Events {
                 return None;
             }
 
-            let mut next: Arc<
-                dyn Fn(Box<dyn Any + Send + Sync>) -> Box<dyn Any + Send + Sync> + Send + Sync,
-            > = Arc::new(|b| b);
+            let mut next: Passthrough = Arc::new(|b| b);
             for listener in listeners.iter() {
                 let listener = Arc::clone(listener);
                 let prev_next = Arc::clone(&next);
@@ -285,18 +303,7 @@ impl Events {
         let result_type_id = TypeId::of::<R>();
         let listener = Arc::new(listener);
         let wrapped: AsyncWaterfallListener = Arc::new(
-            move |payload: Box<dyn Any + Send + Sync>,
-                  next: Box<
-                dyn Fn(
-                        Box<dyn Any + Send + Sync>,
-                    ) -> Pin<
-                        Box<dyn std::future::Future<Output = Box<dyn Any + Send + Sync>> + Send>,
-                    > + Send
-                    + Sync,
-            >|
-                  -> Pin<
-                Box<dyn std::future::Future<Output = Box<dyn Any + Send + Sync>> + Send>,
-            > {
+            move |payload: Box<dyn Any + Send + Sync>, next: AsyncNext| -> BoxFuture {
                 let listener = Arc::clone(&listener);
                 Box::pin(async move {
                     match payload.downcast::<P>() {

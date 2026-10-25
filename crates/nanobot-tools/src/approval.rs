@@ -36,8 +36,14 @@ pub trait ApprovalPolicy: Send + Sync {
 /// The callback receives `(tool_call_id, reason)` and returns `true` if
 /// approved. The callback is expected to send an `approval/request` event
 /// to the main thread and block until the user responds.
+/// The synchronous ask the UI bridges (an `ApprovalOutcome::Ask` lands here).
+pub type ApprovalAsk = Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
+
+/// The audit sink a rule policy reports outcomes to.
+pub type ApprovalAudit = Arc<dyn Fn(&ApprovalOutcome, &str) + Send + Sync>;
+
 pub struct UiApprovalPolicy {
-    callback: Arc<dyn Fn(&str, &str) -> bool + Send + Sync>,
+    callback: ApprovalAsk,
 }
 
 impl UiApprovalPolicy {
@@ -211,8 +217,8 @@ impl ApprovalOutcome {
 /// other two are final.
 pub struct RuleBasedApprovalPolicy {
     rules: Vec<ApprovalRule>,
-    ask: Arc<dyn Fn(&str, &str) -> bool + Send + Sync>,
-    audit: Option<Arc<dyn Fn(&ApprovalOutcome, &str) + Send + Sync>>,
+    ask: ApprovalAsk,
+    audit: Option<ApprovalAudit>,
 }
 
 impl RuleBasedApprovalPolicy {
@@ -264,9 +270,7 @@ impl RuleBasedApprovalPolicy {
         let matched = self
             .rules
             .iter()
-            .enumerate()
-            .filter(|(_, rule)| rule.is_active(now_ms) && rule.matches(action, resource))
-            .next_back();
+            .enumerate().rfind(|(_, rule)| rule.is_active(now_ms) && rule.matches(action, resource));
 
         let outcome = match matched {
             Some((_, rule)) => ApprovalOutcome {
@@ -427,7 +431,7 @@ mod tests {
                 assert_eq!(outcome.action, "build_sfq");
                 sink.fetch_add(1, Ordering::SeqCst);
             });
-        policy.decide("build_sfq", None, "build", 0);
+        let _ = policy.decide("build_sfq", None, "build", 0);
         assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 

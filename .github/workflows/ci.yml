@@ -1,0 +1,72 @@
+# The three gates the framework promises, enforced mechanically:
+#
+# 1. kernel — the 8 GUI-free crates lint clean (`-D warnings`) and test green
+#    on the cheapest runner, with no GUI stack installed. This is the
+#    "CLI / test / MCP server can consume the kernel without dragging a UI
+#    along" guarantee (design §1.2).
+# 2. wasm — the kernel compiles for wasm32-unknown-unknown: no tokio runtime
+#    entry points, host-owned loop (design §1.3, risk NR4 — "written into CI
+#    checks, not documentation conventions").
+# 3. shell — the full workspace (gpui / wgpu / rhai shells) on macOS, the
+#    platform the vendored gpui-ce fork carries the wgpu refresh for
+#    (upstream PR #10).
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  kernel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy (kernel, deny warnings)
+        run: cargo clippy
+          -p nanobot-cordis -p nanobot-session -p nanobot-agent -p nanobot-tools
+          -p nanobot-skills -p nanobot-llm -p nanobot-boot -p nanobot-auth
+          --lib --tests -- -D warnings
+      - name: test (kernel)
+        run: cargo test
+          -p nanobot-cordis -p nanobot-session -p nanobot-agent -p nanobot-tools
+          -p nanobot-skills -p nanobot-llm -p nanobot-boot -p nanobot-auth
+
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: check (kernel, wasm32-unknown-unknown)
+        run: cargo check
+          -p nanobot-cordis -p nanobot-session -p nanobot-agent -p nanobot-tools
+          -p nanobot-skills -p nanobot-llm -p nanobot-boot -p nanobot-auth
+          --target wasm32-unknown-unknown
+
+  shell:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy (workspace, deny warnings)
+        run: cargo clippy --workspace --lib --tests -- -D warnings
+      - name: test (workspace)
+        run: cargo test --workspace

@@ -94,8 +94,10 @@ pub fn checks(harness: &Harness) -> Vec<Check> {
         format!("events={}", harness.agent.session().len()),
     ));
 
-    // 4. Persistence round trip (probe: needs project paths).
+    // 4. Persistence round trip (probe: needs project paths; native only —
+    // the web has no file to read back, so the probe skips there).
     match harness.events_path() {
+        #[cfg(not(target_family = "wasm"))]
         Some(events) => {
             let found = nanobot_session::persistence::load(&events)
                 .map(|entries| {
@@ -110,6 +112,10 @@ pub fn checks(harness: &Harness) -> Vec<Check> {
                 format!("path={}", events.display()),
             ));
         }
+        Some(_) => checks.push(Check::skip(
+            "持久化: 事件日志落盘可回读",
+            "wasm 没有可回读的项目文件",
+        )),
         None => checks.push(Check::skip(
             "持久化: 事件日志落盘可回读",
             "未配置项目路径",

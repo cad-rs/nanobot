@@ -641,7 +641,7 @@ mod tests {
             3,
         );
         for _ in 0..3 {
-            queue.submit(JobSpec::new("margin", serde_json::json!({})));
+            let _ = queue.submit(JobSpec::new("margin", serde_json::json!({})));
         }
         for _ in 0..400 {
             if queue.list().iter().all(|j| j.state.is_terminal()) {
