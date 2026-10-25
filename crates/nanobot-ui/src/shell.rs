@@ -103,6 +103,19 @@ pub struct HarnessShell<S: SessionView> {
     account: Option<Account>,
     on_sign_in: Option<Rc<RefCell<dyn Fn()>>>,
     on_sign_out: Option<Rc<RefCell<dyn Fn()>>>,
+    /// The script plugins the app layer loaded, as the plugins panel shows
+    /// them (`None` = the panel is not registered). Enabled state is
+    /// runtime: the panel's disable removes a plugin's panels.
+    plugins: Option<Vec<PluginEntry>>,
+    /// Plugins that failed to load, with the reason.
+    rejected_plugins: Vec<(String, String)>,
+}
+
+/// One script plugin as the plugins panel shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PluginEntry {
+    pub id: String,
+    pub enabled: bool,
 }
 
 impl<S: SessionView> HarnessShell<S> {
@@ -134,6 +147,8 @@ impl<S: SessionView> HarnessShell<S> {
             account: None,
             on_sign_in: None,
             on_sign_out: None,
+            plugins: None,
+            rejected_plugins: Vec::new(),
         };
         // Framework chrome: the diagnostics panel is always there (it reads
         // nothing but shell state), the settings panel joins when the app
@@ -349,6 +364,69 @@ impl<S: SessionView> HarnessShell<S> {
         F: Fn() + 'static,
     {
         self.on_sign_out = Some(Rc::new(RefCell::new(callback)));
+    }
+
+    /// Shares the plugin load result with the shell: registers the plugins
+    /// panel (bottom dock — loaded plugins with a disable button, rejected
+    /// ones with the reason). Calling again refreshes the snapshot while
+    /// keeping what the user already disabled. A plugin disable at runtime
+    /// removes exactly that plugin's panels; commands and toolbar items
+    /// have no shell surface yet, so there is nothing else to withdraw.
+    pub fn set_plugins(&mut self, loaded: &nanobot_rhai::LoadedPlugins) {
+        let disabled: Vec<String> = self
+            .plugins
+            .take()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|entry| !entry.enabled)
+            .map(|entry| entry.id)
+            .collect();
+        self.plugins = Some(
+            loaded
+                .plugins_loaded
+                .iter()
+                .map(|id| PluginEntry {
+                    id: id.clone(),
+                    enabled: !disabled.contains(id),
+                })
+                .collect(),
+        );
+        self.rejected_plugins = loaded.plugins_rejected.clone();
+
+        const PLUGINS_PANEL_ID: &str = "harness.plugins";
+        if !self
+            .panel_host
+            .panels()
+            .iter()
+            .any(|panel| panel.id == PLUGINS_PANEL_ID)
+        {
+            self.panel_host.register(PanelDef::product(
+                PLUGINS_PANEL_ID,
+                "插件",
+                PanelArea::Bottom,
+                2,
+                Rc::new(plugins_panel),
+            ));
+        }
+    }
+
+    /// The plugin snapshot (ids + enabled state), when shared.
+    pub fn plugins(&self) -> Option<&[PluginEntry]> {
+        self.plugins.as_deref()
+    }
+
+    /// Disables a plugin at runtime: removes exactly its panels from the
+    /// dock and flips the snapshot. Returns the panels removed.
+    pub fn disable_plugin(&mut self, id: &str) -> usize {
+        let removed = self.panel_host.remove_plugin(id);
+        if let Some(plugins) = &mut self.plugins {
+            for entry in plugins.iter_mut() {
+                if entry.id == id {
+                    entry.enabled = false;
+                }
+            }
+        }
+        removed
     }
 
     pub fn store(&self) -> Ref<'_, SessionStore<S>> {
@@ -572,7 +650,7 @@ fn tool_color(state: ToolState, p: Palette) -> Hsla {
 }
 
 /// A tinted pill (session status, tool state, check result).
-fn badge(text: &str, color: Hsla) -> impl IntoElement {
+pub(crate) fn badge(text: &str, color: Hsla) -> impl IntoElement {
     div()
         .px_2()
         .py_1()
@@ -1556,6 +1634,77 @@ fn plan_progress_of<W: WorkspaceView>(ws: &W) -> (usize, usize) {
 /// replaced).
 pub(crate) fn avatar_letter(name: &str) -> char {
     name.trim().chars().next().unwrap_or('U')
+}
+
+/// The framework's plugins panel body, registered by
+/// [`HarnessShell::set_plugins`]: loaded plugins with a runtime disable,
+/// rejected plugins with the reason. The disable removes exactly the
+/// plugin's own panels — the trust boundary stays declarative.
+fn plugins_panel<S: SessionView>(
+    shell: &HarnessShell<S>,
+    _workspace: &S::Workspace,
+    _window: &mut Window,
+    cx: &mut Context<HarnessShell<S>>,
+) -> AnyElement {
+    let p = palette(cx);
+    let mut column = div().flex().flex_col().gap_1().px_1();
+
+    if let Some(plugins) = shell.plugins.clone() {
+        for entry in plugins {
+            let (badge_text, color) = if entry.enabled {
+                ("启用", p.success)
+            } else {
+                ("已禁用", p.muted)
+            };
+            let id = entry.id.clone();
+            let mut row = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .text_xs()
+                        .min_w_0()
+                        .child(crate::widgets::truncate(&id, 36)),
+                )
+                .child(crate::shell::badge(&badge_text, color));
+            if entry.enabled {
+                row = row.child(crate::widgets::button(
+                    format!("harness-plugin-disable-{}", id),
+                    "禁用",
+                    p.danger,
+                    cx,
+                    cx.listener(move |shell, _event, _window, _cx| {
+                        shell.disable_plugin(&id);
+                    }),
+                ));
+            }
+            column = column.child(row);
+        }
+    } else {
+        column = column
+            .child(div().text_xs().text_color(p.muted).child("未共享插件装载结果"));
+    }
+    for (plugin, reason) in shell.rejected_plugins.clone() {
+        column = column.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .child(div().text_xs().text_color(p.danger).child(format!(
+                    "{} 拒绝装载",
+                    crate::widgets::truncate(&plugin, 36)
+                )))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(p.muted)
+                        .child(crate::widgets::truncate(&reason, 64)),
+                ),
+        );
+    }
+    column.into_any_element()
 }
 
 /// The framework's diagnostics panel body, registered by
