@@ -7,7 +7,8 @@ members = [
     "crates/nanobot-tools",
     "crates/nanobot-skills",
     "crates/nanobot-llm",
-    "crates/nanobot-boot",
+    "crates/nanobot-auth",
+  "crates/nanobot-boot",
     # Shell layer (gpui / wgpu): the kernel above stays GUI-free, these do not.
     "crates/nanobot-gpu",
     "crates/nanobot-rhai",
@@ -33,6 +34,7 @@ nanobot-session = { path = "crates/nanobot-session", version = "0.1.0" }
 nanobot-skills = { path = "crates/nanobot-skills", version = "0.1.0" }
 nanobot-tools = { path = "crates/nanobot-tools", version = "0.1.0" }
 nanobot-agent = { path = "crates/nanobot-agent", version = "0.1.0" }
+nanobot-auth = { path = "crates/nanobot-auth", version = "0.1.0" }
 nanobot-boot = { path = "crates/nanobot-boot", version = "0.1.0" }
 nanobot-gpu = { path = "crates/nanobot-gpu", version = "0.1.0" }
 nanobot-rhai = { path = "crates/nanobot-rhai", version = "0.1.0" }
