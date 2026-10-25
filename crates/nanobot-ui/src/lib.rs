@@ -16,11 +16,17 @@
 //! The product registers its domain panels through
 //! [`shell::HarnessShell::panel_host`] and its renderer through
 //! [`nanobot_gpu::ViewportSlot`]. Nothing in this crate knows a domain word.
+//!
+//! The shell's chrome (dark/light theme, the settings panel) is framework
+//! surface: [`theme`] switches the gpui-component global theme every palette
+//! read derives from, and [`shell::HarnessShell::set_settings`] registers the
+//! settings panel that persists the choice through `ui.theme`.
 
 pub mod model;
 pub mod panels;
 pub mod poll;
 pub mod shell;
+pub mod theme;
 pub mod widgets;
 
 pub use model::{
@@ -31,6 +37,7 @@ pub use model::{
 pub use panels::{PanelArea, PanelDef, PanelHost, PanelSource, ScriptRuntime};
 pub use poll::poll_periodically;
 pub use shell::HarnessShell;
+pub use theme::{apply, apply_from_settings, set_theme, ThemeKind, THEME_KEY};
 pub use widgets::{button, line, picker, short_hash, show, truncate, HashedRef};
 
 #[cfg(test)]
@@ -573,4 +580,39 @@ mod tests {
         assert!(host.script_errors().is_empty());
     }
 
+    #[test]
+    fn sharing_settings_registers_the_framework_settings_panel_once() {
+        use std::sync::{Arc, Mutex};
+
+        let mut shell = HarnessShell::new(two_project_store());
+        assert!(
+            shell.panel_host().panels_in(PanelArea::Bottom).is_empty(),
+            "without a settings store the shell registers nothing"
+        );
+
+        let settings = Arc::new(Mutex::new(nanobot_boot::Settings::in_memory()));
+        shell.set_settings(Some(Arc::clone(&settings)));
+        let bottom: Vec<String> = shell
+            .panel_host()
+            .panels_in(PanelArea::Bottom)
+            .iter()
+            .map(|panel| panel.id.clone())
+            .collect();
+        assert_eq!(bottom, vec!["harness.settings".to_string()]);
+        assert!(shell.settings().is_some());
+
+        // Sharing again must not duplicate the panel.
+        shell.set_settings(Some(settings));
+        assert_eq!(shell.panel_host().panels_in(PanelArea::Bottom).len(), 1);
+
+        // A stored theme name becomes the shell's tracked theme; the panel
+        // highlights it on the next frame.
+        let mut named = nanobot_boot::Settings::in_memory();
+        named
+            .set(crate::theme::THEME_KEY, serde_json::json!("light"))
+            .unwrap();
+        let mut shell = HarnessShell::new(two_project_store());
+        shell.set_settings(Some(Arc::new(Mutex::new(named))));
+        assert_eq!(shell.theme(), crate::theme::ThemeKind::Light);
+    }
 }
