@@ -20,3 +20,5 @@ futures-util = { workspace = true }
 
 [dev-dependencies]
 futures-executor = "0.3"
+# The cancellation test holds the model stream open on a channel gate.
+futures-channel = "0.3"
