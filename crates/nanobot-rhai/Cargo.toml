@@ -2,7 +2,7 @@
 name = "nanobot-rhai"
 version = "0.1.0"
 edition = "2021"
-license = "Proprietary"
+license.workspace = true
 description = "nanobot Rhai script-plugin host: a plugin.toml manifest and a Rhai entry point that declares panels, views, commands and toolbar items"
 
 [dependencies]

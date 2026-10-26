@@ -2,7 +2,7 @@
 name = "nanobot-gpu"
 version = "0.1.0"
 edition = "2021"
-license = "Proprietary"
+license.workspace = true
 description = "nanobot GPU render slot: the process-wide shared wgpu device, offscreen targets and zero-copy surface compositing that any harness renderer (product or plugin) draws through"
 
 [features]

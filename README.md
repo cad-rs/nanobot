@@ -68,6 +68,30 @@ cargo test  --workspace
 
 ## License
 
-See the per-crate `license` field. The extracted crates currently carry the
-upstream (`Proprietary`) value; the framework's intended license is an open
-question tracked in the architecture doc.
+**The framework is open source: every crate is MIT** (see [LICENSE](LICENSE)).
+The extracted crates used to carry the upstream `Proprietary` value; the
+framework's own licensing is now settled — it is the open half of an
+open-core model.
+
+**The closed half is plugins.** A harness vendor's plugin packages (script
+plugins, skill packs, compiled modules) are their own commercial property and
+carry their own license; the framework neither requires a plugin to be open
+nor inspects its contents beyond the manifest's declared permissions. That
+boundary is what makes the model work: anyone can build and ship a design
+harness on the framework, and the proprietary value lives in the plugin
+packages a vendor sells.
+
+Vendored third-party code under `.vendor/` keeps its own licenses (the gpui
+stack is Apache-2.0 / MIT — both permissive and compatible with MIT); see
+[.vendor/README.md](.vendor/README.md). Nothing in the vendor tree is covered
+by this license.
+
+### Writing a plugin
+
+A plugin is a directory with a `plugin.toml` manifest plus an entry script
+(see `crates/nanobot-rhai/src/manifest.rs` for the fields and
+`plugins/`-style layout). **A plugin is your property**: ship it under any
+license you like, including a closed one. The framework reads only the
+manifest's declared `permissions` (an audit declaration, not a sandbox) and
+keeps the rest opaque. Keep that boundary in mind when you author one —
+whatever you put in the package is yours to license.

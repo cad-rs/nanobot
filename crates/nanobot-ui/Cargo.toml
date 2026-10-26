@@ -2,7 +2,7 @@
 name = "nanobot-ui"
 version = "0.1.0"
 edition = "2021"
-license = "Proprietary"
+license.workspace = true
 description = "nanobot gpui workbench shell: session list, session workspace, conversation stream, plan review, approval bar and the panel host that mounts product and plugin panels"
 
 [dependencies]

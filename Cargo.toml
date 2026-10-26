@@ -22,7 +22,7 @@ exclude = [".vendor"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "Proprietary"
+license = "MIT"
 repository = "https://github.com/cad-rs/nanobot"
 
 [workspace.dependencies]
