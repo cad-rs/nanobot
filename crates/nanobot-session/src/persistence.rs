@@ -9,6 +9,7 @@
 //! returns an explicit error instead of relying on std's silent stubs.
 
 use crate::session::LogEntry;
+#[cfg(not(target_family = "wasm"))]
 use std::fs;
 #[cfg(not(target_family = "wasm"))]
 use std::io::{BufRead, BufReader, Write};

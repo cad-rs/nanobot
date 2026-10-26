@@ -28,6 +28,7 @@ use std::sync::{Arc, Mutex};
 use nanobot_agent::{Agent, PlanVerifier, ToolExecutor};
 use nanobot_cordis::Context;
 use nanobot_llm::{LlmAdapter, LlmRuntime, OpenAiCompatibleAdapter, ScriptedAdapter};
+#[cfg(not(target_family = "wasm"))]
 use nanobot_session::persistence;
 use nanobot_session::{Session, SessionEvent};
 use nanobot_skills::{PromptAssemble, SkillManifest, SkillRunner};
