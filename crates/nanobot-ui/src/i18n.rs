@@ -157,6 +157,16 @@ const MESSAGES: &[Msg] = &[
     ("diagnostics.guest", "访客", "Guest"),
     // -- settings panel --
     ("settings.theme", "主题", "Theme"),
+    ("settings.font", "字体", "Font"),
+    ("settings.font.small", "小", "Small"),
+    ("settings.font.normal", "标准", "Normal"),
+    ("settings.font.large", "大", "Large"),
+    ("settings.font.family", "字体族", "Family"),
+    (
+        "settings.font.placeholder",
+        "字体族名称，回车应用",
+        "Font family name, Enter to apply",
+    ),
     ("settings.locale", "语言", "Language"),
     ("settings.locale.zh", "中文", "Chinese"),
     ("settings.locale.en", "英文", "English"),

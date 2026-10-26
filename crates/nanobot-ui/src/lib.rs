@@ -40,7 +40,8 @@ pub use poll::poll_periodically;
 pub use shell::HarnessShell;
 pub use i18n::{t, t_replace, Locale};
 pub use theme::{
-    apply, apply_from_settings, set_theme, ThemeKind, LOCALE_KEY, THEME_KEY,
+    apply, apply_font, apply_from_settings, set_theme, ThemeKind, FONT_FAMILY_KEY,
+    FONT_MONO_FAMILY_KEY, FONT_SIZE_KEY, LOCALE_KEY, THEME_KEY,
 };
 pub use widgets::{button, line, picker, short_hash, show, truncate, HashedRef};
 
