@@ -41,6 +41,7 @@ use crate::model::{
     SessionId, SessionStatus, SessionStore, SessionView, StepStatus, ToolState, WorkspaceView,
 };
 use crate::panels::{PanelArea, PanelDef, PanelHost};
+use crate::i18n::Locale;
 use crate::theme::ThemeKind;
 
 /// Pane widths: the workspace is the primary surface (flex), the viewport is the
@@ -118,6 +119,9 @@ pub struct HarnessShell<S: SessionView> {
     plugins: Option<Vec<PluginEntry>>,
     /// Plugins that failed to load, with the reason.
     rejected_plugins: Vec<(String, String)>,
+    /// The UI locale every string in this shell renders in: a user setting
+    /// (`ui.locale`), defaulted from the harness profile.
+    locale: Locale,
 }
 
 /// One script plugin as the plugins panel shows it.
@@ -158,13 +162,14 @@ impl<S: SessionView> HarnessShell<S> {
             on_sign_out: None,
             plugins: None,
             rejected_plugins: Vec::new(),
+            locale: Locale::default(),
         };
         // Framework chrome: the diagnostics panel is always there (it reads
         // nothing but shell state), the settings panel joins when the app
         // layer shares a store.
         shell.panel_host.register(PanelDef::product(
             "harness.diagnostics",
-            "诊断",
+            shell.tr("shell.diagnostics"),
             PanelArea::Bottom,
             1,
             Rc::new(diagnostics_panel),
@@ -183,11 +188,13 @@ impl<S: SessionView> HarnessShell<S> {
     /// windowed constructor; headless callers use [`HarnessShell::new`].
     pub fn with_composer(
         store: SessionStore<S>,
+        locale: Locale,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let composer =
-            cx.new(|cx| InputState::new(window, cx).placeholder("描述你想做的改动，回车发送…"));
+        let composer = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(crate::i18n::t(locale, "composer.placeholder"))
+        });
         let subscription = cx.subscribe_in(
             &composer,
             window,
@@ -211,6 +218,7 @@ impl<S: SessionView> HarnessShell<S> {
         );
 
         let mut shell = Self::new(store);
+        shell.locale = locale;
         shell.composer = Some(composer);
         shell._composer_sub = Some(subscription);
         shell
@@ -305,6 +313,14 @@ impl<S: SessionView> HarnessShell<S> {
         if let Some(store) = &settings {
             self.theme =
                 store.lock().map(|s| crate::theme::kind_from_settings(&s)).unwrap_or(self.theme);
+            if let Some(code) = store
+                .lock()
+                .ok()
+                .and_then(|s| s.get(crate::theme::LOCALE_KEY).cloned())
+                .and_then(|v| v.as_str().map(str::to_string))
+            {
+                self.locale = Locale::from_code(&code);
+            }
             const SETTINGS_PANEL_ID: &str = "harness.settings";
             if !self
                 .panel_host
@@ -314,7 +330,7 @@ impl<S: SessionView> HarnessShell<S> {
             {
                 self.panel_host.register(PanelDef::product(
                     SETTINGS_PANEL_ID,
-                    "设置",
+                    self.tr("shell.settings"),
                     PanelArea::Bottom,
                     0,
                     Rc::new(settings_panel),
@@ -342,6 +358,27 @@ impl<S: SessionView> HarnessShell<S> {
     /// The theme the shell renders in.
     pub fn theme(&self) -> ThemeKind {
         self.theme
+    }
+
+    /// The UI locale. Switch it with [`HarnessShell::set_locale`] (the
+    /// settings panel does, through `ui.locale`).
+    pub fn locale(&self) -> Locale {
+        self.locale
+    }
+
+    /// Switches the UI locale; the shell re-renders on the next frame.
+    pub fn set_locale(&mut self, locale: Locale) {
+        self.locale = locale;
+    }
+
+    /// The localized text for `key` in the shell's locale.
+    fn tr(&self, key: &'static str) -> &'static str {
+        crate::i18n::t(self.locale, key)
+    }
+
+    /// [`tr`](Self::tr) with `{placeholder}` substitution.
+    fn trf(&self, key: &str, args: &[(&str, &str)]) -> String {
+        crate::i18n::t_replace(self.locale, key, args)
     }
 
     /// Switches the theme: remembers it on the shell, persists it through
@@ -421,7 +458,7 @@ impl<S: SessionView> HarnessShell<S> {
         {
             self.panel_host.register(PanelDef::product(
                 PLUGINS_PANEL_ID,
-                "插件",
+                self.tr("shell.plugins"),
                 PanelArea::Bottom,
                 2,
                 Rc::new(plugins_panel),
@@ -721,7 +758,7 @@ impl<S: SessionView> HarnessShell<S> {
         let (done, total) = workspace.map(plan_progress_of).unwrap_or((0, 0));
         let session_line = match workspace {
             Some(ws) => ws.title(),
-            None => "（无会话）".to_string(),
+            None => self.tr("shell.no_sessions").to_string(),
         };
         let status = workspace.map(|ws| ws.status());
         div()
@@ -742,7 +779,7 @@ impl<S: SessionView> HarnessShell<S> {
                     .child(format!("{} · {}", project.name, session_line)),
             )
             .when_some(status, |d, status| {
-                d.child(badge(status.label(), session_color(status, p)))
+                d.child(badge(status.label(self.locale), session_color(status, p)))
             })
             .child(div().flex_1())
             .child(
@@ -753,8 +790,9 @@ impl<S: SessionView> HarnessShell<S> {
                     .child(self.undo_redo_buttons(cx))
                     .child(self.file_ops_buttons(cx)),
             )
-            .child(div().text_xs().text_color(p.muted).child(format!(
-                "计划 {done}/{total} · 会话工作区 · 视口 · 面板"
+            .child(div().text_xs().text_color(p.muted).child(self.trf(
+                "shell.viewport_caption",
+                &[("done", &done.to_string()), ("total", &total.to_string())],
             )))
     }
 
@@ -784,7 +822,7 @@ impl<S: SessionView> HarnessShell<S> {
                     .w(px(14.))
                     .h(px(14.)),
             )
-            .child("撤销")
+            .child(self.tr("shell.undo"))
             .on_click(move |_, _, _| {
                 undo_cb.borrow()(&sid_undo);
             });
@@ -811,7 +849,7 @@ impl<S: SessionView> HarnessShell<S> {
                     .w(px(14.))
                     .h(px(14.)),
             )
-            .child("重做")
+            .child(self.tr("shell.redo"))
             .on_click(move |_, _, _| {
                 redo_cb.borrow()(&sid_redo);
             });
@@ -833,7 +871,7 @@ impl<S: SessionView> HarnessShell<S> {
             .on_save
             .clone()
             .unwrap_or_else(|| Rc::new(RefCell::new(|_: &SessionId| {})));
-        let save_btn = header_button("harness-save", "存档", p.border)
+        let save_btn = header_button("harness-save", self.tr("shell.save"), p.border)
             .on_click(move |_, _, _| {
                 save_cb.borrow()(&sid_save);
             });
@@ -843,7 +881,7 @@ impl<S: SessionView> HarnessShell<S> {
             .on_load
             .clone()
             .unwrap_or_else(|| Rc::new(RefCell::new(|_: &SessionId| {})));
-        let load_btn = header_button("harness-load", "开档", p.border)
+        let load_btn = header_button("harness-load", self.tr("shell.load"), p.border)
             .on_click(move |_, _, _| {
                 load_cb.borrow()(&sid_load);
             });
@@ -853,7 +891,7 @@ impl<S: SessionView> HarnessShell<S> {
             .on_import
             .clone()
             .unwrap_or_else(|| Rc::new(RefCell::new(|_: &SessionId| {})));
-        let import_btn = header_button("harness-import", "导入", p.border)
+        let import_btn = header_button("harness-import", self.tr("shell.import"), p.border)
             .on_click(move |_, _, _| {
                 import_cb.borrow()(&sid_import);
             });
@@ -992,7 +1030,7 @@ impl<S: SessionView> HarnessShell<S> {
             .p_2()
             .border_r_1()
             .border_color(p.border)
-            .child(div().text_xs().text_color(p.muted).child("项目"))
+            .child(div().text_xs().text_color(p.muted).child(self.tr("shell.projects")))
             .child(projects)
             .child(
                 div()
@@ -1001,10 +1039,12 @@ impl<S: SessionView> HarnessShell<S> {
                     .pt_2()
                     .text_xs()
                     .text_color(p.muted)
-                    .child(format!(
-                        "会话 · {}（{} 个）",
-                        self.store.borrow().open_project().name,
-                        self.store.borrow().open_project_sessions().len()
+                    .child(self.trf(
+                        "shell.sessions",
+                        &[
+                            ("count", &self.store.borrow().open_project().name),
+                            ("total", &self.store.borrow().open_project_sessions().len().to_string()),
+                        ],
                     )),
             )
             .child(
@@ -1135,7 +1175,7 @@ impl<S: SessionView> HarnessShell<S> {
                         .justify_center()
                         .child(div().text_xs().text_color(p.muted).child("?".to_string())),
                 )
-                .child(div().text_xs().text_color(p.muted).child("访客 · 点击登录")),
+                .child(div().text_xs().text_color(p.muted).child(self.tr("shell.guest_signin"))),
         }
     }
 
@@ -1177,14 +1217,14 @@ impl<S: SessionView> HarnessShell<S> {
                             .when(selected, |d| d.font_semibold())
                             .child(title),
                     )
-                    .child(badge(status.label(), color)),
+                    .child(badge(status.label(self.locale), color)),
             )
             .child(
                 div()
                     .mt_1()
                     .text_xs()
                     .text_color(p.muted)
-                    .child(format!("计划 {done}/{total}")),
+                    .child(self.trf("shell.plan_progress", &[("done", &done.to_string()), ("total", &total.to_string())])),
             )
     }
 
@@ -1286,7 +1326,7 @@ impl<S: SessionView> HarnessShell<S> {
     /// The session workspace: plan state over the conversation stream.
     fn ai_workspace(&self, ws: &S::Workspace, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
-        let plan = plan_rows(&ws.plan(), p);
+        let plan = plan_rows(&ws.plan(), p, self.locale);
         let conversation = self.conversation_stream(&ws.conversation().blocks, p, cx);
         div()
             .flex_1()
@@ -1295,7 +1335,7 @@ impl<S: SessionView> HarnessShell<S> {
             .flex_col()
             .border_l_1()
             .border_color(p.border)
-            .child(div().flex_none().child(panel("plan 状态", p, plan)))
+            .child(div().flex_none().child(panel(self.tr("shell.plan_state"), p, plan)))
             .when_some(ws.progress(), |panel, (done, total)| {
                 let pct = if total > 0 { done as f32 / total as f32 } else { 0.0 };
                 panel.child(
@@ -1310,7 +1350,7 @@ impl<S: SessionView> HarnessShell<S> {
                             div()
                                 .text_xs()
                                 .text_color(p.muted)
-                                .child(format!("计算进度 {done}/{total}")),
+                                .child(self.trf("shell.compute_progress", &[("done", &done.to_string()), ("total", &total.to_string())])),
                         )
                         .child(
                             div()
@@ -1342,7 +1382,7 @@ impl<S: SessionView> HarnessShell<S> {
                     .border_t_1()
                     .border_color(p.border)
                     .child(panel(
-                        "对话流",
+                        self.tr("shell.conversation"),
                         p,
                         div()
                             .id("harness-conversation".to_string())
@@ -1379,7 +1419,7 @@ impl<S: SessionView> HarnessShell<S> {
                 div()
                     .text_xs()
                     .text_color(p.warning)
-                    .child("AI 需要补充信息，请回答以下问题（通过输入框提交）："),
+                    .child(self.tr("shell.clarify_prompt")),
             );
 
         for (i, question) in ws.clarify_questions().iter().enumerate() {
@@ -1409,16 +1449,16 @@ impl<S: SessionView> HarnessShell<S> {
                     .flex_1()
                     .text_xs()
                     .text_color(p.warning)
-                    .child(format!(
-                        "plan {}：验证未通过，等你决定",
-                        ws.plan_phase().label()
+                    .child(self.trf(
+                        "shell.plan_rejected",
+                        &[("index", ws.plan_phase().label(self.locale))],
                     )),
             );
 
         for (label, decision) in [
-            ("接受", PlanDecision::Accept),
-            ("回滚", PlanDecision::Reject),
-            ("修改", PlanDecision::Modify),
+            (self.tr("shell.accept"), PlanDecision::Accept),
+            (self.tr("shell.reject"), PlanDecision::Reject),
+            (self.tr("shell.modify"), PlanDecision::Modify),
         ] {
             let callback = self.on_plan_decision.clone();
             let session_id = ws.session_id().clone();
@@ -1449,7 +1489,7 @@ impl<S: SessionView> HarnessShell<S> {
                     .flex_none()
                     .text_xs()
                     .text_color(p.muted)
-                    .child("逐项: "),
+                    .child(self.tr("shell.itemized")),
             );
             for (name, accepted) in settlement {
                 let color = if accepted { p.success } else { p.danger };
@@ -1487,13 +1527,13 @@ impl<S: SessionView> HarnessShell<S> {
             .child(
                 div()
                     .text_sm()
-                    .child(format!("工程「{}」还没有会话", self.store.borrow().open_project().name)),
+                    .child(self.trf("shell.no_sessions_in_project", &[("name", &self.store.borrow().open_project().name)])),
             )
             .child(
                 div()
                     .text_xs()
                     .text_color(p.muted)
-                    .child("会话的创建与事件日志随会话内核落地；项目层已把工程目录与清单读进来了"),
+                    .child(self.tr("shell.sessions_note")),
             )
     }
 
@@ -1516,10 +1556,10 @@ impl<S: SessionView> HarnessShell<S> {
                 .flex_row()
                 .items_center()
                 .gap_2()
-                .child(div().text_xs().text_color(color).child(block.kind.label()))
+                .child(div().text_xs().text_color(color).child(block.kind.label(self.locale)))
                 .child(div().text_xs().text_color(p.muted).child(anchor));
             if let Some(state) = block.tool_state {
-                head = head.child(badge(state.label(), tool_color(state, p)));
+                head = head.child(badge(state.label(self.locale), tool_color(state, p)));
             }
             stream = stream.child(
                 div()
@@ -1671,9 +1711,9 @@ fn plugins_panel<S: SessionView>(
     if let Some(plugins) = shell.plugins.clone() {
         for entry in plugins {
             let (badge_text, color) = if entry.enabled {
-                ("启用", p.success)
+                (shell.tr("plugins.enabled"), p.success)
             } else {
-                ("已禁用", p.muted)
+                (shell.tr("plugins.disabled"), p.muted)
             };
             let id = entry.id.clone();
             let mut row = div()
@@ -1691,7 +1731,7 @@ fn plugins_panel<S: SessionView>(
             if entry.enabled {
                 row = row.child(crate::widgets::button(
                     format!("harness-plugin-disable-{}", id),
-                    "禁用",
+                    shell.tr("plugins.disable"),
                     p.danger,
                     cx,
                     cx.listener(move |shell, _event, _window, _cx| {
@@ -1703,7 +1743,7 @@ fn plugins_panel<S: SessionView>(
         }
     } else {
         column = column
-            .child(div().text_xs().text_color(p.muted).child("未共享插件装载结果"));
+            .child(div().text_xs().text_color(p.muted).child(shell.tr("plugins.not_shared")));
     }
     for (plugin, reason) in shell.rejected_plugins.clone() {
         column = column.child(
@@ -1711,9 +1751,9 @@ fn plugins_panel<S: SessionView>(
                 .flex()
                 .flex_col()
                 .gap_0p5()
-                .child(div().text_xs().text_color(p.danger).child(format!(
-                    "{} 拒绝装载",
-                    crate::widgets::truncate(&plugin, 36)
+                .child(div().text_xs().text_color(p.danger).child(shell.trf(
+                    "plugins.rejected",
+                    &[("name", &crate::widgets::truncate(&plugin, 36))],
                 )))
                 .child(
                     div()
@@ -1738,38 +1778,59 @@ fn diagnostics_panel<S: SessionView>(
 ) -> AnyElement {
     let p = palette(cx);
     let store = shell.store.borrow();
-    let rows: [(&str, String); 9] = [
-        ("产品", shell.product_name.clone()),
-        ("主题", shell.theme().as_str().to_string()),
-        ("项目数", store.projects().len().to_string()),
+    let rows: Vec<(String, String)> = vec![
         (
-            "会话数",
-            format!(
-                "{}（打开项目 {}）",
-                store.open_project_sessions().len(),
-                store.open_project().name
+            shell.tr("diagnostics.product").to_string(),
+            shell.product_name.clone(),
+        ),
+        (
+            shell.tr("diagnostics.theme").to_string(),
+            shell.theme().as_str().to_string(),
+        ),
+        (
+            shell.tr("diagnostics.projects").to_string(),
+            store.projects().len().to_string(),
+        ),
+        (
+            shell.tr("diagnostics.sessions").to_string(),
+            shell.trf(
+                "diagnostics.sessions_in_project",
+                &[
+                    ("count", &store.open_project_sessions().len().to_string()),
+                    ("name", &store.open_project().name),
+                ],
             ),
         ),
-        ("面板数", shell.panel_host.len().to_string()),
         (
-            "脚本面板",
-            format!(
-                "已挂载 {}，错误 {}",
-                shell.panel_host.mounted_scripts(),
-                shell.panel_host.script_errors().len()
+            shell.tr("diagnostics.panels").to_string(),
+            shell.panel_host.len().to_string(),
+        ),
+        (
+            shell.tr("diagnostics.script_panels").to_string(),
+            shell.trf(
+                "diagnostics.mounted_errors",
+                &[
+                    ("mounted", &shell.panel_host.mounted_scripts().to_string()),
+                    ("errors", &shell.panel_host.script_errors().len().to_string()),
+                ],
             ),
         ),
-        ("视口帧", shell.painted_frames().to_string()),
         (
-            "设置",
-            shell.settings_path().unwrap_or_else(|| "未连接".to_string()),
+            shell.tr("diagnostics.viewport_frames").to_string(),
+            shell.painted_frames().to_string(),
         ),
         (
-            "账号",
+            shell.tr("diagnostics.settings").to_string(),
+            shell
+                .settings_path()
+                .unwrap_or_else(|| shell.tr("diagnostics.settings_unconnected").to_string()),
+        ),
+        (
+            shell.tr("diagnostics.account").to_string(),
             shell
                 .account()
                 .map(|account| account.display_name.clone())
-                .unwrap_or_else(|| "访客".to_string()),
+                .unwrap_or_else(|| shell.tr("diagnostics.guest").to_string()),
         ),
     ];
     div()
@@ -1778,7 +1839,7 @@ fn diagnostics_panel<S: SessionView>(
         .gap_x_4()
         .gap_y_1()
         .px_1()
-        .children(rows.map(|(label, value)| {
+        .children(rows.into_iter().map(|(label, value)| {
             div()
                 .flex()
                 .flex_row()
@@ -1822,19 +1883,64 @@ fn settings_panel<S: SessionView>(
             )
         };
 
+    let locale_button = |locale: Locale,
+                         label: &'static str,
+                         cx: &mut Context<HarnessShell<S>>| {
+        let active = shell.locale() == locale;
+        let color = if active { p.accent } else { p.muted };
+        crate::widgets::button(
+            format!("harness-locale-{}", locale.code()),
+            label,
+            color,
+            cx,
+            cx.listener(move |shell, _event, _window, _cx| {
+                shell.set_locale(locale);
+                if let Some(store) = shell.settings() {
+                    if let Ok(mut store) = store.lock() {
+                        let _ = store.set(crate::theme::LOCALE_KEY, serde_json::json!(locale.code()));
+                    }
+                }
+            }),
+        )
+    };
+
     div()
         .flex()
-        .flex_row()
-        .items_center()
-        .gap_2()
+        .flex_col()
+        .gap_1()
         .px_1()
-        .child(div().text_xs().text_color(p.muted).child("主题"))
-        .child(theme_button(ThemeKind::Dark, "深色", cx))
-        .child(theme_button(ThemeKind::Light, "浅色", cx))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(div().text_xs().text_color(p.muted).child(shell.tr("settings.theme")))
+                .child(theme_button(ThemeKind::Dark, shell.tr("settings.theme_dark"), cx))
+                .child(theme_button(ThemeKind::Light, shell.tr("settings.theme_light"), cx)),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(div().text_xs().text_color(p.muted).child(shell.tr("settings.locale")))
+                .child(locale_button(
+                    Locale::ZhCn,
+                    crate::i18n::t(Locale::ZhCn, "settings.locale.zh"),
+                    cx,
+                ))
+                .child(locale_button(
+                    Locale::En,
+                    crate::i18n::t(Locale::En, "settings.locale.en"),
+                    cx,
+                )),
+        )
         .child(div().flex_1())
         .child(div().text_xs().text_color(p.muted).child(
             crate::widgets::truncate(
-                &path.unwrap_or_else(|| "内存模式（未连接设置存储）".to_string()),
+                &path.unwrap_or_else(|| shell.tr("settings.memory_mode").to_string()),
                 64,
             ),
         ))
@@ -1842,7 +1948,7 @@ fn settings_panel<S: SessionView>(
 }
 
 
-fn plan_rows(plan: &[PlanStep], p: Palette) -> impl IntoElement {
+fn plan_rows(plan: &[PlanStep], p: Palette, locale: Locale) -> impl IntoElement {
     let mut rows = div().flex().flex_col().gap_1();
     for step in plan {
         let color = step_color(step.status, p);
@@ -1865,7 +1971,7 @@ fn plan_rows(plan: &[PlanStep], p: Palette) -> impl IntoElement {
                     div()
                         .text_xs()
                         .text_color(p.muted)
-                        .child(step.status.label()),
+                        .child(step.status.label(locale)),
                 ),
         );
     }

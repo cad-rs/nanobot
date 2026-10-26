@@ -22,6 +22,7 @@
 //! read derives from, and [`shell::HarnessShell::set_settings`] registers the
 //! settings panel that persists the choice through `ui.theme`.
 
+pub mod i18n;
 pub mod model;
 pub mod panels;
 pub mod poll;
@@ -37,7 +38,10 @@ pub use model::{
 pub use panels::{PanelArea, PanelDef, PanelHost, PanelSource, ScriptRuntime};
 pub use poll::poll_periodically;
 pub use shell::HarnessShell;
-pub use theme::{apply, apply_from_settings, set_theme, ThemeKind, THEME_KEY};
+pub use i18n::{t, t_replace, Locale};
+pub use theme::{
+    apply, apply_from_settings, set_theme, ThemeKind, LOCALE_KEY, THEME_KEY,
+};
 pub use widgets::{button, line, picker, short_hash, show, truncate, HashedRef};
 
 #[cfg(test)]
@@ -484,7 +488,14 @@ mod tests {
         assert!(PlanPhase::Contingent.awaits_decision());
         assert!(PlanPhase::Clarify.awaits_decision());
         assert!(!PlanPhase::Proposed.awaits_decision());
-        assert_eq!(SessionStatus::AwaitingReview.label(), "等待审查");
+        assert_eq!(
+            SessionStatus::AwaitingReview.label(crate::i18n::Locale::ZhCn),
+            "等待审查"
+        );
+        assert_eq!(
+            SessionStatus::AwaitingReview.label(crate::i18n::Locale::En),
+            "Awaiting review"
+        );
 
         let mut conversation = Conversation::default();
         conversation.blocks.push(Block::new(BlockKind::User, 1, "hi"));
@@ -628,6 +639,25 @@ mod tests {
         let mut shell = HarnessShell::new(two_project_store());
         shell.set_settings(Some(Arc::new(Mutex::new(named))));
         assert_eq!(shell.theme(), crate::theme::ThemeKind::Light);
+    }
+
+    #[test]
+    fn the_locale_switches_and_follows_the_settings_store() {
+        use std::sync::{Arc, Mutex};
+
+        let mut shell = HarnessShell::new(two_project_store());
+        assert_eq!(shell.locale(), crate::i18n::Locale::ZhCn, "the default");
+
+        shell.set_locale(crate::i18n::Locale::En);
+        assert_eq!(shell.locale(), crate::i18n::Locale::En);
+
+        // Sharing a store adopts its `ui.locale`, like it adopts the theme.
+        let mut settings = nanobot_boot::Settings::in_memory();
+        settings
+            .set(crate::theme::LOCALE_KEY, serde_json::json!("en"))
+            .unwrap();
+        shell.set_settings(Some(Arc::new(Mutex::new(settings))));
+        assert_eq!(shell.locale(), crate::i18n::Locale::En);
     }
 
     #[test]

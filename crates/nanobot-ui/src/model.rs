@@ -79,12 +79,12 @@ pub enum SessionStatus {
 }
 
 impl SessionStatus {
-    pub fn label(self) -> &'static str {
+    pub fn label(self, locale: crate::i18n::Locale) -> &'static str {
         match self {
-            SessionStatus::Active => "活动",
-            SessionStatus::Running => "运行中",
-            SessionStatus::AwaitingReview => "等待审查",
-            SessionStatus::Archived => "已归档",
+            SessionStatus::Active => crate::i18n::t(locale, "status.active"),
+            SessionStatus::Running => crate::i18n::t(locale, "status.running"),
+            SessionStatus::AwaitingReview => crate::i18n::t(locale, "status.awaiting_review"),
+            SessionStatus::Archived => crate::i18n::t(locale, "status.archived"),
         }
     }
 }
@@ -117,11 +117,11 @@ pub enum StepStatus {
 }
 
 impl StepStatus {
-    pub fn label(self) -> &'static str {
+    pub fn label(self, locale: crate::i18n::Locale) -> &'static str {
         match self {
-            StepStatus::Pending => "待办",
-            StepStatus::InProgress => "进行中",
-            StepStatus::Done => "完成",
+            StepStatus::Pending => crate::i18n::t(locale, "step.pending"),
+            StepStatus::InProgress => crate::i18n::t(locale, "step.in_progress"),
+            StepStatus::Done => crate::i18n::t(locale, "step.done"),
         }
     }
 }
@@ -154,16 +154,16 @@ impl PlanPhase {
         matches!(self, PlanPhase::Contingent | PlanPhase::Clarify)
     }
 
-    pub fn label(self) -> &'static str {
+    pub fn label(self, locale: crate::i18n::Locale) -> &'static str {
         match self {
-            PlanPhase::None => "无",
-            PlanPhase::Proposed => "已提议",
-            PlanPhase::Executing => "执行中",
-            PlanPhase::Verifying => "验证中",
-            PlanPhase::Settled => "已接受",
-            PlanPhase::Contingent => "待审查",
-            PlanPhase::Rejected => "已回滚",
-            PlanPhase::Clarify => "待补充",
+            PlanPhase::None => crate::i18n::t(locale, "plan.none"),
+            PlanPhase::Proposed => crate::i18n::t(locale, "plan.proposed"),
+            PlanPhase::Executing => crate::i18n::t(locale, "plan.executing"),
+            PlanPhase::Verifying => crate::i18n::t(locale, "plan.verifying"),
+            PlanPhase::Settled => crate::i18n::t(locale, "plan.settled"),
+            PlanPhase::Contingent => crate::i18n::t(locale, "plan.contingent"),
+            PlanPhase::Rejected => crate::i18n::t(locale, "plan.rejected"),
+            PlanPhase::Clarify => crate::i18n::t(locale, "plan.clarify"),
         }
     }
 }
@@ -190,13 +190,13 @@ pub enum BlockKind {
 }
 
 impl BlockKind {
-    pub fn label(self) -> &'static str {
+    pub fn label(self, locale: crate::i18n::Locale) -> &'static str {
         match self {
-            BlockKind::User => "你",
-            BlockKind::Assistant => "AI",
-            BlockKind::Tool => "工具",
-            BlockKind::Plan => "计划",
-            BlockKind::Check => "检查",
+            BlockKind::User => crate::i18n::t(locale, "block.user"),
+            BlockKind::Assistant => crate::i18n::t(locale, "block.assistant"),
+            BlockKind::Tool => crate::i18n::t(locale, "block.tool"),
+            BlockKind::Plan => crate::i18n::t(locale, "block.plan"),
+            BlockKind::Check => crate::i18n::t(locale, "block.check"),
         }
     }
 }
@@ -210,11 +210,11 @@ pub enum ToolState {
 }
 
 impl ToolState {
-    pub fn label(self) -> &'static str {
+    pub fn label(self, locale: crate::i18n::Locale) -> &'static str {
         match self {
-            ToolState::Running => "运行中",
-            ToolState::Done => "完成",
-            ToolState::Failed => "失败",
+            ToolState::Running => crate::i18n::t(locale, "tool.running"),
+            ToolState::Done => crate::i18n::t(locale, "tool.done"),
+            ToolState::Failed => crate::i18n::t(locale, "tool.failed"),
         }
     }
 }
