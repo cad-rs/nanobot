@@ -20,6 +20,9 @@ use nanobot_boot::Settings;
 /// The settings key the theme name lives under.
 pub const THEME_KEY: &str = "ui.theme";
 
+/// The settings key the UI locale lives under.
+pub const LOCALE_KEY: &str = "ui.locale";
+
 /// The theme kinds the shell ships. Anything unrecognised reads as dark.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ThemeKind {
