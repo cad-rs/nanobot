@@ -1,6 +1,6 @@
 # The three gates the framework promises, enforced mechanically:
 #
-# 1. kernel — the 8 GUI-free crates lint clean (`-D warnings`) and test green
+# 1. kernel — the 9 GUI-free crates lint clean (`-D warnings`) and test green
 #    on the cheapest runner, with no GUI stack installed. This is the
 #    "CLI / test / MCP server can consume the kernel without dragging a UI
 #    along" guarantee (design §1.2).
@@ -36,13 +36,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: clippy (kernel, deny warnings)
         run: cargo clippy
-          -p nanobot-cordis -p nanobot-session -p nanobot-agent -p nanobot-tools
-          -p nanobot-skills -p nanobot-llm -p nanobot-boot -p nanobot-auth
+          -p nanobot-telemetry -p nanobot-cordis -p nanobot-session -p nanobot-agent
+          -p nanobot-tools -p nanobot-skills -p nanobot-llm -p nanobot-boot -p nanobot-auth
           --lib --tests -- -D warnings
       - name: test (kernel)
         run: cargo test
-          -p nanobot-cordis -p nanobot-session -p nanobot-agent -p nanobot-tools
-          -p nanobot-skills -p nanobot-llm -p nanobot-boot -p nanobot-auth
+          -p nanobot-telemetry --features testing -p nanobot-cordis -p nanobot-session
+          -p nanobot-agent -p nanobot-tools -p nanobot-skills -p nanobot-llm -p nanobot-boot
+          -p nanobot-auth
 
   wasm:
     runs-on: ubuntu-latest
@@ -54,8 +55,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: check (kernel, wasm32-unknown-unknown)
         run: cargo check
-          -p nanobot-cordis -p nanobot-session -p nanobot-agent -p nanobot-tools
-          -p nanobot-skills -p nanobot-llm -p nanobot-boot -p nanobot-auth
+          -p nanobot-telemetry -p nanobot-cordis -p nanobot-session -p nanobot-agent
+          -p nanobot-tools -p nanobot-skills -p nanobot-llm -p nanobot-boot -p nanobot-auth
           --target wasm32-unknown-unknown
 
   shell:

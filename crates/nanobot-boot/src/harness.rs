@@ -32,6 +32,7 @@ use nanobot_llm::{LlmAdapter, LlmRuntime, OpenAiCompatibleAdapter, ScriptedAdapt
 use nanobot_session::persistence;
 use nanobot_session::{Session, SessionEvent};
 use nanobot_skills::{PromptAssemble, SkillManifest, SkillRunner};
+use nanobot_telemetry::TelemetryContext;
 use nanobot_tools::{ApprovalPolicy, AutoApprovalPolicy, DenyAllPolicy, ToolDefinition, ToolPipeline, ToolRegistry, UiApprovalPolicy};
 
 use crate::account::{Account, AccountProvider, AnonymousProvider, EntitlementDecision, SharedAccountProvider, TURN_CAPABILITY};
@@ -211,6 +212,7 @@ pub struct HarnessBuilder {
     persona: Option<String>,
     model: Option<String>,
     skills: Vec<SkillManifest>,
+    telemetry: Option<Arc<dyn TelemetryContext>>,
 }
 
 impl HarnessBuilder {
@@ -231,6 +233,7 @@ impl HarnessBuilder {
             persona: None,
             model: None,
             skills: Vec::new(),
+            telemetry: None,
         }
     }
 
@@ -341,6 +344,18 @@ impl HarnessBuilder {
         self
     }
 
+    /// The telemetry context the assembled harness emits its spans through.
+    ///
+    /// Installed on both the LLM runtime (`provider.request`) and the agent
+    /// loop (`agent.turn` / `agent.step` / `tool.execute`). Absent, every span
+    /// is dropped on the floor by the no-op default — instrumentation is a
+    /// choice, and the kernel never drags a tracing backend into a consumer
+    /// that did not ask for one.
+    pub fn with_telemetry(mut self, telemetry: Arc<dyn TelemetryContext>) -> Self {
+        self.telemetry = Some(telemetry);
+        self
+    }
+
     /// Skill manifests to enable at assembly time. Each enablement is
     /// isolated: a manifest that fails (or panics) is skipped and noted, not
     /// fatal.
@@ -367,6 +382,7 @@ impl HarnessBuilder {
             persona,
             model,
             skills,
+            telemetry,
         } = self;
 
         let mut notes: Vec<String> = Vec::new();
@@ -459,6 +475,12 @@ impl HarnessBuilder {
             }
         }
 
+        // The runtime owns the `provider.request` span, so it needs the context
+        // before the agent takes ownership of it.
+        if let Some(telemetry) = &telemetry {
+            llm.set_telemetry(telemetry.clone());
+        }
+
         let mut tool_count = 0usize;
         let registry = match registry {
             Some(registry) => {
@@ -496,6 +518,9 @@ impl HarnessBuilder {
         }
         if let Some(model) = model {
             agent.set_model(model);
+        }
+        if let Some(telemetry) = &telemetry {
+            agent.set_telemetry(telemetry.clone());
         }
 
         // The skill runner with a root context. Each enablement is isolated:

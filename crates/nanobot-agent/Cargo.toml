@@ -11,6 +11,7 @@ crate-type = ["rlib"]
 [dependencies]
 nanobot-llm = { workspace = true }
 nanobot-session = { workspace = true }
+nanobot-telemetry = { workspace = true }
 nanobot-tools = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -22,3 +23,5 @@ futures-util = { workspace = true }
 futures-executor = "0.3"
 # The cancellation test holds the model stream open on a channel gate.
 futures-channel = "0.3"
+# The telemetry test asserts on the spans the loop emitted.
+nanobot-telemetry = { workspace = true, features = ["testing"] }

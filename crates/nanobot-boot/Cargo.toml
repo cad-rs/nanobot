@@ -13,6 +13,7 @@ nanobot-cordis = { workspace = true }
 nanobot-llm = { workspace = true }
 nanobot-session = { workspace = true }
 nanobot-skills = { workspace = true }
+nanobot-telemetry = { workspace = true }
 nanobot-tools = { workspace = true }
 nanobot-agent = { workspace = true }
 serde = { workspace = true }

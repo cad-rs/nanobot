@@ -33,6 +33,7 @@ use crate::inbox::Inbox;
 use crate::plan::{Plan, PlanState};
 use nanobot_llm::{BlockAssembler, LlmRequest, LlmRuntime, Message, ToolDefinition};
 use nanobot_session::{Session, SessionEvent, TurnEndReason};
+use nanobot_telemetry::{NoopTelemetryContext, SpanKind, SpanOptions, TelemetryContext};
 use nanobot_tools::ToolPipeline;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -195,6 +196,10 @@ struct AgentInner {
     /// post-execution state (design-harness 14.3). Absent -> a plan with an
     /// intent passes (nothing to check against).
     plan_verifier: Mutex<Option<Arc<dyn PlanVerifier>>>,
+    /// The telemetry context the loop emits its spans through. The default
+    /// records nothing, so instrumentation stays a *choice*: the kernel never
+    /// drags a tracing backend into a consumer that did not ask for one.
+    telemetry: Mutex<Arc<dyn TelemetryContext>>,
 }
 
 /// The adapter key the agent asks for when the product sets no model.
@@ -312,6 +317,7 @@ impl Agent {
                 persona: Mutex::new(None),
                 model: Mutex::new(None),
                 plan_verifier: Mutex::new(None),
+                telemetry: Mutex::new(Arc::new(NoopTelemetryContext)),
             }),
         }
     }
@@ -362,6 +368,22 @@ impl Agent {
     /// plan that declares an intent passes — there is nothing to check against.
     pub fn set_plan_verifier(&self, verifier: Arc<dyn PlanVerifier>) {
         *self.inner.plan_verifier.lock().unwrap() = Some(verifier);
+    }
+
+    /// Set the telemetry context the loop emits its spans through.
+    ///
+    /// The default is the no-op context: `agent.turn`, `agent.step`,
+    /// `tool.execute` and `provider.request` spans are then dropped on the
+    /// floor. A consumer that wants them implements [`TelemetryContext`]
+    /// (bridging into its own tracing stack) and installs it here.
+    pub fn set_telemetry(&self, telemetry: Arc<dyn TelemetryContext>) {
+        *self.inner.telemetry.lock().unwrap() = telemetry;
+    }
+
+    /// The telemetry context, cloned so the loop can hold it across an `.await`
+    /// without keeping the lock guard alive.
+    fn telemetry(&self) -> Arc<dyn TelemetryContext> {
+        self.inner.telemetry.lock().unwrap().clone()
     }
 
     /// The system prompt the model receives this turn (design-harness 14.2).
@@ -832,6 +854,14 @@ impl Agent {
             // turn/start
             self.inner.session.append(SessionEvent::TurnStart { turn });
 
+            // The turn span stays open until the turn returns (completion,
+            // cancellation, max steps or a provider error), so its duration is
+            // the turn's. Dropped on every exit path, including the early
+            // `return`s below.
+            let _turn_span = self
+                .telemetry()
+                .start_span(SpanOptions::new("agent.turn", SpanKind::AgentTurn));
+
             // The system prompt is assembled once per turn (design 14.2): it is
             // a turn-level view of the document, not a per-step one.
             let system_prompt = self.build_system_prompt();
@@ -860,6 +890,13 @@ impl Agent {
                 self.inner
                     .session
                     .append(SessionEvent::StepStart { turn, step });
+
+                // One span per step: it ends when the step does (the loop body
+                // ends, breaks, or returns), so it measures the model request
+                // plus the tool dispatch it triggered.
+                let _step_span = self
+                    .telemetry()
+                    .start_span(SpanOptions::new("agent.step", SpanKind::AgentStep));
 
                 // Get next step message (steering). For the first step, use the
                 // turn message; for subsequent steps, use steering or empty.
@@ -993,6 +1030,14 @@ impl Agent {
                     // Log tool calls and execute them under the write gate.
                     for tc in &block.tool_calls {
                         has_tool_calls = true;
+                        // Per-call span: it ends when the call is dispatched
+                        // (including the `continue`s for a denied or
+                        // executor-less call), so it measures the whole
+                        // pre-execute -> execute -> post-execute path.
+                        let _tool_span = self
+                            .telemetry()
+                            .start_span(SpanOptions::new("tool.execute", SpanKind::Tool));
+
                         let args: serde_json::Value =
                             serde_json::from_str(&tc.arguments).unwrap_or(serde_json::Value::Null);
 
