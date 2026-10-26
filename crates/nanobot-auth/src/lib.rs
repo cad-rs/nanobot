@@ -14,9 +14,22 @@ pub mod error;
 pub mod license;
 pub mod oauth;
 
+pub(crate) mod base64;
+
 pub use error::AuthError;
-pub use license::{public_key_from_base64, public_key_to_base64, License, LicenseProvider, sign_license};
+pub use license::{
+    public_key_from_base64, public_key_to_base64, sign_license, License, LicenseProvider,
+};
 pub use oauth::{
     forget_tokens, persist_tokens, restore_tokens, DeviceCode, DeviceFlow, OAuth2Config,
     OAuth2Provider, PollOutcome, TokenSet,
 };
+
+/// The unix clock (ms) both backends read for expiry decisions. web-time
+/// keeps wasm builds working.
+pub(crate) fn now_ms() -> u64 {
+    web_time::SystemTime::now()
+        .duration_since(web_time::SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}

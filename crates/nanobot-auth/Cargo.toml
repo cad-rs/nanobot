@@ -10,6 +10,8 @@ crate-type = ["rlib"]
 
 [dependencies]
 nanobot-boot = { workspace = true }
+# The glob a feature list matches against (the approval policy's matcher).
+nanobot-tools = { workspace = true }
 reqwest = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true

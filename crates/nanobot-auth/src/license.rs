@@ -14,12 +14,14 @@
 //! vendor's own tooling (and these tests) can produce tokens — the signing
 //! key's custody is entirely outside the framework.
 
-use base64 as b64;
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
 use nanobot_boot::{Account, AccountProvider, EntitlementDecision};
+use nanobot_tools::glob_match;
 use serde::{Deserialize, Serialize};
 
+use crate::base64;
 use crate::error::AuthError;
+use crate::now_ms;
 
 /// The verified payload. Field order here is the canonical byte order —
 /// adding fields changes the encoding, which is fine: old tokens keep
@@ -67,7 +69,7 @@ pub fn public_key_to_base64(key: &VerifyingKey) -> String {
 pub fn sign_license(license: &License, signing_key: &SigningKey) -> String {
     let payload = serde_json::to_vec(license).expect("license serializes");
     let signature = signing_key.sign(&payload);
-    format!("{}.{}", b64::encode_urlsafe(&payload), b64::encode_urlsafe(&signature.to_bytes()))
+    format!("{}.{}", base64::encode_urlsafe(&payload), base64::encode_urlsafe(&signature.to_bytes()))
 }
 
 /// A signed license held by one deployment: verified once at load, asked
@@ -91,9 +93,9 @@ impl LicenseProvider {
         let (payload_b64, signature_b64) = text
             .split_once('.')
             .ok_or_else(|| AuthError::Protocol("license is not <payload>.<signature>".into()))?;
-        let payload = b64::decode_urlsafe(payload_b64)
+        let payload = base64::decode_urlsafe(payload_b64)
             .ok_or_else(|| AuthError::Protocol("license payload is not base64url".into()))?;
-        let signature_bytes = b64::decode_urlsafe(signature_b64)
+        let signature_bytes = base64::decode_urlsafe(signature_b64)
             .ok_or_else(|| AuthError::Protocol("license signature is not base64url".into()))?;
         let signature_bytes: [u8; 64] = signature_bytes
             .try_into()
@@ -110,13 +112,14 @@ impl LicenseProvider {
                 return Err(AuthError::Expired);
             }
         }
+        let plan = license.plan.clone().unwrap_or_else(|| "license".into());
         Ok(Self {
-            account: Account::new(
-                license.license_id.clone(),
-                license.plan.clone().unwrap_or_else(|| "license".into()),
-            )
-            .with_plan(license.plan.clone().unwrap_or_else(|| "license".into()))
-            .with_expiry_opts(license.expires_at_ms),
+            account: Account {
+                id: license.license_id.clone(),
+                display_name: plan.clone(),
+                plan: Some(plan),
+                expires_at_ms: license.expires_at_ms,
+            },
             license,
             expected_product: None,
             now_ms: None,
@@ -191,93 +194,6 @@ impl AccountProvider for LicenseProvider {
     }
 }
 
-/// `*` / `?` glob matching (case-sensitive), the semantics `RuleBasedApprovalPolicy`
-/// uses for actions and resources. A feature list that grants `export.*`
-/// should mean what it says.
-fn glob_match(pattern: &str, text: &str) -> bool {
-    fn inner(p: &[u8], t: &[u8]) -> bool {
-        match (p.first(), t.first()) {
-            (None, None) => true,
-            (Some(b'*'), _) => inner(&p[1..], t) || (!t.is_empty() && inner(p, &t[1..])),
-            (Some(b'?'), Some(_)) => inner(&p[1..], &t[1..]),
-            (Some(a), Some(b)) if a == b => inner(&p[1..], &t[1..]),
-            _ => false,
-        }
-    }
-    inner(pattern.as_bytes(), text.as_bytes())
-}
-
-fn now_ms() -> u64 {
-    web_time::SystemTime::now()
-        .duration_since(web_time::SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-/// Small helper so [`LicenseProvider::load`] reads flat.
-trait AccountExpiry {
-    fn with_expiry_opts(self, expires_at_ms: Option<u64>) -> Self;
-}
-impl AccountExpiry for Account {
-    fn with_expiry_opts(self, expires_at_ms: Option<u64>) -> Self {
-        match expires_at_ms {
-            Some(ms) => self.with_expiry_ms(ms),
-            None => self,
-        }
-    }
-}
-
-/// Minimal base64url (RFC 4648 §5, unpadded) — hand-rolled to keep the
-/// dependency face at ed25519-dalek alone, with a round-trip test below.
-pub(crate) mod base64 {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-
-    pub fn encode_urlsafe(data: &[u8]) -> String {
-        let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-        for chunk in data.chunks(3) {
-            let b = [
-                chunk[0],
-                chunk.get(1).copied().unwrap_or(0),
-                chunk.get(2).copied().unwrap_or(0),
-            ];
-            let group = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-            let quad = [
-                (group >> 18) as usize & 0x3f,
-                (group >> 12) as usize & 0x3f,
-                (group >> 6) as usize & 0x3f,
-                group as usize & 0x3f,
-            ];
-            let significant = match chunk.len() {
-                1 => 2,
-                2 => 3,
-                _ => 4,
-            };
-            for (i, index) in quad.iter().enumerate() {
-                if i < significant {
-                    out.push(TABLE[*index] as char);
-                }
-            }
-        }
-        out
-    }
-
-    pub fn decode_urlsafe(encoded: &str) -> Option<Vec<u8>> {
-        let mut out = Vec::with_capacity(encoded.len() * 3 / 4);
-        let mut buffer = 0_u32;
-        let mut bits = 0_u32;
-        for ch in encoded.trim_end_matches('=').bytes() {
-            let value = TABLE.iter().position(|c| *c == ch)? as u32;
-            buffer = (buffer << 6) | value;
-            bits += 6;
-            if bits >= 8 {
-                bits -= 8;
-                out.push(((buffer >> bits) & 0xff) as u8);
-            }
-        }
-        Some(out)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,13 +204,6 @@ mod tests {
         SigningKey::from_bytes(&[7_u8; 32])
     }
 
-    fn now_ms_for_tests() -> u64 {
-        web_time::SystemTime::now()
-            .duration_since(web_time::SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0)
-    }
-
     /// A license valid now, for an hour.
     fn sample() -> License {
         License {
@@ -303,8 +212,8 @@ mod tests {
             plan: Some("team".into()),
             seats: 10,
             features: vec!["agent.turn".into(), "export.*".into()],
-            issued_at_ms: now_ms_for_tests().saturating_sub(1_000),
-            expires_at_ms: Some(now_ms_for_tests() + 3_600_000),
+            issued_at_ms: crate::now_ms().saturating_sub(1_000),
+            expires_at_ms: Some(crate::now_ms() + 3_600_000),
         }
     }
 
@@ -322,7 +231,7 @@ mod tests {
     fn base64_round_trips_on_split_boundaries() {
         for len in 0..40 {
             let data: Vec<u8> = (0..len as u8).collect();
-            assert_eq!(b64::decode_urlsafe(&b64::encode_urlsafe(&data)), Some(data.clone()));
+            assert_eq!(base64::decode_urlsafe(&base64::encode_urlsafe(&data)), Some(data.clone()));
         }
     }
 
@@ -352,9 +261,9 @@ mod tests {
         let (payload, signature) = token.split_once('.').unwrap();
 
         // One flipped payload byte, re-encoded.
-        let mut payload_bytes = b64::decode_urlsafe(payload).unwrap();
+        let mut payload_bytes = base64::decode_urlsafe(payload).unwrap();
         payload_bytes[3] ^= 0x01;
-        let flipped = format!("{}.{}", b64::encode_urlsafe(&payload_bytes), signature);
+        let flipped = format!("{}.{}", base64::encode_urlsafe(&payload_bytes), signature);
         assert!(matches!(
             LicenseProvider::load(flipped.as_bytes(), &public),
             Err(AuthError::Protocol(_))
@@ -385,7 +294,7 @@ mod tests {
         );
 
         // Within its window (pinned before its expiry) it loads and runs.
-        let inside = License { expires_at_ms: Some(now_ms_for_tests() + 60_000), ..expired_sample() };
+        let inside = License { expires_at_ms: Some(crate::now_ms() + 60_000), ..expired_sample() };
         let provider = LicenseProvider::load(sign_license(&inside, &key).as_bytes(), &public)
             .expect("within the window it loads");
         assert!(provider.check("agent.turn").is_allowed());
@@ -417,7 +326,7 @@ mod tests {
     #[test]
     fn a_public_key_from_base64_matches_the_vendor_key() {
         let key = vendor_key();
-        let encoded = b64::encode_urlsafe(&key.verifying_key().to_bytes());
+        let encoded = base64::encode_urlsafe(&key.verifying_key().to_bytes());
         let restored = public_key_from_base64(&encoded).expect("key decodes");
         let token = sign_license(&sample(), &key);
         assert!(LicenseProvider::load(token.as_bytes(), &restored).is_ok());
