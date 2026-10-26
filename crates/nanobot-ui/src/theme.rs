@@ -14,14 +14,22 @@
 
 use std::sync::{Arc, Mutex};
 
-use gpui::{App, Window};
+use gpui::{px, App, Window};
 use nanobot_boot::Settings;
+use serde_json::Value;
 
 /// The settings key the theme name lives under.
 pub const THEME_KEY: &str = "ui.theme";
 
 /// The settings key the UI locale lives under.
 pub const LOCALE_KEY: &str = "ui.locale";
+
+/// The base font size (px). gpui-component's default is 16.
+pub const FONT_SIZE_KEY: &str = "ui.font.size";
+/// The UI font family; empty/unset means the platform default.
+pub const FONT_FAMILY_KEY: &str = "ui.font.family";
+/// The monospace family, for code and measurements.
+pub const FONT_MONO_FAMILY_KEY: &str = "ui.font.mono_family";
 
 /// The theme kinds the shell ships. Anything unrecognised reads as dark.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,6 +92,37 @@ pub fn apply_from_settings(settings: &Settings, cx: &mut App) -> ThemeKind {
     kind
 }
 
+/// Applies the font settings to the gpui-component theme.
+///
+/// The base size and the two families are public fields on `Theme`, and
+/// every component reads them when it builds (through the typography
+/// tokens), so a window refresh is all the propagation needed — there is
+/// no second font table to keep in sync.
+pub fn apply_font(settings: &Settings, window: Option<&mut Window>, cx: &mut App) {
+    let size = settings.get(FONT_SIZE_KEY).and_then(Value::as_f64);
+    let family = settings.get(FONT_FAMILY_KEY).and_then(Value::as_str);
+    let mono = settings.get(FONT_MONO_FAMILY_KEY).and_then(Value::as_str);
+    if size.is_none() && family.is_none() && mono.is_none() {
+        return;
+    }
+    {
+        let theme = cx.global_mut::<gpui_component::Theme>();
+        if let Some(size) = size {
+            theme.font_size = px(size as f32);
+        }
+        if let Some(family) = family {
+            theme.font_family = family.into();
+        }
+        if let Some(mono) = mono {
+            theme.mono_font_family = mono.into();
+        }
+    }
+    gpui_component::Theme::sync_base(cx);
+    if let Some(window) = window {
+        window.refresh();
+    }
+}
+
 /// Writes the theme choice through the settings store, then applies it.
 /// The write goes through [`Settings::set`], so it reaches the file
 /// immediately; an unwritable store degrades to an in-memory switch, never
@@ -103,6 +142,14 @@ pub fn set_theme(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn font_keys_are_distinct_from_the_theme_and_locale_keys() {
+        for key in [FONT_SIZE_KEY, FONT_FAMILY_KEY, FONT_MONO_FAMILY_KEY] {
+            assert_ne!(key, THEME_KEY);
+            assert_ne!(key, LOCALE_KEY);
+        }
+    }
 
     #[test]
     fn names_round_trip_and_unknown_reads_as_dark() {

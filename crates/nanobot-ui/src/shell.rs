@@ -122,6 +122,9 @@ pub struct HarnessShell<S: SessionView> {
     /// The UI locale every string in this shell renders in: a user setting
     /// (`ui.locale`), defaulted from the harness profile.
     locale: Locale,
+    /// The settings panel's font-family input, created on first show.
+    font_input: Rc<RefCell<Option<Entity<InputState>>>>,
+    _font_input_sub: Rc<RefCell<Option<Subscription>>>,
 }
 
 /// One script plugin as the plugins panel shows it.
@@ -163,6 +166,8 @@ impl<S: SessionView> HarnessShell<S> {
             plugins: None,
             rejected_plugins: Vec::new(),
             locale: Locale::default(),
+            font_input: Rc::new(RefCell::new(None)),
+            _font_input_sub: Rc::new(RefCell::new(None)),
         };
         // Framework chrome: the diagnostics panel is always there (it reads
         // nothing but shell state), the settings panel joins when the app
@@ -369,6 +374,34 @@ impl<S: SessionView> HarnessShell<S> {
     /// Switches the UI locale; the shell re-renders on the next frame.
     pub fn set_locale(&mut self, locale: Locale) {
         self.locale = locale;
+    }
+
+    /// The settings panel's font input handle (the panel creates it on
+    /// first show).
+    pub fn font_input(&self) -> Rc<RefCell<Option<Entity<InputState>>>> {
+        self.font_input.clone()
+    }
+
+    pub(crate) fn font_input_sub(&self) -> Rc<RefCell<Option<Subscription>>> {
+        self._font_input_sub.clone()
+    }
+
+    /// Writes one font setting and re-themes the window. The settings panel
+    /// is the only caller today; the app layer applies the stored fonts at
+    /// launch through [`crate::theme::apply_font`].
+    fn set_font_setting(
+        &mut self,
+        key: &'static str,
+        value: serde_json::Value,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(store) = &self.settings {
+            if let Ok(mut store) = store.lock() {
+                let _ = store.set(key, value);
+                crate::theme::apply_font(&store, Some(window), cx);
+            }
+        }
     }
 
     /// The localized text for `key` in the shell's locale.
@@ -1862,7 +1895,7 @@ fn diagnostics_panel<S: SessionView>(
 fn settings_panel<S: SessionView>(
     shell: &HarnessShell<S>,
     _workspace: &S::Workspace,
-    _window: &mut Window,
+    window: &mut Window,
     cx: &mut Context<HarnessShell<S>>,
 ) -> AnyElement {
     let p = palette(cx);
@@ -1904,6 +1937,61 @@ fn settings_panel<S: SessionView>(
         )
     };
 
+    let size_button = |size: f64, label: &'static str, cx: &mut Context<HarnessShell<S>>| {
+        let current = shell.settings().and_then(|store| {
+            store
+                .lock()
+                .ok()
+                .and_then(|store| store.get(crate::theme::FONT_SIZE_KEY).and_then(|v| v.as_f64()))
+        });
+        let active = current
+            .map(|current| (current - size).abs() < f64::EPSILON)
+            .unwrap_or((size - 16.0).abs() < f64::EPSILON);
+        let color = if active { p.accent } else { p.muted };
+        crate::widgets::button(
+            format!("harness-font-size-{size}"),
+            label,
+            color,
+            cx,
+            cx.listener(move |shell, _event, window, cx| {
+                shell.set_font_setting(
+                    crate::theme::FONT_SIZE_KEY,
+                    serde_json::json!(size),
+                    window,
+                    cx,
+                );
+            }),
+        )
+    };
+
+    // The font family input is created on first show; Enter applies it.
+    if shell.font_input().borrow().is_none() {
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(crate::i18n::t(shell.locale(), "settings.font.placeholder"))
+        });
+        let subscription = cx.subscribe_in(
+            &input,
+            window,
+            |shell: &mut HarnessShell<S>, input, event: &InputEvent, window, cx| {
+                if !matches!(event, InputEvent::PressEnter { .. }) {
+                    return;
+                }
+                let family = input.read(cx).value().to_string();
+                if !family.trim().is_empty() {
+                    shell.set_font_setting(
+                        crate::theme::FONT_FAMILY_KEY,
+                        serde_json::json!(family),
+                        window,
+                        cx,
+                    );
+                }
+            },
+        );
+        *shell.font_input().borrow_mut() = Some(input);
+        *shell.font_input_sub().borrow_mut() = Some(subscription);
+    }
+
     div()
         .flex()
         .flex_col()
@@ -1936,6 +2024,36 @@ fn settings_panel<S: SessionView>(
                     crate::i18n::t(Locale::En, "settings.locale.en"),
                     cx,
                 )),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(div().text_xs().text_color(p.muted).child(shell.tr("settings.font")))
+                .child(size_button(14.0, shell.tr("settings.font.small"), cx))
+                .child(size_button(16.0, shell.tr("settings.font.normal"), cx))
+                .child(size_button(18.0, shell.tr("settings.font.large"), cx)),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(div().text_xs().text_color(p.muted).child(shell.tr("settings.font.family")))
+                .child(
+                    div()
+                        .w(px(180.))
+                        .when(shell.font_input().borrow().is_some(), |row| {
+                            row.child(
+                                Input::new(&shell.font_input().borrow().clone().expect("checked above"))
+                                    .w_full()
+                                    .text_xs(),
+                            )
+                        }),
+                ),
         )
         .child(div().flex_1())
         .child(div().text_xs().text_color(p.muted).child(
