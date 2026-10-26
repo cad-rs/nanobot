@@ -15,7 +15,9 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use crate::harness::{is_user_message, run_one_turn};
+#[cfg(not(target_family = "wasm"))]
+use crate::harness::is_user_message;
+use crate::harness::run_one_turn;
 use crate::Harness;
 
 /// One selfcheck outcome.
