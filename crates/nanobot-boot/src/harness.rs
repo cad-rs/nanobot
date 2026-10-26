@@ -179,15 +179,10 @@ impl Harness {
 
 impl Drop for Harness {
     fn drop(&mut self) {
-        // Pending settings changes are persisted on the way out — the same
-        // close-out discipline as the clean marker. A store nobody touched
-        // writes nothing.
-        if let Ok(mut settings) = self.settings.lock() {
-            let _ = settings.save_if_dirty();
-        }
         // A normal exit marks the session clean. A crash (process exit
         // without drop) leaves the marker absent — the next build() reads
-        // the absence as "recover".
+        // the absence as "recover". Settings need no close-out: they are
+        // written through at every change.
         if let Some(marker) = self.clean_marker_path() {
             if let Some(dir) = marker.parent() {
                 let _ = std::fs::create_dir_all(dir);

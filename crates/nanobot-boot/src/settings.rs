@@ -5,15 +5,15 @@
 //! hardening batch): a `BTreeMap<String, Value>` behind dotted key strings —
 //! `ui.theme`, `plugin.<id>.enabled` — written through on every change. The
 //! dot is part of the key, not a nesting operator; there is no schema and no
-//! defaults table (typed getters take their default inline).
+//! defaults table.
 //!
 //! Settings are **user-scoped, not project-scoped**: they live under
 //! [`user_config_dir`] keyed by the harness id (`~/.config/<id>` on Unix,
 //! `%APPDATA%\<id>` on Windows), so the theme survives a project switch.
 //! Loading is never fatal — a missing file is empty settings, a corrupt file
-//! resets with a message for the assembly notes — and a headless assembly
-//! never touches the file: only a changed setting is written
-//! ([`Settings::save_if_dirty`], run from the harness's `Drop`).
+//! resets with a message for the assembly notes. The file is only ever
+//! written by an explicit change ([`Settings::set`] / [`Settings::remove`]):
+//! an assembly that changed nothing writes nothing.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -55,7 +55,6 @@ pub fn user_config_dir(harness_id: &str) -> PathBuf {
 pub struct Settings {
     values: BTreeMap<String, Value>,
     path: Option<PathBuf>,
-    dirty: bool,
 }
 
 impl Settings {
@@ -92,18 +91,12 @@ impl Settings {
         Self {
             values: BTreeMap::new(),
             path: Some(path.to_path_buf()),
-            dirty: false,
         }
     }
 
     /// The file these settings persist to, when they persist at all.
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
-    }
-
-    /// Whether a change is pending that [`save`](Self::save) would write.
-    pub fn is_dirty(&self) -> bool {
-        self.dirty
     }
 
     pub fn get(&self, key: &str) -> Option<&Value> {
@@ -117,32 +110,18 @@ impl Settings {
             .to_string()
     }
 
-    pub fn get_f64(&self, key: &str, default: f64) -> f64 {
-        self.get(key).and_then(Value::as_f64).unwrap_or(default)
-    }
-
-    pub fn get_bool(&self, key: &str, default: bool) -> bool {
-        self.get(key).and_then(Value::as_bool).unwrap_or(default)
-    }
-
     /// Sets `key` and writes the whole file through immediately (write-through:
     /// a crash after a settings change loses nothing). Without a path the
-    /// change lives in memory only, and stays pending.
+    /// change lives in memory only.
     pub fn set(&mut self, key: &str, value: Value) -> Result<(), String> {
         self.values.insert(key.to_string(), value);
-        self.dirty = true;
         self.save()
     }
 
     /// Removes `key` and writes through, mirroring [`set`](Self::set).
     pub fn remove(&mut self, key: &str) -> Result<(), String> {
         self.values.remove(key);
-        self.dirty = true;
         self.save()
-    }
-
-    pub fn keys(&self) -> impl Iterator<Item = &str> {
-        self.values.keys().map(String::as_str)
     }
 
     /// Writes the full file. An error is a message, never a panic — a
@@ -155,18 +134,7 @@ impl Settings {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        std::fs::write(path, json).map_err(|e| format!("write settings {}: {e}", path.display()))?;
-        self.dirty = false;
-        Ok(())
-    }
-
-    /// [`save`](Self::save) for assemblies that had nothing changed: a
-    /// headless build must not create a file in the user's config directory.
-    pub fn save_if_dirty(&mut self) -> Result<(), String> {
-        if !self.dirty {
-            return Ok(());
-        }
-        self.save()
+        std::fs::write(path, json).map_err(|e| format!("write settings {}: {e}", path.display()))
     }
 }
 
@@ -210,58 +178,26 @@ mod tests {
 
         let mut settings = Settings::load(&file).0;
         settings.set("ui.theme", Value::String("light".into())).expect("set");
-        settings.set("autosave.interval_secs", serde_json::json!(15)).expect("set");
         assert!(file.is_file(), "set writes the file immediately");
 
         let reloaded = Settings::load(&file).0;
         assert_eq!(reloaded.get_str("ui.theme", "dark"), "light");
-        assert_eq!(reloaded.get_f64("autosave.interval_secs", 30.0), 15.0);
-        assert!(!reloaded.is_dirty(), "a loaded file starts clean");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn typed_getters_fall_back_to_their_defaults() {
+    fn get_str_falls_back_to_its_default() {
         let mut settings = Settings::in_memory();
         settings.values.insert("ui.theme".into(), Value::String("light".into()));
-        settings.values.insert("flag".into(), Value::String("not a bool".into()));
 
         assert_eq!(settings.get_str("ui.theme", "dark"), "light");
         assert_eq!(settings.get_str("absent", "dark"), "dark");
-        assert_eq!(settings.get_f64("absent", 1.5), 1.5);
-        assert!(settings.get_bool("absent", true));
-        assert!(
-            settings.get_bool("flag", true),
-            "a wrong-typed value is ignored in favour of the default"
-        );
     }
 
     #[test]
-    fn dirty_tracking_only_writes_what_changed() {
-        let dir = scratch("dirty");
-        let file = dir.join("settings.json");
-
-        // A freshly loaded store is clean: saving it must not create a file.
-        let mut settings = Settings::load(&file).0;
-        settings.save_if_dirty().expect("clean save");
-        assert!(!file.exists(), "an untouched settings store writes nothing");
-
-        // set() writes through: a successful save leaves nothing pending.
-        settings.set("ui.theme", Value::String("dark".into())).expect("set");
-        assert!(file.is_file(), "set writes the file immediately");
-        assert!(
-            !settings.is_dirty(),
-            "a successful write-through leaves nothing pending"
-        );
-
-        // A store with nowhere to write keeps the change pending — the
-        // harness's Drop (or a later save) retries it.
-        let mut memory = Settings::in_memory();
-        memory.set("k", Value::Bool(true)).expect("memory set");
-        assert!(memory.is_dirty(), "nowhere to write leaves the change pending");
-        memory.save_if_dirty().expect("memory save is a no-op, not an error");
-        assert!(memory.is_dirty(), "still pending: there is no path to clear it");
-
-        let _ = std::fs::remove_dir_all(&dir);
+    fn in_memory_settings_accept_changes_without_a_file() {
+        let mut settings = Settings::in_memory();
+        settings.set("k", Value::Bool(true)).expect("memory set");
+        assert_eq!(settings.get("k"), Some(&Value::Bool(true)));
     }
 }

@@ -329,6 +329,16 @@ impl<S: SessionView> HarnessShell<S> {
         self.settings.clone()
     }
 
+    /// The settings file's path as the panels show it (`None` = in-memory,
+    /// nothing shared). The single read the settings and diagnostics panels
+    /// share.
+    pub fn settings_path(&self) -> Option<String> {
+        self.settings
+            .as_ref()
+            .and_then(|store| store.lock().ok())
+            .and_then(|settings| settings.path().map(|path| path.display().to_string()))
+    }
+
     /// The theme the shell renders in.
     pub fn theme(&self) -> ThemeKind {
         self.theme
@@ -1752,14 +1762,7 @@ fn diagnostics_panel<S: SessionView>(
         ("视口帧", shell.painted_frames().to_string()),
         (
             "设置",
-            shell
-                .settings()
-                .and_then(|store| {
-                    store.lock().ok().and_then(|s| {
-                        s.path().map(|path| path.display().to_string())
-                    })
-                })
-                .unwrap_or_else(|| "未连接".to_string()),
+            shell.settings_path().unwrap_or_else(|| "未连接".to_string()),
         ),
         (
             "账号",
@@ -1803,12 +1806,7 @@ fn settings_panel<S: SessionView>(
 ) -> AnyElement {
     let p = palette(cx);
     let current = shell.theme();
-    let path = shell.settings().and_then(|store| {
-        store
-            .lock()
-            .ok()
-            .and_then(|settings| settings.path().map(|path| path.display().to_string()))
-    });
+    let path = shell.settings_path();
 
     let theme_button =
         |kind: ThemeKind, label: &'static str, cx: &mut Context<HarnessShell<S>>| {
