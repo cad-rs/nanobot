@@ -22,11 +22,12 @@ use std::sync::Mutex;
 use nanobot_boot::{Account, AccountProvider, EntitlementDecision, Settings};
 use serde_json::Value;
 
+use crate::base64;
 use crate::error::AuthError;
+use crate::now_ms;
 
 /// The endpoints and identity of one OAuth2 client. Plain data: the product
 /// fills it from its own configuration (a provider block, a const).
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OAuth2Config {
     pub client_id: String,
     /// The device-authorization endpoint (`/oauth/device/authorize`-shaped).
@@ -39,7 +40,6 @@ pub struct OAuth2Config {
 }
 
 /// What `begin` hands back: what the user sees and what the harness polls.
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceCode {
     pub device_code: String,
     /// The short code the user types at `verification_uri`.
@@ -56,7 +56,7 @@ pub struct DeviceCode {
 /// The outcome of one [`DeviceFlow::poll`] round. The caller loops:
 /// [`PollOutcome::Authorized`] ends the flow, the pending shapes mean "sleep
 /// `retry_after_ms`, then poll again", and the errors mean stop.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum PollOutcome {
     Authorized(TokenSet),
     /// The user has not finished yet.
@@ -69,7 +69,7 @@ pub enum PollOutcome {
 /// One grant's tokens. `id_token` is kept for the claims it carries
 /// (display identity); the framework never validates it — that happened at
 /// the TLS-protected token endpoint.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TokenSet {
     pub access_token: String,
     pub refresh_token: Option<String>,
@@ -83,32 +83,12 @@ impl TokenSet {
     /// The JWT `id_token`'s payload claims, decoded without verification
     /// (display only; see the type docs).
     pub fn id_token_claims(&self) -> Option<Value> {
-        let id_token = self.id_token.as_deref()?;
-        let payload = id_token.split('.').nth(1)?;
-        jwt_payload_json(payload)
+        let payload = self.id_token.as_deref()?.split('.').nth(1)?;
+        serde_json::from_slice(&base64::decode_urlsafe(payload)?).ok()
     }
 }
 
-/// A very small JWT-claim decoder: base64url (unpadded) to bytes to JSON.
-fn jwt_payload_json(payload: &str) -> Option<Value> {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = Vec::with_capacity(payload.len() * 3 / 4);
-    let mut buffer = 0_u32;
-    let mut bits = 0_u32;
-    for ch in payload.trim_end_matches('=').bytes() {
-        let value = TABLE.iter().position(|c| *c == ch)? as u32;
-        buffer = (buffer << 6) | value;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push(((buffer >> bits) & 0xff) as u8);
-        }
-    }
-    serde_json::from_slice(&out).ok()
-}
-
-/// The RFC 8628 transport. Cheap to clone; all methods take `&self`.
-#[derive(Clone)]
+/// The RFC 8628 transport. All methods take `&self`.
 pub struct DeviceFlow {
     config: OAuth2Config,
     http: reqwest::Client,
@@ -273,13 +253,6 @@ fn float_field(json: &Value, key: &str) -> Option<f64> {
     json.get(key)?.as_f64()
 }
 
-fn now_ms() -> u64 {
-    web_time::SystemTime::now()
-        .duration_since(web_time::SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 /// The [`AccountProvider`] over a device-flow token cache. Construction is
 /// network-free; a fresh provider is a signed-out provider.
 pub struct OAuth2Provider {
@@ -332,7 +305,9 @@ impl AccountProvider for OAuth2Provider {
             .and_then(Value::as_str)
             .unwrap_or(&subject)
             .to_string();
-        Some(Account::new(subject, display).with_expiry_opts(tokens.expires_at_ms))
+        let mut account = Account::new(subject, display);
+        account.expires_at_ms = tokens.expires_at_ms;
+        Some(account)
     }
 
     /// Allowed while a non-expired grant is cached. No network, ever.
@@ -353,18 +328,16 @@ impl AccountProvider for OAuth2Provider {
     }
 }
 
-/// Settings keys the token cache persists under, keyed by an account label
-/// (`auth.oauth.<label>.<field>`).
-mod keys {
-    pub const PREFIX: &str = "auth.oauth";
-    pub const ACCESS: &str = "access";
-    pub const REFRESH: &str = "refresh";
-    pub const EXPIRES: &str = "expires_at_ms";
-    pub const TOKEN_TYPE: &str = "token_type";
-    pub const ID_TOKEN: &str = "id_token";
+/// The settings key a token field persists under (`auth.oauth.<label>.<field>`).
+fn token_key(label: &str, field: &str) -> String {
+    format!("auth.oauth.{label}.{field}")
 }
 
-use keys::PREFIX;
+const ACCESS: &str = "access";
+const REFRESH: &str = "refresh";
+const EXPIRES: &str = "expires_at_ms";
+const TOKEN_TYPE: &str = "token_type";
+const ID_TOKEN: &str = "id_token";
 
 /// Persists the grant through the harness's settings store (opt-in: only the
 /// app layer knows whether a machine may keep secrets at rest). On Unix the
@@ -375,30 +348,30 @@ pub fn persist_tokens(
     tokens: &TokenSet,
 ) -> Result<(), String> {
     settings.set(
-        &format!("{PREFIX}.{label}.{}", keys::ACCESS),
+        &token_key(label, ACCESS),
         Value::String(tokens.access_token.clone()),
     )?;
     if let Some(refresh) = &tokens.refresh_token {
         settings.set(
-            &format!("{PREFIX}.{label}.{}", keys::REFRESH),
+        &token_key(label, REFRESH),
             Value::String(refresh.clone()),
         )?;
     }
     if let Some(expires) = tokens.expires_at_ms {
         settings.set(
-            &format!("{PREFIX}.{label}.{}", keys::EXPIRES),
+        &token_key(label, EXPIRES),
             Value::from(expires),
         )?;
     }
     if let Some(kind) = &tokens.token_type {
         settings.set(
-            &format!("{PREFIX}.{label}.{}", keys::TOKEN_TYPE),
+        &token_key(label, TOKEN_TYPE),
             Value::String(kind.clone()),
         )?;
     }
     if let Some(id_token) = &tokens.id_token {
         settings.set(
-            &format!("{PREFIX}.{label}.{}", keys::ID_TOKEN),
+        &token_key(label, ID_TOKEN),
             Value::String(id_token.clone()),
         )?;
     }
@@ -408,23 +381,23 @@ pub fn persist_tokens(
 
 /// Restores what [`persist_tokens`] stored, `None` when nothing is there.
 pub fn restore_tokens(settings: &Settings, label: &str) -> Option<TokenSet> {
-    let field = |name: &str| settings.get(&format!("{PREFIX}.{label}.{name}")).cloned();
-    let access = field(keys::ACCESS)?.as_str()?.to_string();
+    let field = |name: &str| settings.get(&token_key(label, name)).cloned();
+    let access = field(ACCESS)?.as_str()?.to_string();
     Some(TokenSet {
         access_token: access,
-        refresh_token: field(keys::REFRESH)
+        refresh_token: field(REFRESH)
             .and_then(|v| v.as_str().map(str::to_string)),
-        expires_at_ms: field(keys::EXPIRES).and_then(|v| v.as_u64()),
-        token_type: field(keys::TOKEN_TYPE)
+        expires_at_ms: field(EXPIRES).and_then(|v| v.as_u64()),
+        token_type: field(TOKEN_TYPE)
             .and_then(|v| v.as_str().map(str::to_string)),
-        id_token: field(keys::ID_TOKEN).and_then(|v| v.as_str().map(str::to_string)),
+        id_token: field(ID_TOKEN).and_then(|v| v.as_str().map(str::to_string)),
     })
 }
 
 /// Removes a persisted grant (sign-out).
 pub fn forget_tokens(settings: &mut Settings, label: &str) -> Result<(), String> {
-    for name in [keys::ACCESS, keys::REFRESH, keys::EXPIRES, keys::TOKEN_TYPE, keys::ID_TOKEN] {
-        settings.remove(&format!("{PREFIX}.{label}.{name}"))?;
+    for name in [ACCESS, REFRESH, EXPIRES, TOKEN_TYPE, ID_TOKEN] {
+        settings.remove(&token_key(label, name))?;
     }
     Ok(())
 }
@@ -442,16 +415,3 @@ fn tighten_file_mode(path: Option<&std::path::Path>) {
 }
 #[cfg(not(unix))]
 fn tighten_file_mode(_path: Option<&std::path::Path>) {}
-
-/// Small helper so [`OAuth2Provider::account`] reads flat.
-trait AccountExpiry {
-    fn with_expiry_opts(self, expires_at_ms: Option<u64>) -> Self;
-}
-impl AccountExpiry for Account {
-    fn with_expiry_opts(self, expires_at_ms: Option<u64>) -> Self {
-        match expires_at_ms {
-            Some(ms) => self.with_expiry_ms(ms),
-            None => self,
-        }
-    }
-}
