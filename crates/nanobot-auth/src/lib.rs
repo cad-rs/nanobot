@@ -13,12 +13,18 @@
 pub mod error;
 pub mod license;
 pub mod oauth;
+pub mod plugin;
 
 pub(crate) mod base64;
 
 pub use error::AuthError;
 pub use license::{
-    public_key_from_base64, public_key_to_base64, sign_license, License, LicenseProvider,
+    public_key_from_base64, public_key_to_base64, sign_license, sign_token, verify_token, License,
+    LicenseProvider,
+};
+pub use plugin::{
+    check_plugin_license, machine_fingerprint, sign_plugin_license, Ed25519PluginVerifier,
+    PluginClaims, PluginLicenseDecision, PluginLicenseVerifier, PLUGIN_LICENSE_FILE,
 };
 pub use oauth::{
     forget_tokens, persist_tokens, restore_tokens, DeviceCode, DeviceFlow, OAuth2Config,

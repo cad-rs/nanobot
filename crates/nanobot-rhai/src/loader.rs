@@ -118,10 +118,29 @@ pub fn load_one(dir: &Path) -> Result<(PluginManifest, RhaiProgram, Collected), 
     Ok((manifest, program, collected))
 }
 
+/// The license gate a plugin must pass before it loads: given the validated
+/// manifest and the plugin directory, `Err(reason)` rejects it.
+///
+/// A plugin that ships no license is open and passes any gate that allows
+/// it; a plugin that ships one must verify. The host supplies the gate —
+/// typically [`nanobot_auth::check_plugin_license`] over the vendor's
+/// verifying keys — so the plugin host stays free of keys and crypto.
+pub type PluginGate<'a> = &'a dyn Fn(&PluginManifest, &Path) -> Result<(), String>;
+
+/// Loads every plugin under `dirs` without license checking (an open plugin
+/// set). See [`load_all_with`].
+pub fn load_all(dirs: &[PathBuf]) -> LoadedPlugins {
+    load_all_with(dirs, &|_, _| Ok(()))
+}
+
 /// Loads every plugin under `dirs`, draining each entry point's declarations
 /// into one result. Duplicate ids are rejected individually so one plugin
 /// cannot silently shadow another's panel or command.
-pub fn load_all(dirs: &[PathBuf]) -> LoadedPlugins {
+///
+/// `gate` runs after the manifest validates and before the entry point
+/// compiles; a plugin it rejects lands in `plugins_rejected` with the reason,
+/// next to the other load failures.
+pub fn load_all_with(dirs: &[PathBuf], gate: PluginGate<'_>) -> LoadedPlugins {
     let mut loaded = LoadedPlugins::default();
     let mut plugin_ids = Vec::new();
     let mut panel_ids = Vec::new();
@@ -137,6 +156,10 @@ pub fn load_all(dirs: &[PathBuf]) -> LoadedPlugins {
                 continue;
             }
         };
+        if let Err(reason) = gate(&manifest, &dir) {
+            loaded.plugins_rejected.push((name, format!("license: {reason}")));
+            continue;
+        }
         if plugin_ids.contains(&manifest.plugin.id) {
             loaded.plugins_rejected.push((
                 name,
