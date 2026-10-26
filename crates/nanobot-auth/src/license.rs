@@ -64,12 +64,45 @@ pub fn public_key_to_base64(key: &VerifyingKey) -> String {
     base64::encode_urlsafe(&key.to_bytes())
 }
 
-/// Signs a license with the vendor key, returning the `<payload>.<signature>`
-/// token. The signing key never leaves the vendor's tooling.
+/// Signs any serializable payload, returning the `<payload>.<signature>`
+/// token. The one token format both the app license and the plugin license
+/// share; the signing key never leaves the vendor's tooling.
+pub fn sign_token<T: Serialize>(payload: &T, signing_key: &SigningKey) -> String {
+    let bytes = serde_json::to_vec(payload).expect("payload serializes");
+    let signature = signing_key.sign(&bytes);
+    format!(
+        "{}.{}",
+        base64::encode_urlsafe(&bytes),
+        base64::encode_urlsafe(&signature.to_bytes())
+    )
+}
+
+/// Verifies and decodes a [`sign_token`] token. A tampered payload, a
+/// transplanted signature, or a foreign key is an [`AuthError::Protocol`].
+pub fn verify_token<T: for<'de> Deserialize<'de>>(
+    token: &str,
+    public_key: &VerifyingKey,
+) -> Result<T, AuthError> {
+    let (payload_b64, signature_b64) = token
+        .split_once('.')
+        .ok_or_else(|| AuthError::Protocol("token is not <payload>.<signature>".into()))?;
+    let payload = base64::decode_urlsafe(payload_b64)
+        .ok_or_else(|| AuthError::Protocol("token payload is not base64url".into()))?;
+    let signature_bytes = base64::decode_urlsafe(signature_b64)
+        .ok_or_else(|| AuthError::Protocol("token signature is not base64url".into()))?;
+    let signature_bytes: [u8; 64] = signature_bytes
+        .try_into()
+        .map_err(|_| AuthError::Protocol("token signature must be 64 bytes".into()))?;
+    let signature = Signature::from_bytes(&signature_bytes);
+    public_key
+        .verify(&payload, &signature)
+        .map_err(|_| AuthError::Protocol("token signature does not verify".into()))?;
+    serde_json::from_slice(&payload).map_err(|e| AuthError::Protocol(format!("token payload: {e}")))
+}
+
+/// Signs an app license. The signing key never leaves the vendor's tooling.
 pub fn sign_license(license: &License, signing_key: &SigningKey) -> String {
-    let payload = serde_json::to_vec(license).expect("license serializes");
-    let signature = signing_key.sign(&payload);
-    format!("{}.{}", base64::encode_urlsafe(&payload), base64::encode_urlsafe(&signature.to_bytes()))
+    sign_token(license, signing_key)
 }
 
 /// A signed license held by one deployment: verified once at load, asked
@@ -89,24 +122,7 @@ impl LicenseProvider {
     pub fn load(data: &[u8], public_key: &VerifyingKey) -> Result<Self, AuthError> {
         let text = std::str::from_utf8(data)
             .map_err(|_| AuthError::Protocol("license is not utf-8".into()))?;
-        let text = text.trim();
-        let (payload_b64, signature_b64) = text
-            .split_once('.')
-            .ok_or_else(|| AuthError::Protocol("license is not <payload>.<signature>".into()))?;
-        let payload = base64::decode_urlsafe(payload_b64)
-            .ok_or_else(|| AuthError::Protocol("license payload is not base64url".into()))?;
-        let signature_bytes = base64::decode_urlsafe(signature_b64)
-            .ok_or_else(|| AuthError::Protocol("license signature is not base64url".into()))?;
-        let signature_bytes: [u8; 64] = signature_bytes
-            .try_into()
-            .map_err(|_| AuthError::Protocol("license signature must be 64 bytes".into()))?;
-        let signature = Signature::from_bytes(&signature_bytes);
-        public_key
-            .verify(&payload, &signature)
-            .map_err(|_| AuthError::Protocol("license signature does not verify".into()))?;
-
-        let license: License = serde_json::from_slice(&payload)
-            .map_err(|e| AuthError::Protocol(format!("license payload: {e}")))?;
+        let license: License = verify_token(text.trim(), public_key)?;
         if let Some(expires_at) = license.expires_at_ms {
             if now_ms() >= expires_at {
                 return Err(AuthError::Expired);

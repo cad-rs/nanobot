@@ -19,3 +19,8 @@ toml = { workspace = true }
 # have it, and gpui-rhai then fails to compile. Declare it here so the host
 # builds standalone and inside a product workspace alike.
 usvg = { workspace = true }
+
+[dev-dependencies]
+# The license-gate test wires the real ed25519 verifier.
+nanobot-auth = { workspace = true }
+ed25519-dalek.workspace = true
