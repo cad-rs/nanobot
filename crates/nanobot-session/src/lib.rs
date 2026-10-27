@@ -35,6 +35,7 @@
 pub mod event;
 pub mod persistence;
 pub mod projection;
+pub mod recovery;
 pub mod session;
 
 pub use event::{PlanProposal, SessionEvent, TurnEndReason, Usage};
@@ -43,4 +44,5 @@ pub use persistence::default_path;
 #[cfg(not(target_family = "wasm"))]
 pub use persistence::{load, save};
 pub use projection::{derive_messages, ProjectedMessage};
+pub use recovery::{DanglingCall, dangling_tool_calls};
 pub use session::{Disposable, LogEntry, NoopDisposable, Session};

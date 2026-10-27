@@ -25,21 +25,69 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use nanobot_agent::{Agent, PlanVerifier, ToolExecutor};
+use nanobot_agent::{Agent, PlanVerifier, ReplayOutcome, ToolExecutor};
 use nanobot_cordis::Context;
 use nanobot_llm::{LlmAdapter, LlmRuntime, OpenAiCompatibleAdapter, ScriptedAdapter};
 #[cfg(not(target_family = "wasm"))]
 use nanobot_session::persistence;
-use nanobot_session::{Session, SessionEvent};
+use nanobot_session::{DanglingCall, Session, SessionEvent, dangling_tool_calls};
 use nanobot_skills::{PromptAssemble, SkillManifest, SkillRunner};
 use nanobot_telemetry::TelemetryContext;
-use nanobot_tools::{ApprovalPolicy, AutoApprovalPolicy, DenyAllPolicy, ToolDefinition, ToolPipeline, ToolRegistry, UiApprovalPolicy};
+use nanobot_tools::{
+    ApprovalPolicy, AutoApprovalPolicy, DenyAllPolicy, ToolContract, ToolDefinition, ToolPipeline,
+    ToolRegistry, UiApprovalPolicy,
+};
 
 use crate::account::{Account, AccountProvider, AnonymousProvider, EntitlementDecision, SharedAccountProvider, TURN_CAPABILITY};
 use crate::container::ProjectPaths;
 use crate::error::BootError;
 use crate::harness_toml::{ApprovalMode, HarnessProfile};
 use crate::settings::{Settings, SETTINGS_FILE};
+
+/// Whether re-running an interrupted call is safe.
+///
+/// Read-only and ungated. A mutating call could double-apply whatever the
+/// crashed run already did, and a gated call cannot re-obtain the approval the
+/// crash lost. A call whose tool is gone cannot be replayed at all.
+fn replay_is_safe(registry: &ToolRegistry, call: &DanglingCall) -> Result<(), String> {
+    let definition = registry
+        .get(&call.name)
+        .ok_or_else(|| format!("tool `{}` is no longer registered", call.name))?;
+    if definition.requires_approval {
+        return Err(format!(
+            "tool `{}` requires approval, which a replay cannot re-obtain",
+            call.name
+        ));
+    }
+    if !matches!(definition.contract, ToolContract::ReadOnly) {
+        return Err(format!(
+            "tool `{}` mutates state; re-running it could double-apply",
+            call.name
+        ));
+    }
+    Ok(())
+}
+
+/// Answer a dangling call as unknown, so the log is a valid turn again.
+///
+/// The model can see that the call never returned and re-issue it.
+fn record_unknown_outcome(session: &Session, call: &DanglingCall, reason: &str) {
+    session.append(SessionEvent::ToolResult {
+        id: call.id.clone(),
+        success: false,
+        output: serde_json::json!({
+            "ok": false,
+            "error": {
+                "code": "interrupted",
+                "detail": "the previous run was interrupted before this call returned, so its \
+                           result is unknown; re-issue it",
+                "reason": reason,
+            }
+        })
+        .to_string(),
+        topology_signature: None,
+    });
+}
 
 /// The marker [`Drop`] writes into the conversation directory. Its absence
 /// at the next `build()` — with a log present — is what
@@ -64,7 +112,50 @@ pub struct Harness {
     has_tool_executor: bool,
     notes: Vec<String>,
     recovered: bool,
+    /// Calls a crash left unanswered that are safe to replay, waiting for the
+    /// caller to drive them (`resume()`).
+    pending_resume: Mutex<Vec<PendingResume>>,
+    /// How recovery resolved every dangling call it found.
+    repaired: Mutex<Vec<RepairedCall>>,
 }
+
+/// A crash-interrupted tool call that recovery decided to replay.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingResume {
+    /// The call id the missing `ToolResult` would have carried.
+    pub id: String,
+    /// The tool the call named.
+    pub name: String,
+    /// The arguments the model sent.
+    pub arguments: serde_json::Value,
+    /// The log position of the original call.
+    pub seq: u32,
+}
+
+/// How recovery resolved one dangling call.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RepairedCall {
+    /// Replayed and answered.
+    Replayed {
+        /// The call id.
+        id: String,
+        /// Whether the tool reported success.
+        success: bool,
+    },
+    /// Could not be safely replayed, so its outcome was recorded as unknown.
+    Unknown {
+        /// The call id.
+        id: String,
+        /// Why it was not replayed.
+        reason: String,
+    },
+}
+
+/// How many interrupted calls one recovery may replay.
+///
+/// A bound, because replaying is re-execution: a session that somehow reports
+/// many dangling calls must not turn recovery into a long silent run.
+pub const RESUME_BUDGET: usize = 3;
 
 impl Harness {
     /// Starts a builder with the built-in defaults.
@@ -168,6 +259,58 @@ impl Harness {
     /// into the session by `build()`.
     pub fn crash_recovered(&self) -> bool {
         self.recovered
+    }
+
+    /// Whether the previous run left tool calls that are safe to replay.
+    ///
+    /// A dangling call makes the log an invalid turn for every provider, so
+    /// recovery resolves *all* of them: the safe ones are queued here, the rest
+    /// are answered as unknown immediately. The caller decides when to drain
+    /// the queue, because driving a run has to happen wherever the output is
+    /// rendered.
+    pub fn has_pending_resume(&self) -> bool {
+        !self.pending_resume.lock().unwrap().is_empty()
+    }
+
+    /// The calls waiting to be replayed.
+    pub fn pending_resume(&self) -> Vec<PendingResume> {
+        self.pending_resume.lock().unwrap().clone()
+    }
+
+    /// How recovery resolved each dangling call it found.
+    pub fn repaired_calls(&self) -> Vec<RepairedCall> {
+        self.repaired.lock().unwrap().clone()
+    }
+
+    /// Replay the queued calls, answering each in the log.
+    ///
+    /// Returns how many ran. The queue drains: a call that could not be
+    /// replayed is logged as refused rather than left pending.
+    pub fn resume(&self) -> usize {
+        let pending: Vec<PendingResume> = {
+            let mut queue = self.pending_resume.lock().unwrap();
+            std::mem::take(&mut *queue)
+        };
+
+        let mut replayed = 0;
+        for call in pending {
+            let outcome = self.agent.replay_call(&call.id, &call.name, &call.arguments);
+            let repaired = match outcome {
+                ReplayOutcome::Replayed { success, .. } => {
+                    replayed += 1;
+                    RepairedCall::Replayed {
+                        id: call.id,
+                        success,
+                    }
+                }
+                ReplayOutcome::Unknown => RepairedCall::Unknown {
+                    id: call.id,
+                    reason: "the call was refused during replay".to_string(),
+                },
+            };
+            self.repaired.lock().unwrap().push(repaired);
+        }
+        replayed
     }
 
     /// The conversation directory's clean marker path (`None` without
@@ -589,6 +732,59 @@ impl HarnessBuilder {
                 .unwrap_or(base)
         });
 
+        // Resolve the calls a crash left unanswered. This runs after the
+        // registry exists (the safety decision reads it) and after persistence
+        // attaches (the repair appends are written).
+        //
+        // Every dangling call must be answered: a call without its result makes
+        // the log an invalid turn for every provider, so the next request
+        // would be rejected. The safe ones wait for the caller to replay them;
+        // the rest are answered as unknown right now.
+        let mut pending_resume = Vec::new();
+        let mut repaired = Vec::new();
+        if recovered {
+            for call in dangling_tool_calls(&agent.session().events()) {
+                let safe = replay_is_safe(&registry, &call);
+                match safe {
+                    Ok(()) if pending_resume.len() < RESUME_BUDGET => {
+                        pending_resume.push(PendingResume {
+                            id: call.id.clone(),
+                            name: call.name.clone(),
+                            arguments: call.arguments.clone(),
+                            seq: call.seq,
+                        });
+                        notes.push(format!(
+                            "interrupted call `{}` ({}) is safe to replay; call `resume()`",
+                            call.name, call.id
+                        ));
+                    }
+                    Ok(()) => {
+                        let reason = format!(
+                            "the resume budget of {RESUME_BUDGET} is spent, so it was not replayed"
+                        );
+                        record_unknown_outcome(agent.session(), &call, &reason);
+                        repaired.push(RepairedCall::Unknown {
+                            id: call.id.clone(),
+                            reason,
+                        });
+                    }
+                    Err(reason) => {
+                        record_unknown_outcome(agent.session(), &call, &reason);
+                        repaired.push(RepairedCall::Unknown {
+                            id: call.id.clone(),
+                            reason,
+                        });
+                    }
+                }
+            }
+            if !repaired.is_empty() {
+                notes.push(format!(
+                    "{} interrupted call(s) recorded as unknown; re-issue them",
+                    repaired.len()
+                ));
+            }
+        }
+
         Ok(Harness {
             agent,
             skills: skills_runner,
@@ -604,6 +800,8 @@ impl HarnessBuilder {
             has_tool_executor,
             notes,
             recovered,
+            pending_resume: Mutex::new(pending_resume),
+            repaired: Mutex::new(repaired),
         })
     }
 }
@@ -917,6 +1115,19 @@ mod tests {
         }
     }
 
+    /// Counts invocations, for the crash-recovery replay assertions.
+    #[derive(Default)]
+    struct CountingExecutor {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ToolExecutor for CountingExecutor {
+        fn execute(&self, _name: &str, _arguments: &serde_json::Value) -> String {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            "{}".to_string()
+        }
+    }
+
     #[test]
     fn a_rejected_skill_is_skipped_not_fatal() {
         use nanobot_skills::{SkillDefinition, SkillManifest, SkillPackage};
@@ -950,5 +1161,202 @@ mod tests {
             !harness.assembly_notes().is_empty(),
             "the rejected skill is reported in the notes"
         );
+    }
+    // -- crash recovery: the calls a crash left unanswered --
+
+    /// Write a log by hand: a crash mid-call is not something the happy path
+    /// produces, so the fixture writes the events a crashed run would have left.
+    fn write_log(dir: &Path, events: Vec<SessionEvent>) {
+        let entries: Vec<nanobot_session::LogEntry> = events
+            .into_iter()
+            .enumerate()
+            .map(|(index, event)| nanobot_session::LogEntry {
+                seq: index as u32,
+                timestamp_ms: 0,
+                event,
+            })
+            .collect();
+        std::fs::create_dir_all(dir).expect("the conversation directory");
+        nanobot_session::save(&dir.join("events.jsonl"), &entries).expect("write the log");
+    }
+
+    fn tool(name: &str, contract: ToolContract, requires_approval: bool) -> ToolDefinition {
+        ToolDefinition {
+            name: name.to_string(),
+            description: "a test tool".to_string(),
+            parameters_schema: serde_json::json!({"type": "object"}),
+            requires_approval,
+            contract,
+            validate_args: false,
+        }
+    }
+
+    fn tool_results(harness: &Harness) -> Vec<String> {
+        harness
+            .agent
+            .session()
+            .events()
+            .into_iter()
+            .filter_map(|entry| match entry.event {
+                SessionEvent::ToolResult { output, .. } => Some(output),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn dangling(harness: &Harness) -> usize {
+        nanobot_session::dangling_tool_calls(&harness.agent.session().events()).len()
+    }
+
+    fn crashed_call(id: &str, name: &str) -> SessionEvent {
+        SessionEvent::ToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            arguments: serde_json::json!({}),
+            seq: 3,
+        }
+    }
+
+    #[test]
+    fn a_mutating_call_is_answered_as_unknown_on_recovery() {
+        let paths = scratch("recover-mutating");
+        let session_id = "sess-recover-mutating";
+        write_log(
+            &paths.conversation(session_id),
+            vec![
+                SessionEvent::TurnStart { turn: 0 },
+                SessionEvent::StepStart { turn: 0, step: 0 },
+                SessionEvent::UserMessage {
+                    content: "build it".to_string(),
+                    selection_ref: None,
+                },
+                crashed_call("c1", "build_sfq"),
+            ],
+        );
+
+        let harness = Harness::builder()
+            .with_session_id(session_id)
+            .with_project_paths(paths)
+            .with_tool_definitions(vec![tool("build_sfq", ToolContract::Mutating, true)])
+            .build()
+            .expect("assembly");
+
+        assert!(harness.crash_recovered());
+        assert!(
+            !harness.has_pending_resume(),
+            "a mutating, gated call must not be queued for replay"
+        );
+        assert_eq!(harness.repaired_calls().len(), 1);
+        assert!(
+            dangling(&harness) == 0,
+            "the log is a valid turn again: the call has an answer"
+        );
+        assert!(
+            tool_results(&harness)[0].contains("interrupted"),
+            "the answer says the result is unknown"
+        );
+    }
+
+    #[test]
+    fn a_read_only_call_is_queued_and_replayed_on_resume() {
+        let paths = scratch("recover-read-only");
+        let session_id = "sess-recover-read-only";
+        write_log(
+            &paths.conversation(session_id),
+            vec![
+                SessionEvent::TurnStart { turn: 0 },
+                SessionEvent::StepStart { turn: 0, step: 0 },
+                crashed_call("c1", "get_device_catalog"),
+            ],
+        );
+
+        let executor = Arc::new(CountingExecutor::default());
+        let harness = Harness::builder()
+            .with_session_id(session_id)
+            .with_project_paths(paths)
+            .with_tool_definitions(vec![tool(
+                "get_device_catalog",
+                ToolContract::ReadOnly,
+                false,
+            )])
+            .with_tool_executor(executor.clone())
+            .build()
+            .expect("assembly");
+
+        assert!(
+            harness.has_pending_resume(),
+            "a read-only call waits to be replayed"
+        );
+        assert_eq!(dangling(&harness), 1, "it is not answered until resume() runs");
+        assert_eq!(
+            harness.pending_resume()[0].name, "get_device_catalog",
+            "the queued call names the tool"
+        );
+
+        assert_eq!(harness.resume(), 1, "one call replayed");
+        assert_eq!(
+            executor.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(dangling(&harness), 0, "the replay answered it");
+        assert!(!harness.has_pending_resume(), "the queue drained");
+    }
+
+    #[test]
+    fn the_resume_budget_bounds_the_queue() {
+        let paths = scratch("recover-budget");
+        let session_id = "sess-recover-budget";
+        let mut events = vec![
+            SessionEvent::TurnStart { turn: 0 },
+            SessionEvent::StepStart { turn: 0, step: 0 },
+        ];
+        for index in 0..(RESUME_BUDGET + 2) {
+            events.push(crashed_call(&format!("c{index}"), "get_device_catalog"));
+        }
+        write_log(&paths.conversation(session_id), events);
+
+        let executor = Arc::new(CountingExecutor::default());
+        let harness = Harness::builder()
+            .with_session_id(session_id)
+            .with_project_paths(paths)
+            .with_tool_definitions(vec![tool(
+                "get_device_catalog",
+                ToolContract::ReadOnly,
+                false,
+            )])
+            .with_tool_executor(executor.clone())
+            .build()
+            .expect("assembly");
+
+        assert_eq!(
+            harness.pending_resume().len(),
+            RESUME_BUDGET,
+            "the queue is bounded by the resume budget"
+        );
+        assert_eq!(
+            harness.repaired_calls().len(),
+            2,
+            "the calls past the budget are answered as unknown"
+        );
+        // The budgeted calls stay open until the caller replays them.
+        assert_eq!(dangling(&harness), RESUME_BUDGET);
+        assert_eq!(harness.resume(), RESUME_BUDGET);
+        assert_eq!(
+            executor.calls.load(std::sync::atomic::Ordering::SeqCst),
+            RESUME_BUDGET
+        );
+        assert_eq!(dangling(&harness), 0, "the replay resolved the rest");
+    }
+
+    #[test]
+    fn a_clean_log_repairs_nothing() {
+        // A normal exit writes the clean marker, so nothing is recovered.
+        let harness = Harness::builder()
+            .with_session_id("sess-clean")
+            .build()
+            .expect("assembly");
+        assert!(!harness.crash_recovered());
+        assert!(!harness.has_pending_resume());
+        assert!(harness.repaired_calls().is_empty());
     }
 }
