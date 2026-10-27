@@ -34,7 +34,8 @@ pub mod job;
 pub mod plan;
 
 pub use agent::{
-    Agent, AgentState, PlanVerifier, RestorePoint, ToolExecutor, WriteCheck, WriteOutcome,
+    Agent, AgentState, PlanVerifier, ReplayOutcome, RestorePoint, ToolExecutor, WriteCheck,
+    WriteOutcome,
 };
 pub use batch::{Axis, BatchOutcome, BatchSpec, Variant, VariantOutcome};
 pub use cancellation::CancellationToken;

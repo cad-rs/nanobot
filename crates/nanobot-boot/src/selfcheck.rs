@@ -134,6 +134,28 @@ pub fn checks(harness: &Harness) -> Vec<Check> {
         ));
     }
 
+    // 7. Recovery repair (probe: only when the previous run crashed). A tool
+    //    call without its result makes the log an invalid turn for every
+    //    provider, so a recovered session must have none left.
+    if harness.crash_recovered() {
+        let dangling =
+            nanobot_session::dangling_tool_calls(&harness.agent.session().events()).len();
+        checks.push(Check::new(
+            "崩溃恢复: 悬空调用已了结",
+            dangling == 0,
+            format!(
+                "dangling={dangling} repaired={} pending_replay={}",
+                harness.repaired_calls().len(),
+                harness.pending_resume().len()
+            ),
+        ));
+    } else {
+        checks.push(Check::skip(
+            "崩溃恢复: 悬空调用已了结",
+            "上次运行正常结束（无恢复）",
+        ));
+    }
+
     checks
 }
 

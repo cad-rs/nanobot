@@ -153,6 +153,22 @@ pub enum AgentState {
     Cancelled,
 }
 
+/// What happened when a crash-interrupted call was replayed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReplayOutcome {
+    /// The call ran again. `success` is what the tool reported.
+    Replayed {
+        /// Whether the tool reported success.
+        success: bool,
+        /// The tool's reply.
+        output: String,
+    },
+    /// The call could not be replayed (no executor, or the pipeline refused
+    /// it). Its outcome is recorded as unknown so the session is still a valid
+    /// turn.
+    Unknown,
+}
+
 /// The agent handle: primary interface for driving the agent loop.
 ///
 /// `Agent` is `Clone` (Arc internals). It is `Send + Sync`.
@@ -737,6 +753,134 @@ impl Agent {
         });
     }
 
+    /// Run a tool call that cleared the gate, and log the call and its result.
+    ///
+    /// Shared by the turn loop and by crash-recovery replay, so a replayed call
+    /// is logged exactly like one the model just asked for.
+    fn execute_and_log(
+        &self,
+        executor: &Arc<dyn ToolExecutor>,
+        id: &str,
+        name: &str,
+        args: &serde_json::Value,
+        seq: u32,
+    ) -> (bool, String) {
+        // Announce the check, then execute the tool call under its contract. A
+        // rejected write has already been rolled back, so the document carries
+        // no trace of it.
+        let check_id = format!("write:{name}");
+        self.inner
+            .session
+            .append(SessionEvent::CheckRun { check_id: check_id.clone() });
+
+        let outcome = executor.apply(name, args);
+        self.inner.session.append(SessionEvent::ToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            arguments: args.clone(),
+            seq,
+        });
+
+        let success = outcome.accepted && !outcome.reply.contains("\"ok\":false");
+        // Post-execute waterfall (design 14.1): lightweight verification hook
+        // after the tool has run.
+        let post = self.inner.tools.post_execute(name, &outcome.reply);
+        let (output, check_details) = if outcome.accepted {
+            match post {
+                nanobot_tools::PostExecuteResult::Accept => {
+                    (outcome.reply.clone(), outcome.summary())
+                }
+                nanobot_tools::PostExecuteResult::Replace(v) => (v, outcome.summary()),
+                nanobot_tools::PostExecuteResult::Block(reason) => (
+                    serde_json::json!({"ok":false,"error":{"code":"post_blocked","detail":reason}})
+                        .to_string(),
+                    outcome.summary(),
+                ),
+            }
+        } else {
+            // The write was rolled back; tell the model why.
+            let failures: Vec<String> = outcome
+                .failures()
+                .map(|f| format!("{}: {}", f.invariant, f.detail))
+                .collect();
+            let detail = failures.join("; ");
+            let output = serde_json::json!({
+                "ok": false,
+                "error": { "code": "write_rejected", "detail": detail }
+            })
+            .to_string();
+            (output, outcome.summary())
+        };
+        self.inner.session.append(SessionEvent::ToolResult {
+            id: id.to_string(),
+            success,
+            output: output.clone(),
+            topology_signature: None,
+        });
+
+        // The verdict lands in the check panel (the app projects `CheckResult`
+        // into its check items).
+        self.inner.session.append(SessionEvent::CheckResult {
+            check_id,
+            passed: outcome.accepted,
+            // The invariants the gate recorded, in full: this is what lets a
+            // check panel or an agent filter on the failing invariant instead of
+            // reading the summary.
+            payload: Some(serde_json::json!({
+                "invariants": outcome
+                    .checks
+                    .iter()
+                    .map(|check| serde_json::json!({
+                        "invariant": check.invariant,
+                        "passed": check.passed,
+                        "detail": check.detail,
+                    }))
+                    .collect::<Vec<_>>(),
+            })),
+            details: check_details,
+        });
+
+        (success, output)
+    }
+
+    /// Re-execute a tool call the log recorded but never answered.
+    ///
+    /// Crash recovery: a call whose result was lost to a crash is re-run when
+    /// the harness judged it safe to replay, and its answer is appended so the
+    /// session is a valid turn again. The call goes through the same gate as a
+    /// live one, so a refusal is logged rather than silently skipped.
+    pub fn replay_call(
+        &self,
+        id: &str,
+        name: &str,
+        arguments: &serde_json::Value,
+    ) -> ReplayOutcome {
+        let seq = self.inner.session.next_seq();
+        match self.inner.tools.pre_execute(name, arguments) {
+            nanobot_tools::PreExecuteResult::Allow(args) => {
+                let executor = self.inner.tool_executor.lock().unwrap().clone();
+                let Some(executor) = executor else {
+                    self.log_unexecuted_call(
+                        id,
+                        name,
+                        arguments,
+                        seq,
+                        "no_executor",
+                        "no tool executor is wired",
+                    );
+                    return ReplayOutcome::Unknown;
+                };
+                let (success, output) = self.execute_and_log(&executor, id, name, &args, seq);
+                ReplayOutcome::Replayed { success, output }
+            }
+            nanobot_tools::PreExecuteResult::Deny(reason)
+            | nanobot_tools::PreExecuteResult::Ask(reason) => {
+                self.log_unexecuted_call(id, name, arguments, seq, "tool_denied", &reason);
+                ReplayOutcome::Unknown
+            }
+        }
+    }
+
     /// Grade the plan awaiting verification and finalize it.
     ///
     /// The verdict lands in the check panel as `CheckRun`/`CheckResult`
@@ -1193,83 +1337,7 @@ impl Agent {
                             }
                         }
 
-                        // Announce the check, then execute the tool call under
-                        // its contract. A rejected write has already been
-                        // rolled back, so the document carries no trace of it.
-                        let check_id = format!("write:{}", tc.name);
-                        self.inner.session.append(SessionEvent::CheckRun {
-                            check_id: check_id.clone(),
-                        });
-
-                        let outcome = executor.apply(&tc.name, &args);
-                        self.inner.session.append(SessionEvent::ToolCall {
-                            id: tc.id.clone(),
-                            name: tc.name.clone(),
-                            arguments: args.clone(),
-                            seq,
-                        });
-
-                        let success = outcome.accepted && !outcome.reply.contains("\"ok\":false");
-                        // Post-execute waterfall (design 14.1): lightweight
-                        // verification hook after the tool has run.
-                        let post = self.inner.tools.post_execute(&tc.name, &outcome.reply);
-                        let (output, check_details) = if outcome.accepted {
-                            match post {
-                                nanobot_tools::PostExecuteResult::Accept => {
-                                    (outcome.reply.clone(), outcome.summary())
-                                }
-                                nanobot_tools::PostExecuteResult::Replace(v) => {
-                                    (v, outcome.summary())
-                                }
-                                nanobot_tools::PostExecuteResult::Block(reason) => {
-                                    (serde_json::json!({"ok":false,"error":{"code":"post_blocked","detail":reason}}).to_string(), outcome.summary())
-                                }
-                            }
-                        } else {
-                            // The write was rolled back; tell the model why.
-                            let failures: Vec<String> = outcome
-                                .failures()
-                                .map(|f| format!("{}: {}", f.invariant, f.detail))
-                                .collect();
-                            let detail = failures.join("; ");
-                            let output = serde_json::json!({
-                                "ok": false,
-                                "error": {
-                                    "code": "write_rejected",
-                                    "detail": detail
-                                }
-                            })
-                            .to_string();
-                            (output, outcome.summary())
-                        };
-                        self.inner.session.append(SessionEvent::ToolResult {
-                            id: tc.id.clone(),
-                            success,
-                            output,
-                            topology_signature: None,
-                        });
-
-                        // The verdict lands in the check panel (the app
-                        // projects `CheckResult` into its check items).
-                        self.inner.session.append(SessionEvent::CheckResult {
-                            check_id,
-                            passed: outcome.accepted,
-                            // The invariants the gate recorded, in full: this is
-                            // what lets a check panel or an agent filter on the
-                            // failing invariant instead of reading the summary.
-                            payload: Some(serde_json::json!({
-                                "invariants": outcome
-                                    .checks
-                                    .iter()
-                                    .map(|check| serde_json::json!({
-                                        "invariant": check.invariant,
-                                        "passed": check.passed,
-                                        "detail": check.detail,
-                                    }))
-                                    .collect::<Vec<_>>(),
-                            })),
-                            details: check_details,
-                        });
+                        let _ = self.execute_and_log(&executor, &tc.id, &tc.name, &args, seq);
                     }
                 }
 
