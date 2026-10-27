@@ -44,23 +44,11 @@ impl Inbox {
         self.next_step.lock().unwrap().pop_front()
     }
 
-    /// Check whether there are pending turn messages.
-    pub fn has_turn(&self) -> bool {
-        !self.next_turn.lock().unwrap().is_empty()
-    }
 
     /// Check whether there are pending step messages.
     pub fn has_step(&self) -> bool {
         !self.next_step.lock().unwrap().is_empty()
     }
 
-    /// Get the number of pending turn messages.
-    pub fn turn_len(&self) -> usize {
-        self.next_turn.lock().unwrap().len()
-    }
 
-    /// Get the number of pending step messages.
-    pub fn step_len(&self) -> usize {
-        self.next_step.lock().unwrap().len()
-    }
 }

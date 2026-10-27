@@ -173,7 +173,7 @@ impl AccountProvider for LicenseProvider {
 
     fn check(&self, capability: &str) -> EntitlementDecision {
         if let Some(expires_at) = self.license.expires_at_ms {
-            if self.now() >= expires_at {
+            if nanobot_boot::account::is_expired(self.license.expires_at_ms, self.now()) {
                 return EntitlementDecision::Denied {
                     reason: format!("license `{}` expired at {expires_at} ms", self.license.license_id),
                 };

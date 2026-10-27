@@ -150,13 +150,24 @@ impl StaticProvider {
     }
 
     fn now(&self) -> u64 {
-        self.now_ms.unwrap_or_else(|| {
-            web_time::SystemTime::now()
-                .duration_since(web_time::SystemTime::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0)
-        })
+        self.now_ms.unwrap_or_else(now_ms)
     }
+}
+
+/// The wall clock, in milliseconds since the Unix epoch.
+pub fn now_ms() -> u64 {
+    web_time::SystemTime::now()
+        .duration_since(web_time::SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Whether an entitlement expiring at `expires_at_ms` is still valid.
+///
+/// `None` means it never expires. Every account, license, token and plugin
+/// verifier asks the same question, so it lives once.
+pub fn is_expired(expires_at_ms: Option<u64>, now_ms: u64) -> bool {
+    expires_at_ms.is_some_and(|expires_at| now_ms >= expires_at)
 }
 
 impl AccountProvider for StaticProvider {
@@ -166,7 +177,7 @@ impl AccountProvider for StaticProvider {
 
     fn check(&self, capability: &str) -> EntitlementDecision {
         if let Some(expires_at) = self.account.expires_at_ms {
-            if self.now() >= expires_at {
+            if is_expired(self.account.expires_at_ms, self.now()) {
                 return EntitlementDecision::Denied {
                     reason: format!(
                         "account `{}` expired at {expires_at} ms",

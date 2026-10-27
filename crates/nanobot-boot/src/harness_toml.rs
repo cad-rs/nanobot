@@ -53,14 +53,6 @@ impl ApprovalMode {
             _ => None,
         }
     }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ApprovalMode::Auto => "auto",
-            ApprovalMode::DenyAll => "deny-all",
-            ApprovalMode::Ui => "ui",
-        }
-    }
 }
 
 /// Provider descriptor from the optional `[provider]` section.

@@ -31,11 +31,7 @@ pub use oauth::{
     OAuth2Provider, PollOutcome, TokenSet,
 };
 
-/// The unix clock (ms) both backends read for expiry decisions. web-time
-/// keeps wasm builds working.
+/// The unix clock (ms) both backends read for expiry decisions.
 pub(crate) fn now_ms() -> u64 {
-    web_time::SystemTime::now()
-        .duration_since(web_time::SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    nanobot_boot::account::now_ms()
 }

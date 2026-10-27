@@ -49,7 +49,7 @@ pub use account::{
 };
 pub use cli::{Cli, CliMode};
 pub use container::{
-    validate_relative_path, ChecksumState, Manifest, PackageRef, PackageSelection, Project,
+    validate_relative_path, ChecksumState, Manifest, Project,
     ProjectInfo, ProjectPaths, SessionEntry, SessionIndex, SessionStatus, STATE_DIR,
     MANIFEST_FILE,
 };

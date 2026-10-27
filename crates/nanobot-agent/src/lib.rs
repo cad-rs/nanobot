@@ -4,8 +4,7 @@
 //! - `Agent` handle — `followup` / `steer` / `inject` / `cancel` / `run`
 //! - `Inbox` — dual-queue message buffer (next-turn + next-step)
 //! - `Plan` — eventized plan state machine
-//! - `CancellationToken` — per-turn cancellation
-//! - `JobQueue` — work that outlives a turn (multi-fidelity verification)
+//! - `JobQueue` — work that outlives a turn, wired by the product's job plane
 //!
 //! The agent loop drives the turn/step cycle:
 //! ```text
@@ -27,8 +26,6 @@
 //! event log, making the log the single source of truth for plan state.
 
 pub mod agent;
-pub mod batch;
-pub mod cancellation;
 pub mod inbox;
 pub mod job;
 pub mod plan;
@@ -37,8 +34,6 @@ pub use agent::{
     Agent, AgentState, PlanVerifier, ReplayOutcome, RestorePoint, ToolExecutor, WriteCheck,
     WriteOutcome, DEFAULT_COMPACTION_THRESHOLD,
 };
-pub use batch::{Axis, BatchOutcome, BatchSpec, Variant, VariantOutcome};
-pub use cancellation::CancellationToken;
 pub use inbox::Inbox;
 pub use job::{Job, JobContext, JobEvent, JobQueue, JobResult, JobRunner, JobSpec, JobState};
 pub use plan::{Plan, PlanState};

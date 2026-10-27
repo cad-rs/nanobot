@@ -626,109 +626,9 @@ impl Agent {
         self.inner.state.lock().unwrap().clone()
     }
 
-    /// Get the current plan state, if a plan is active.
-    pub fn current_plan_state(&self) -> Option<PlanState> {
-        self.inner
-            .current_plan
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|p| p.state)
-    }
-
-    /// Accept the current plan: keep the work and close the plan
-    /// (design-harness 14.3, the decision bar's Accept).
-    ///
-    /// Emits `PlanAccepted`. Returns whether a plan was open.
-    pub fn accept_plan(&self) -> bool {
-        let plan_id = {
-            let mut guard = self.inner.current_plan.lock().unwrap();
-            match guard.as_mut() {
-                Some(p) => {
-                    let id = p.plan_id.clone();
-                    *guard = None;
-                    id
-                }
-                None => return false,
-            }
-        };
-
-        self.inner
-            .session
-            .append(SessionEvent::PlanAccepted { plan_id });
-        *self.inner.plan_checkpoint.lock().unwrap() = None;
-        *self.inner.plan_start_seq.lock().unwrap() = None;
-        true
-    }
-
-    /// Reject the current plan: roll the work back and close the plan
-    /// (design-harness 14.3, the decision bar's Reject).
-    ///
-    /// The document is restored to the plan's starting checkpoint and the log
-    /// is rewound to the plan's starting seq, so the rolled-back work leaves
-    /// the model's projected history too. Emits `PlanRejected`, which *is*
-    /// model-visible — the model needs to know the plan was rejected and why.
-    ///
-    /// Returns whether a plan was open.
-    pub fn reject_plan(&self, reason: impl Into<String>) -> bool {
-        let plan_id = {
-            let mut guard = self.inner.current_plan.lock().unwrap();
-            match guard.as_mut() {
-                Some(p) => {
-                    let id = p.plan_id.clone();
-                    *guard = None;
-                    id
-                }
-                None => return false,
-            }
-        };
-
-        // Rewind the document first, then the log: the truncation drops the
-        // tool-call events whose effects the restore just undid.
-        if let Some(checkpoint) = self.inner.plan_checkpoint.lock().unwrap().take() {
-            if let Some(executor) = self.inner.tool_executor.lock().unwrap().as_ref() {
-                executor.restore(checkpoint);
-            }
-        }
-        if let Some(seq) = self.inner.plan_start_seq.lock().unwrap().take() {
-            self.inner.session.truncate_to(seq);
-        }
-
-        self.inner.session.append(SessionEvent::PlanRejected {
-            plan_id,
-            reason: reason.into(),
-        });
-        true
-    }
-
-    /// Send the current plan back to `Drafting`, keeping its context
-    /// (design-harness 14.3, the decision bar's Modify).
-    ///
-    /// The next `propose_plan` replaces it. Returns whether a plan was open.
-    pub fn modify_plan(&self) -> bool {
-        let mut guard = self.inner.current_plan.lock().unwrap();
-        match guard.as_mut() {
-            Some(p) => {
-                p.restart_drafting();
-                true
-            }
-            None => false,
-        }
-    }
-
     /// Send a followup message that will start a new turn.
     pub fn followup(&self, message: impl Into<String>) {
         self.inner.inbox.push_turn(message.into());
-    }
-
-    /// Send a steering message that will inject into the current step.
-    pub fn steer(&self, message: impl Into<String>) {
-        self.inner.inbox.push_step(message.into());
-    }
-
-    /// Inject a raw session event.
-    pub fn inject(&self, event: SessionEvent) {
-        self.inner.session.append(event);
     }
 
     /// Cancel the current turn.
@@ -760,7 +660,6 @@ impl Agent {
         let proposal = nanobot_session::PlanProposal {
             plan_id: plan.plan_id.clone(),
             summary: plan.summary.clone(),
-            steps: plan.steps.clone(),
         };
 
         self.inner
@@ -911,7 +810,6 @@ impl Agent {
                 nanobot_tools::PostExecuteResult::Accept => {
                     (outcome.reply.clone(), outcome.summary())
                 }
-                nanobot_tools::PostExecuteResult::Replace(v) => (v, outcome.summary()),
                 nanobot_tools::PostExecuteResult::Block(reason) => (
                     serde_json::json!({"ok":false,"error":{"code":"post_blocked","detail":reason}})
                         .to_string(),
@@ -993,8 +891,7 @@ impl Agent {
                 let (success, output) = self.execute_and_log(&executor, id, name, &args, seq);
                 ReplayOutcome::Replayed { success, output }
             }
-            nanobot_tools::PreExecuteResult::Deny(reason)
-            | nanobot_tools::PreExecuteResult::Ask(reason) => {
+            nanobot_tools::PreExecuteResult::Deny(reason) => {
                 self.log_unexecuted_call(id, name, arguments, seq, "tool_denied", &reason);
                 ReplayOutcome::Unknown
             }
@@ -1501,11 +1398,7 @@ impl Agent {
                                 args = coerced;
                                 None
                             }
-                            // The approval policy resolves synchronously today,
-                            // so `Ask` is not produced; refusing it keeps an
-                            // unapproved call from slipping through.
-                            nanobot_tools::PreExecuteResult::Deny(reason)
-                            | nanobot_tools::PreExecuteResult::Ask(reason) => Some(reason),
+                            nanobot_tools::PreExecuteResult::Deny(reason) => Some(reason),
                         };
 
                         if let Some(reason) = denial {
