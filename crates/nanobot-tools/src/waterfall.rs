@@ -2,7 +2,7 @@
 //!
 //! The tool pipeline is:
 //! 1. **pre-execute**: check tool is registered + validate parameters against
-//!    JSON Schema + check approval requirement -> `Allow` / `Deny` / `Ask`
+//!    JSON Schema + check approval requirement -> `Allow` / `Deny`
 //! 2. **execute**: call the tool body (async closure provided by the caller,
 //!    typically wrapping an `ocad-engine` dispatch)
 //! 3. **post-execute**: lightweight verification hook -> `Accept` / `Replace` / `Block`
@@ -32,8 +32,6 @@ pub enum PreExecuteResult {
     /// the refusal is structured for the product; the other refusals stay
     /// prose.
     Deny(String),
-    /// Approval is required before execution.
-    Ask(String),
 }
 
 /// Result of the post-execute waterfall.
@@ -41,8 +39,6 @@ pub enum PreExecuteResult {
 pub enum PostExecuteResult {
     /// Result is accepted as-is.
     Accept,
-    /// Result should be replaced with a different value.
-    Replace(String),
     /// Result should be blocked (execution was incorrect).
     Block(String),
 }
@@ -157,11 +153,6 @@ impl ToolPipeline {
             return PostExecuteResult::Block(format!("tool {name} returned empty output"));
         }
         PostExecuteResult::Accept
-    }
-
-    /// Get a tool definition by name.
-    pub fn get_tool(&self, name: &str) -> Option<ToolDefinition> {
-        self.registry.get(name)
     }
 
     /// List all registered tool definitions.

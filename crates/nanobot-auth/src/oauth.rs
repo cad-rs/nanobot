@@ -318,7 +318,7 @@ impl AccountProvider for OAuth2Provider {
             };
         };
         if let Some(expires_at) = tokens.expires_at_ms {
-            if now_ms() >= expires_at {
+            if nanobot_boot::account::is_expired(tokens.expires_at_ms, now_ms()) {
                 return EntitlementDecision::Denied {
                     reason: format!("access token expired at {expires_at} ms"),
                 };

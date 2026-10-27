@@ -63,11 +63,6 @@ impl ToolRegistry {
         Ok(())
     }
 
-    /// Deregister a tool by name.
-    pub fn deregister(&self, name: &str) -> Option<ToolDefinition> {
-        self.tools.lock().unwrap().remove(name)
-    }
-
     /// Look up a tool by name.
     pub fn get(&self, name: &str) -> Option<ToolDefinition> {
         self.tools.lock().unwrap().get(name).cloned()
