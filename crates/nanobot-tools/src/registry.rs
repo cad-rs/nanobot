@@ -21,6 +21,20 @@ pub struct ToolDefinition {
     pub requires_approval: bool,
     /// Tier 1 structural contract this tool promises (design-harness 18).
     pub contract: crate::contract::ToolContract,
+    /// Whether the pipeline refuses a call whose arguments violate
+    /// [`Self::parameters_schema`].
+    ///
+    /// Off by default. The arguments are still **coerced** either way (a
+    /// numeric string becomes a number, a `null` takes the schema default).
+    ///
+    /// The opt-in exists because a `schemars` schema describes the type's
+    /// *serialized* shape, not the shape its deserializer *accepts*: a type
+    /// with a custom `Deserialize` is lossy in its schema, and a strict check
+    /// would refuse input the product accepts. A product whose schema is
+    /// faithful turns this on; the authoritative check stays the product's own
+    /// deserialization either way.
+    #[serde(default)]
+    pub validate_args: bool,
 }
 
 /// Registry of tool definitions.
