@@ -58,6 +58,10 @@ jobs:
           -p nanobot-telemetry -p nanobot-cordis -p nanobot-session -p nanobot-agent
           -p nanobot-tools -p nanobot-skills -p nanobot-llm -p nanobot-boot -p nanobot-auth
           --target wasm32-unknown-unknown
+      - name: check (kernel, network-free)
+        # The HTTP provider is a choice: the core builds without it.
+        run: cargo check
+          -p nanobot-llm -p nanobot-boot --no-default-features
 
   shell:
     runs-on: macos-latest

@@ -27,7 +27,9 @@ use std::sync::{Arc, Mutex};
 
 use nanobot_agent::{Agent, PlanVerifier, ReplayOutcome, ToolExecutor};
 use nanobot_cordis::Context;
-use nanobot_llm::{LlmAdapter, LlmRuntime, OpenAiCompatibleAdapter, ScriptedAdapter};
+use nanobot_llm::{LlmAdapter, LlmRuntime, ScriptedAdapter};
+#[cfg(feature = "nanobot-llm-providers")]
+use nanobot_llm::OpenAiCompatibleAdapter;
 #[cfg(not(target_family = "wasm"))]
 use nanobot_session::persistence;
 use nanobot_session::{DanglingCall, Session, SessionEvent, dangling_tool_calls};
@@ -633,6 +635,7 @@ impl HarnessBuilder {
         let mut llm = LlmRuntime::new();
         if adapters.is_empty() {
             if let Some(provider) = &profile.provider {
+                #[cfg(feature = "nanobot-llm-providers")]
                 if provider.kind == "openai-compatible" {
                     let adapter = OpenAiCompatibleAdapter::new(
                         provider.endpoint.clone(),
@@ -645,6 +648,14 @@ impl HarnessBuilder {
                         "harness.toml provider kind `{}` is not built in; using the scripted default",
                         provider.kind
                     ));
+                }
+                #[cfg(not(feature = "nanobot-llm-providers"))]
+                if provider.kind == "openai-compatible" {
+                    notes.push(
+                        "harness.toml asks for an openai-compatible provider, but this build has \
+                         no HTTP provider (no `providers` feature); using the scripted default"
+                            .to_string(),
+                    );
                 }
             }
             if llm.providers().next().is_none() {
