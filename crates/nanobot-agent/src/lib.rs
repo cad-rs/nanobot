@@ -35,7 +35,7 @@ pub mod plan;
 
 pub use agent::{
     Agent, AgentState, PlanVerifier, ReplayOutcome, RestorePoint, ToolExecutor, WriteCheck,
-    WriteOutcome,
+    WriteOutcome, DEFAULT_COMPACTION_THRESHOLD,
 };
 pub use batch::{Axis, BatchOutcome, BatchSpec, Variant, VariantOutcome};
 pub use cancellation::CancellationToken;

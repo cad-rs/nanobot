@@ -356,6 +356,8 @@ pub struct HarnessBuilder {
     model: Option<String>,
     /// Model routes declared by the product: `(model id, provider key, wire model)`.
     model_routes: Vec<(String, String, String)>,
+    /// The projected-history threshold for compaction; `0` disables it.
+    compaction_threshold: Option<usize>,
     skills: Vec<SkillManifest>,
     telemetry: Option<Arc<dyn TelemetryContext>>,
 }
@@ -378,6 +380,7 @@ impl HarnessBuilder {
             persona: None,
             model: None,
             model_routes: Vec::new(),
+            compaction_threshold: None,
             skills: Vec::new(),
             telemetry: None,
         }
@@ -511,6 +514,17 @@ impl HarnessBuilder {
         self
     }
 
+    /// The projected-history threshold for compaction.
+    ///
+    /// When the model-visible history grows past this, the older turns are
+    /// summarized into a `CompactionEntry` so the context stays bounded; the
+    /// log keeps every event. `0` disables compaction. Unset, the agent's
+    /// `nanobot_agent::DEFAULT_COMPACTION_THRESHOLD` applies.
+    pub fn with_compaction_threshold(mut self, max_messages: usize) -> Self {
+        self.compaction_threshold = Some(max_messages);
+        self
+    }
+
     /// The telemetry context the assembled harness emits its spans through.
     ///
     /// Installed on both the LLM runtime (`provider.request`) and the agent
@@ -549,6 +563,7 @@ impl HarnessBuilder {
             persona,
             model,
             model_routes,
+            compaction_threshold,
             skills,
             telemetry,
         } = self;
@@ -698,6 +713,9 @@ impl HarnessBuilder {
         }
         if let Some(telemetry) = &telemetry {
             agent.set_telemetry(telemetry.clone());
+        }
+        if let Some(threshold) = compaction_threshold {
+            agent.set_compaction_threshold(threshold);
         }
 
         // The skill runner with a root context. Each enablement is isolated:
@@ -1346,6 +1364,26 @@ mod tests {
             RESUME_BUDGET
         );
         assert_eq!(dangling(&harness), 0, "the replay resolved the rest");
+    }
+
+    #[test]
+    fn the_compaction_threshold_is_wired_from_the_builder() {
+        let harness = Harness::builder()
+            .with_session_id("sess-compaction-threshold")
+            .with_compaction_threshold(7)
+            .build()
+            .expect("assembly");
+        assert_eq!(harness.agent.compaction_threshold(), 7);
+
+        // Unset, the agent's default applies.
+        let default = Harness::builder()
+            .with_session_id("sess-compaction-default")
+            .build()
+            .expect("assembly");
+        assert_eq!(
+            default.agent.compaction_threshold(),
+            nanobot_agent::DEFAULT_COMPACTION_THRESHOLD
+        );
     }
 
     #[test]
