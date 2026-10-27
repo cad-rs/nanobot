@@ -211,6 +211,8 @@ pub struct HarnessBuilder {
     approval_policy: Option<Arc<dyn ApprovalPolicy>>,
     persona: Option<String>,
     model: Option<String>,
+    /// Model routes declared by the product: `(model id, provider key, wire model)`.
+    model_routes: Vec<(String, String, String)>,
     skills: Vec<SkillManifest>,
     telemetry: Option<Arc<dyn TelemetryContext>>,
 }
@@ -232,6 +234,7 @@ impl HarnessBuilder {
             approval_policy: None,
             persona: None,
             model: None,
+            model_routes: Vec::new(),
             skills: Vec::new(),
             telemetry: None,
         }
@@ -344,6 +347,27 @@ impl HarnessBuilder {
         self
     }
 
+    /// Declare a model route on the assembled harness's runtime.
+    ///
+    /// `id` is the model id the agent is pointed at with
+    /// [`HarnessBuilder::with_model`]; `provider` is the adapter key it routes
+    /// to; `model` is the wire model the provider is asked for. The wire model
+    /// may differ from the id, which is how a harness offers an alias (a cost
+    /// or latency tier) without naming a concrete provider model.
+    ///
+    /// A harness that declares no routes keeps the pre-catalog behaviour: the
+    /// model id is the wire model and it routes to the `default` adapter.
+    pub fn with_model_route(
+        mut self,
+        id: impl Into<String>,
+        provider: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        self.model_routes
+            .push((id.into(), provider.into(), model.into()));
+        self
+    }
+
     /// The telemetry context the assembled harness emits its spans through.
     ///
     /// Installed on both the LLM runtime (`provider.request`) and the agent
@@ -381,6 +405,7 @@ impl HarnessBuilder {
             approval_policy,
             persona,
             model,
+            model_routes,
             skills,
             telemetry,
         } = self;
@@ -479,6 +504,15 @@ impl HarnessBuilder {
         // before the agent takes ownership of it.
         if let Some(telemetry) = &telemetry {
             llm.set_telemetry(telemetry.clone());
+        }
+
+        // Declare the model routes: each maps a model id the agent can be
+        // pointed at to the adapter key and the wire model it resolves to.
+        for (id, provider, model) in &model_routes {
+            llm.register_model(id, provider, model);
+        }
+        if !model_routes.is_empty() {
+            notes.push(format!("{} model route(s) declared", model_routes.len()));
         }
 
         let mut tool_count = 0usize;
@@ -626,6 +660,37 @@ mod tests {
         assert!(
             !harness.agent.session().is_empty(),
             "the scripted default must produce a turn"
+        );
+    }
+
+    #[test]
+    fn a_declared_model_route_sends_the_wire_model_to_its_provider() {
+        // The builder is the production path: the product declares the route
+        // and the model id, and the agent resolves the id to the provider and
+        // the wire model the provider is asked for.
+        let harness = Harness::builder()
+            .with_session_id("sess-route")
+            .with_llm_adapter("openai", Arc::new(ScriptedAdapter::text("ok")))
+            .with_model_route("fast", "openai", "gpt-6-mini")
+            .with_model("fast")
+            .build()
+            .expect("assembly");
+
+        run_one_turn(&harness, "go");
+
+        let recorded = harness
+            .agent
+            .session()
+            .events()
+            .into_iter()
+            .find_map(|entry| match entry.event {
+                SessionEvent::RequestHeader { model, .. } => Some(model),
+                _ => None,
+            });
+        assert_eq!(
+            recorded,
+            Some("gpt-6-mini".to_string()),
+            "`with_model_route` routes the alias to its provider and records its wire model"
         );
     }
 

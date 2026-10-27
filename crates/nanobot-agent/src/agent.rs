@@ -202,8 +202,10 @@ struct AgentInner {
     telemetry: Mutex<Arc<dyn TelemetryContext>>,
 }
 
-/// The adapter key the agent asks for when the product sets no model.
-const DEFAULT_MODEL: &str = "default";
+/// The model id the agent uses when the product sets none: the
+/// [`nanobot_llm::DEFAULT_PROVIDER`] adapter key, so a harness that registers
+/// one adapter under `"default"` keeps working without a catalog.
+const DEFAULT_MODEL: &str = nanobot_llm::DEFAULT_PROVIDER;
 
 /// Convert the wire accounting type into the session's.
 ///
@@ -347,21 +349,39 @@ impl Agent {
         *self.inner.persona.lock().unwrap() = Some(persona.into());
     }
 
-    /// Set the wire model id (what the provider is asked for, and what
-    /// `RequestHeader` records). Unset, the agent asks for the adapter key
-    /// `"default"`.
+    /// Set the model id the agent routes.
+    ///
+    /// The id is resolved through the runtime's [`ModelCatalog`]: a catalog
+    /// entry wins (routing to its provider, asking it for its wire model);
+    /// without one, the id is the wire model and routes to the `default`
+    /// adapter. Unset, the agent asks for [`DEFAULT_MODEL`] — the adapter key
+    /// a harness registers its single adapter under.
     pub fn set_model(&self, model: impl Into<String>) {
         *self.inner.model.lock().unwrap() = Some(model.into());
     }
 
-    /// The model id requests are made with.
-    fn wire_model(&self) -> String {
+    /// The model id requests are made with (the configured id, or the default).
+    fn model_id(&self) -> String {
         self.inner
             .model
             .lock()
             .unwrap()
             .clone()
             .unwrap_or_else(|| DEFAULT_MODEL.to_string())
+    }
+
+    /// The wire model id: what the provider is actually asked for, and what
+    /// `RequestHeader` records.
+    ///
+    /// A catalog route may name a different wire model than the id the agent
+    /// was given (an alias), so the runtime's resolution is the truth.
+    fn wire_model(&self) -> String {
+        let id = self.model_id();
+        self.inner
+            .llm
+            .resolve(&id)
+            .map(|route| route.model)
+            .unwrap_or(id)
     }
 
     /// Set the plan verifier (the product's intent grader). Without one, a
@@ -953,7 +973,11 @@ impl Agent {
                     })
                     .collect();
 
-                // Build LLM request.
+                // Build LLM request. The model *id* goes to the runtime, which
+                // resolves it through the catalog (provider + wire model); the
+                // request carries the wire model, which is what the provider is
+                // asked for and what `RequestHeader` records.
+                let model_id = self.model_id();
                 let wire_model = self.wire_model();
                 let request = LlmRequest {
                     model: wire_model.clone(),
@@ -964,7 +988,7 @@ impl Agent {
                 };
 
                 // Stream from LLM.
-                let mut stream = self.inner.llm.stream("default", request);
+                let mut stream = self.inner.llm.stream_model(&model_id, request);
                 let mut assembler = BlockAssembler::new();
                 let mut stream_error: Option<String> = None;
 
