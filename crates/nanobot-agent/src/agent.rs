@@ -32,7 +32,7 @@
 use crate::inbox::Inbox;
 use crate::plan::{Plan, PlanState};
 use nanobot_llm::{BlockAssembler, LlmRequest, LlmRuntime, Message, ToolDefinition};
-use nanobot_session::{Session, SessionEvent, TurnEndReason};
+use nanobot_session::{ProjectedMessage, Session, SessionEvent, TurnEndReason, derive_messages};
 use nanobot_telemetry::{NoopTelemetryContext, SpanKind, SpanOptions, TelemetryContext};
 use nanobot_tools::ToolPipeline;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -216,12 +216,116 @@ struct AgentInner {
     /// records nothing, so instrumentation stays a *choice*: the kernel never
     /// drags a tracing backend into a consumer that did not ask for one.
     telemetry: Mutex<Arc<dyn TelemetryContext>>,
+    /// The projected history above which the older turns are compacted.
+    ///
+    /// The projected history is what the model's context window sees, and a
+    /// long negotiation grows it without bound. `0` disables compaction.
+    compaction_threshold: Mutex<usize>,
 }
 
 /// The model id the agent uses when the product sets none: the
 /// [`nanobot_llm::DEFAULT_PROVIDER`] adapter key, so a harness that registers
 /// one adapter under `"default"` keeps working without a catalog.
 const DEFAULT_MODEL: &str = nanobot_llm::DEFAULT_PROVIDER;
+
+/// The log position of the first event of the earliest turn to keep.
+///
+/// Walks the turns newest-first, keeping them while they fit in
+/// `keep_messages`, and returns the start of the oldest kept turn. `None` when
+/// there is only one turn — compaction has nothing to split at.
+///
+/// Turn-aligned on purpose: a split inside a turn could leave a tool call
+/// without its result in the kept half.
+fn compaction_split(entries: &[nanobot_session::LogEntry], keep_messages: usize) -> Option<u32> {
+    let turns = turn_message_counts(entries);
+    if turns.len() < 2 {
+        return None;
+    }
+
+    let mut kept = 0usize;
+    let mut split = None;
+    for (start, count) in turns.iter().rev() {
+        // Always keep at least the newest turn, even if it alone is over budget.
+        if kept > 0 && kept + count > keep_messages {
+            break;
+        }
+        kept += count;
+        split = Some(*start);
+    }
+    split
+}
+
+/// Projected message count per turn, oldest first: `(turn start seq, count)`.
+fn turn_message_counts(entries: &[nanobot_session::LogEntry]) -> Vec<(u32, usize)> {
+    let mut turns: Vec<(u32, usize)> = Vec::new();
+    for entry in entries {
+        if matches!(entry.event, SessionEvent::TurnStart { .. }) {
+            turns.push((entry.seq, 0));
+        }
+        if let Some((_, count)) = turns.last_mut() {
+            if projects_to_message(&entry.event) {
+                *count += 1;
+            }
+        }
+    }
+    turns
+}
+
+/// Whether an event projects to a model-visible message.
+fn projects_to_message(event: &SessionEvent) -> bool {
+    matches!(
+        event,
+        SessionEvent::UserMessage { .. }
+            | SessionEvent::AssistantMessage { .. }
+            | SessionEvent::ToolCall { .. }
+            | SessionEvent::ToolResult { .. }
+            | SessionEvent::PlanRejected { .. }
+    )
+}
+
+/// The first log position no live compaction already covers.
+fn next_uncovered_seq(entries: &[nanobot_session::LogEntry]) -> u32 {
+    entries
+        .iter()
+        .filter_map(|entry| match &entry.event {
+            SessionEvent::CompactionEntry { to_seq, .. } => Some(*to_seq + 1),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Project the messages of a log range.
+fn derive_messages_in(
+    entries: &[nanobot_session::LogEntry],
+    from_seq: u32,
+    to_seq: u32,
+) -> Vec<ProjectedMessage> {
+    derive_messages(
+        &entries
+            .iter()
+            .filter(|entry| entry.seq >= from_seq && entry.seq <= to_seq)
+            .cloned()
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// Render projected messages as text for the summarizer.
+fn render_messages(messages: &[ProjectedMessage]) -> String {
+    messages
+        .iter()
+        .map(|message| match message {
+            ProjectedMessage::System(text) => format!("[system] {text}"),
+            ProjectedMessage::User(text) => format!("[user] {text}"),
+            ProjectedMessage::Assistant(text) => format!("[assistant] {text}"),
+            ProjectedMessage::ToolCall {
+                name, arguments, ..
+            } => format!("[tool call] {name} {arguments}"),
+            ProjectedMessage::ToolResult { output, .. } => format!("[tool result] {output}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 /// Convert the wire accounting type into the session's.
 ///
@@ -246,6 +350,23 @@ const MAX_STEPS: u32 = 50;
 /// How many times a failed plan verification is handed back to the model
 /// before the plan is left `Contingent` for a human.
 const MAX_VERIFY_RETRIES: u32 = 2;
+
+/// The projected history above which the older turns are compacted, by default.
+///
+/// Generous on purpose: compaction trades detail for a bounded context, so it
+/// should only engage on a genuinely long session. A product tunes it with
+/// [`Agent::set_compaction_threshold`].
+pub const DEFAULT_COMPACTION_THRESHOLD: usize = 400;
+
+/// The instruction the summarizer gets.
+const COMPACT_PROMPT: &str = "You are compressing an earlier part of a design \
+session. Write a compact but complete summary of the design intent, the \
+decisions made, the assumptions recorded and the verification results so far. \
+Preserve concrete values (frequencies, counts, dimensions) and anything still \
+open. Do not add new decisions.";
+
+/// How many tokens the summary may take.
+const COMPACT_MAX_TOKENS: u32 = 1024;
 
 /// What the plan gate decided at the end of a step.
 #[derive(Debug, Clone)]
@@ -337,6 +458,7 @@ impl Agent {
                 model: Mutex::new(None),
                 plan_verifier: Mutex::new(None),
                 telemetry: Mutex::new(Arc::new(NoopTelemetryContext)),
+                compaction_threshold: Mutex::new(DEFAULT_COMPACTION_THRESHOLD),
             }),
         }
     }
@@ -881,6 +1003,103 @@ impl Agent {
         }
     }
 
+    /// The projected history above which the older turns are compacted.
+    ///
+    /// `0` disables compaction. See [`Agent::compact_history`].
+    pub fn compaction_threshold(&self) -> usize {
+        *self.inner.compaction_threshold.lock().unwrap()
+    }
+
+    /// Set the projected-history threshold for compaction.
+    ///
+    /// `0` disables it. The default is [`DEFAULT_COMPACTION_THRESHOLD`].
+    pub fn set_compaction_threshold(&self, max_messages: usize) {
+        *self.inner.compaction_threshold.lock().unwrap() = max_messages;
+    }
+
+    /// Compact the older turns of the model history into a `CompactionEntry`.
+    ///
+    /// The projected history is what the model's context window sees, and a
+    /// long negotiation grows it without bound. Compaction asks the model to
+    /// summarize the older turns and records that summary as a
+    /// [`SessionEvent::CompactionEntry`], which [`Session::derive_messages`]
+    /// then emits in place of the covered events. The log keeps every event —
+    /// compaction is a projection record, not a rewrite — so the audit trail
+    /// and the UI replay are unaffected.
+    ///
+    /// Returns whether a compaction was recorded. Nothing happens when the
+    /// history is under the threshold, when there is no turn boundary to split
+    /// at, or when the summarizer returns nothing.
+    pub async fn compact_history(&self) -> bool {
+        let threshold = self.compaction_threshold();
+        if threshold == 0 {
+            return false;
+        }
+
+        let entries = self.inner.session.events();
+        if derive_messages(&entries).len() <= threshold {
+            return false;
+        }
+
+        // Keep the newest turns that fit in half the threshold, so a session
+        // always has room to grow before the next compaction.
+        let Some(split) = compaction_split(&entries, threshold / 2) else {
+            return false;
+        };
+        let from_seq = next_uncovered_seq(&entries);
+        if from_seq >= split {
+            // Everything up to the split is already covered.
+            return false;
+        }
+        let to_seq = split - 1;
+
+        let older = derive_messages_in(&entries, from_seq, to_seq);
+        if older.is_empty() {
+            return false;
+        }
+        let Some(summary) = self.summarize(&older).await else {
+            return false;
+        };
+
+        self.inner.session.append(SessionEvent::CompactionEntry {
+            from_seq,
+            to_seq,
+            summary,
+        });
+        true
+    }
+
+    /// Ask the model to summarize `older` into one message.
+    async fn summarize(&self, older: &[ProjectedMessage]) -> Option<String> {
+        let model_id = self.model_id();
+        let request = LlmRequest {
+            model: self.wire_model(),
+            messages: vec![
+                Message::system(COMPACT_PROMPT),
+                Message::user(render_messages(older)),
+            ],
+            tools: vec![],
+            temperature: None,
+            max_tokens: Some(COMPACT_MAX_TOKENS),
+        };
+
+        let mut stream = self.inner.llm.stream_model(&model_id, request);
+        let mut assembler = BlockAssembler::new();
+        use futures_util::StreamExt;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(chunk) => {
+                    assembler.push(chunk);
+                }
+                Err(_) => return None,
+            }
+        }
+        assembler
+            .finish()
+            .map(|block| block.text)
+            .filter(|text| !text.trim().is_empty())
+    }
+
     /// Grade the plan awaiting verification and finalize it.
     ///
     /// The verdict lands in the check panel as `CheckRun`/`CheckResult`
@@ -1077,7 +1296,11 @@ impl Agent {
                     selection_ref: None,
                 });
 
-                // Derive messages from session.
+                // Derive messages from session. Compaction runs first: the
+                // projected history is what the context window sees, and a long
+                // negotiation must not grow it without bound. It is a no-op
+                // under the threshold.
+                self.compact_history().await;
                 let projected = self.inner.session.derive_messages();
                 let mut messages: Vec<Message> = vec![Message::system(system_prompt.clone())];
                 messages.extend(

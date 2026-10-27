@@ -162,6 +162,25 @@ pub enum SessionEvent {
     /// rolled back and where to.
     SessionReverted { to_seq: u32, reverted: u32 },
 
+    /// The events in `[from_seq, to_seq]` were replaced by `summary` for the
+    /// model's context.
+    ///
+    /// The events themselves stay in the log — it is the audit trail and the
+    /// source of truth — so this is a **projection** record, not a rewrite.
+    /// `derive_messages` emits this summary in place of the covered events,
+    /// which is what keeps a long session inside its context window.
+    ///
+    /// A later compaction may cover this event too; the projection then emits
+    /// only the later summary.
+    CompactionEntry {
+        /// First covered log position (inclusive).
+        from_seq: u32,
+        /// Last covered log position (inclusive).
+        to_seq: u32,
+        /// What the covered events amount to.
+        summary: String,
+    },
+
     /// Per-model-request header (model, usage, cache info).
     RequestHeader { model: String, usage: Option<Usage> },
 
@@ -216,6 +235,7 @@ impl SessionEvent {
             SessionEvent::GeometryRevision { .. } => "geometry_revision",
             SessionEvent::SessionForked { .. } => "session_forked",
             SessionEvent::SessionReverted { .. } => "session_reverted",
+            SessionEvent::CompactionEntry { .. } => "compaction_entry",
             SessionEvent::RequestHeader { .. } => "request_header",
             // The product's own kind lives in the payload; the framework only
             // reports that this was an extension event.
