@@ -11,7 +11,7 @@
 //! than one message per stream).
 
 use crate::adapter::Usage;
-use crate::chunk::{StreamChunk, ToolCallDelta};
+use crate::chunk::{StopReason, StreamChunk, ToolCallDelta};
 use serde::{Deserialize, Serialize};
 
 /// A fully assembled response block, ready for the agent loop to consume.
@@ -30,6 +30,13 @@ pub struct ResponseBlock {
     /// event).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
+    /// Why the response stream ended, when the provider said.
+    ///
+    /// A `length` stop means the model was cut off at the token limit, so any
+    /// tool call in this block was requested by an incomplete message. The
+    /// agent refuses those rather than acting on them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<StopReason>,
     /// Whether this block represents the end of a logical response unit.
     pub is_complete: bool,
 }
@@ -56,6 +63,8 @@ pub struct BlockAssembler {
     tool_calls: Vec<AssembledToolCall>,
     /// Token accounting reported by the provider, when it reports any.
     usage: Option<Usage>,
+    /// Why the stream ended, when the provider said.
+    stop_reason: Option<StopReason>,
     /// Whether the last chunk signalled completion.
     complete: bool,
 }
@@ -85,6 +94,9 @@ impl BlockAssembler {
             StreamChunk::Usage(usage) => {
                 self.usage = Some(usage);
             }
+            StreamChunk::Stop(reason) => {
+                self.stop_reason = Some(reason);
+            }
         }
 
         if self.complete {
@@ -97,12 +109,14 @@ impl BlockAssembler {
     /// Signal end-of-stream: yield whatever has been accumulated.
     ///
     /// A stream that carried only usage still yields a block: the accounting is
-    /// the point of that response, and dropping it would lose the numbers.
+    /// the point of that response, and dropping it would lose the numbers. The
+    /// same goes for a stop reason on an otherwise empty stream.
     pub fn finish(mut self) -> Option<ResponseBlock> {
         if self.reasoning.is_empty()
             && self.text.is_empty()
             && self.tool_calls.is_empty()
             && self.usage.is_none()
+            && self.stop_reason.is_none()
         {
             None
         } else {
@@ -145,6 +159,7 @@ impl BlockAssembler {
             text: std::mem::take(&mut self.text),
             tool_calls: std::mem::take(&mut self.tool_calls),
             usage: self.usage.take(),
+            stop_reason: self.stop_reason.take(),
             is_complete: self.complete,
         };
         self.complete = false;
@@ -171,5 +186,56 @@ mod usage_tests {
         let block = assembler.finish().expect("a block");
         assert_eq!(block.text, "hi");
         assert!(block.usage.is_some());
+    }
+
+    #[test]
+    fn the_stop_reason_is_collected_into_the_block() {
+        let mut assembler = BlockAssembler::new();
+        assembler.push(StreamChunk::Text("hi".to_string()));
+        assembler.push(StreamChunk::Stop(StopReason::Length));
+        let block = assembler.finish().expect("a block");
+        assert_eq!(block.stop_reason, Some(StopReason::Length));
+    }
+
+    #[test]
+    fn a_stop_only_stream_still_yields_a_block() {
+        // The provider cut the response off before any content. Dropping the
+        // block would lose the truncation signal entirely.
+        let mut assembler = BlockAssembler::new();
+        assembler.push(StreamChunk::Stop(StopReason::Length));
+        let block = assembler.finish().expect("a block");
+        assert_eq!(block.stop_reason, Some(StopReason::Length));
+        assert!(block.text.is_empty());
+    }
+
+    #[test]
+    fn a_stream_without_a_stop_reason_reports_none() {
+        let mut assembler = BlockAssembler::new();
+        assembler.push(StreamChunk::Text("hi".to_string()));
+        let block = assembler.finish().expect("a block");
+        assert_eq!(block.stop_reason, None);
+    }
+}
+
+#[cfg(test)]
+mod stop_reason_tests {
+    use super::*;
+
+    #[test]
+    fn wire_finish_reasons_map_onto_the_vocabulary() {
+        assert_eq!(StopReason::from_wire("stop"), StopReason::Stop);
+        assert_eq!(StopReason::from_wire("tool_calls"), StopReason::ToolUse);
+        assert_eq!(StopReason::from_wire("length"), StopReason::Length);
+        assert_eq!(StopReason::from_wire("content_filter"), StopReason::ContentFilter);
+        // A provider inventing a reason must not break the stream.
+        assert_eq!(StopReason::from_wire("something_new"), StopReason::Other);
+    }
+
+    #[test]
+    fn only_length_counts_as_truncated() {
+        assert!(StopReason::Length.is_truncated());
+        for reason in [StopReason::Stop, StopReason::ToolUse, StopReason::ContentFilter, StopReason::Other, StopReason::Aborted] {
+            assert!(!reason.is_truncated(), "{reason:?} must not be treated as truncated");
+        }
     }
 }

@@ -1052,9 +1052,48 @@ impl Agent {
                         });
                     }
 
+                    // A response the provider cut off at the token limit is an
+                    // incomplete message: the text may stop mid-sentence and
+                    // the tool arguments mid-JSON. Recorded so the check panel
+                    // and the trace both show why the calls below were refused.
+                    let truncated = block.stop_reason.map(|reason| reason.is_truncated()).unwrap_or(false);
+                    if truncated {
+                        self.inner.session.append(SessionEvent::CheckResult {
+                            check_id: "llm:truncated".to_string(),
+                            passed: false,
+                            payload: Some(serde_json::json!({
+                                "stop_reason": format!("{:?}", block.stop_reason),
+                                "tool_calls": block.tool_calls.len(),
+                            })),
+                            details: "the provider cut the response off at the token limit; \
+                                      its tool calls were not executed"
+                                .to_string(),
+                        });
+                    }
+
                     // Log tool calls and execute them under the write gate.
                     for tc in &block.tool_calls {
                         has_tool_calls = true;
+
+                        // A response the provider cut off at the token limit
+                        // asked for these tools with an incomplete message.
+                        // Acting on them would run a half-formed intent, so
+                        // every call in the block is failed rather than
+                        // executed; the model sees the refusal and can re-ask.
+                        if truncated {
+                            self.log_unexecuted_call(
+                                &tc.id,
+                                &tc.name,
+                                &serde_json::from_str(&tc.arguments)
+                                    .unwrap_or(serde_json::Value::Null),
+                                self.inner.session.next_seq(),
+                                "truncated",
+                                "the response was cut off at the token limit, so this \
+                                 call was not executed; re-issue it in full",
+                            );
+                            continue;
+                        }
+
                         // Per-call span: it ends when the call is dispatched
                         // (including the `continue`s for a denied or
                         // executor-less call), so it measures the whole

@@ -37,7 +37,7 @@ pub use adapter::{
 };
 pub use assembler::{AssembledToolCall, BlockAssembler, ResponseBlock};
 pub use catalog::{DEFAULT_PROVIDER, ModelCatalog, ModelRoute};
-pub use chunk::{StreamChunk, ToolCallDelta};
+pub use chunk::{StopReason, StreamChunk, ToolCallDelta};
 pub use cost::{BudgetDecision, ModelAccount, Pricing, UsageAccount};
 pub use error::LlmError;
 pub use openai::OpenAiCompatibleAdapter;

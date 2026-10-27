@@ -5,10 +5,11 @@
 //! `wasm-streams`) — no platform-conditional compilation.
 
 use crate::adapter::{AdapterStream, LlmAdapter, LlmRequest, Role, Usage};
-use crate::chunk::{StreamChunk, ToolCallDelta};
+use crate::chunk::{StopReason, StreamChunk, ToolCallDelta};
 use crate::error::LlmError;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
+use std::collections::VecDeque;
 
 /// The byte stream returned by `reqwest::Response::bytes_stream()`.
 ///
@@ -136,15 +137,19 @@ impl OpenAiCompatibleAdapter {
         body
     }
 
-    /// Parse one SSE `data` payload into a `StreamChunk`.
-    fn parse_chunk(data: &str) -> Result<StreamChunk, LlmError> {
+    /// Parse one SSE `data` payload into the chunks it carries.
+    ///
+    /// Usually one chunk. A provider may put content and `finish_reason` in the
+    /// same event, and both are returned so neither is dropped: the stop reason
+    /// is what tells the consumer a response was cut off.
+    fn parse_chunks(data: &str) -> Result<Vec<StreamChunk>, LlmError> {
         let value: serde_json::Value = serde_json::from_str(data)?;
 
         // The accounting chunk carries `usage` and an *empty* choices array, so
         // it must be handled before the choices are required — otherwise a
         // provider that honours `include_usage` breaks the stream.
         if let Some(usage) = value.get("usage").filter(|u| !u.is_null()) {
-            return Ok(StreamChunk::Usage(Usage {
+            return Ok(vec![StreamChunk::Usage(Usage {
                 prompt_tokens: usage
                     .get("prompt_tokens")
                     .and_then(serde_json::Value::as_u64)
@@ -157,7 +162,7 @@ impl OpenAiCompatibleAdapter {
                     .get("total_tokens")
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0) as u32,
-            }));
+            })]);
         }
 
         let choices = value
@@ -168,6 +173,13 @@ impl OpenAiCompatibleAdapter {
         let choice = choices
             .first()
             .ok_or_else(|| LlmError::Provider("empty choices array".to_string()))?;
+
+        // The stop reason rides the chunk the provider ends on. `null` until
+        // then, so it is read before the delta is required.
+        let stop = choice
+            .get("finish_reason")
+            .and_then(|f| f.as_str())
+            .map(|reason| StreamChunk::Stop(StopReason::from_wire(reason)));
 
         let delta = choice
             .get("delta")
@@ -189,18 +201,27 @@ impl OpenAiCompatibleAdapter {
                     .and_then(|a| a.as_str())
                     .unwrap_or("")
                     .to_string();
-                return Ok(StreamChunk::ToolCall(ToolCallDelta {
+
+                let mut chunks = vec![StreamChunk::ToolCall(ToolCallDelta {
                     index,
                     id,
                     name,
                     arguments_fragment,
-                }));
+                })];
+                chunks.extend(stop);
+                return Ok(chunks);
             }
         }
 
-        // Otherwise, treat as text content.
+        // Otherwise, treat as text content. An empty delta with no stop reason
+        // carries nothing (providers emit these between turns of a stream).
         let text = delta.get("content").and_then(|c| c.as_str()).unwrap_or("");
-        Ok(StreamChunk::Text(text.to_string()))
+        let mut chunks = Vec::new();
+        if !text.is_empty() {
+            chunks.push(StreamChunk::Text(text.to_string()));
+        }
+        chunks.extend(stop);
+        Ok(chunks)
     }
 }
 
@@ -252,27 +273,63 @@ impl LlmAdapter for OpenAiCompatibleAdapter {
                                     ));
                                 }
                                 let byte_stream: ByteStream<'a> = Box::pin(r.bytes_stream());
-                                let es = byte_stream.eventsource();
-                                Some((Ok(StreamChunk::Text(String::new())), Stage::Streaming(es)))
+                                let events = byte_stream.eventsource();
+                                Some((
+                                    Ok(StreamChunk::Text(String::new())),
+                                    Stage::Streaming {
+                                        events,
+                                        pending: VecDeque::new(),
+                                    },
+                                ))
                             }
                             Err(e) => Some((Err(LlmError::Http(e.to_string())), Stage::Done)),
                         }
                     }
-                    Stage::Streaming(mut es) => {
-                        while let Some(item) = es.next().await {
+                    Stage::Streaming {
+                        mut events,
+                        mut pending,
+                    } => {
+                        // Chunks parsed from an earlier event (content plus its
+                        // finish reason) come out first.
+                        if let Some(chunk) = pending.pop_front() {
+                            return Some((
+                                Ok(chunk),
+                                Stage::Streaming {
+                                    events,
+                                    pending,
+                                },
+                            ));
+                        }
+                        while let Some(item) = events.next().await {
                             match item {
                                 Ok(event) => {
                                     if event.data == "[DONE]" {
                                         return None;
                                     }
-                                    match Self::parse_chunk(&event.data) {
-                                        Ok(chunk) => {
-                                            if let StreamChunk::Text(ref t) = chunk {
-                                                if t.is_empty() {
-                                                    continue;
-                                                }
-                                            }
-                                            return Some((Ok(chunk), Stage::Streaming(es)));
+                                    match Self::parse_chunks(&event.data) {
+                                        Ok(chunks) => {
+                                            // Drop empty text deltas, which carry
+                                            // nothing between turns of a stream.
+                                            let mut chunks: VecDeque<StreamChunk> = chunks
+                                                .into_iter()
+                                                .filter(|chunk| {
+                                                    !matches!(
+                                                        chunk,
+                                                        StreamChunk::Text(text) if text.is_empty()
+                                                    )
+                                                })
+                                                .collect();
+                                            let Some(first) = chunks.pop_front() else {
+                                                continue;
+                                            };
+                                            pending.extend(chunks);
+                                            return Some((
+                                                Ok(first),
+                                                Stage::Streaming {
+                                                    events,
+                                                    pending,
+                                                },
+                                            ));
                                         }
                                         Err(e) => {
                                             return Some((Err(e), Stage::Done));
@@ -301,7 +358,12 @@ enum Stage<'a> {
         body: serde_json::Value,
         api_key: &'a str,
     },
-    Streaming(eventsource_stream::EventStream<ByteStream<'a>>),
+    Streaming {
+        events: eventsource_stream::EventStream<ByteStream<'a>>,
+        /// Chunks parsed from an event that produced more than one, waiting
+        /// for the next poll.
+        pending: VecDeque<StreamChunk>,
+    },
     Done,
 }
 
@@ -336,10 +398,13 @@ mod tests {
         // Providers honouring `include_usage` send a final chunk whose choices
         // array is empty. Treating that as a protocol error would break every
         // such provider, so the accounting is read before choices are required.
-        let chunk = OpenAiCompatibleAdapter::parse_chunk(
+        let chunk = OpenAiCompatibleAdapter::parse_chunks(
             r#"{"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":5,"total_tokens":16}}"#,
         )
-        .expect("a usage-only chunk is valid");
+        .expect("a usage-only chunk is valid")
+        .into_iter()
+        .next()
+        .expect("one chunk");
         assert_eq!(
             chunk,
             StreamChunk::Usage(Usage {
@@ -347,6 +412,32 @@ mod tests {
                 completion_tokens: 5,
                 total_tokens: 16,
             })
+        );
+    }
+
+    #[test]
+    fn the_finish_reason_is_parsed_into_a_stop_chunk() {
+        let chunks = OpenAiCompatibleAdapter::parse_chunks(
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}"#,
+        )
+        .expect("a finishing chunk is valid");
+        assert_eq!(chunks, vec![StreamChunk::Stop(StopReason::Length)]);
+    }
+
+    #[test]
+    fn content_and_finish_reason_in_one_event_both_survive() {
+        // A provider may put the last text delta and the finish reason in the
+        // same event. Dropping either would lose the text or the signal.
+        let chunks = OpenAiCompatibleAdapter::parse_chunks(
+            r#"{"choices":[{"index":0,"delta":{"content":"tail"},"finish_reason":"stop"}]}"#,
+        )
+        .expect("the event is valid");
+        assert_eq!(
+            chunks,
+            vec![
+                StreamChunk::Text("tail".to_string()),
+                StreamChunk::Stop(StopReason::Stop),
+            ]
         );
     }
 

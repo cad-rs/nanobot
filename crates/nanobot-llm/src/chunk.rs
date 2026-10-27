@@ -16,6 +16,10 @@ use crate::adapter::Usage;
 /// accounting a provider reports at the end of a response. Usage rides the same
 /// stream as content so a consumer that assembles the response also gets the
 /// numbers to bill and budget with.
+///
+/// [`StreamChunk::Stop`] carries the provider's `finish_reason`. It is what
+/// lets a consumer tell a complete answer from one the provider cut off at the
+/// token limit — and refuse to act on the truncated one.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum StreamChunk {
     /// Incremental reasoning / chain-of-thought text.
@@ -26,6 +30,47 @@ pub enum StreamChunk {
     ToolCall(ToolCallDelta),
     /// Token accounting for the response so far (providers send it last).
     Usage(Usage),
+    /// The response ended, and here is why (the provider's `finish_reason`).
+    Stop(StopReason),
+}
+
+/// Why a response stream ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StopReason {
+    /// The model stopped on its own with a complete answer.
+    Stop,
+    /// The model requested tools and stopped.
+    ToolUse,
+    /// The provider cut the response off at the token limit: the text, and any
+    /// tool arguments, are incomplete.
+    Length,
+    /// The provider stopped on a content policy.
+    ContentFilter,
+    /// The provider stopped for a reason this build does not name.
+    Other,
+    /// The stream was cut by the client.
+    Aborted,
+}
+
+impl StopReason {
+    /// Map a provider's `finish_reason` onto this vocabulary.
+    ///
+    /// Unknown values become [`StopReason::Other`] rather than an error: a
+    /// provider inventing a new reason must not break the stream.
+    pub fn from_wire(finish_reason: &str) -> Self {
+        match finish_reason {
+            "stop" => StopReason::Stop,
+            "tool_calls" => StopReason::ToolUse,
+            "length" => StopReason::Length,
+            "content_filter" => StopReason::ContentFilter,
+            _ => StopReason::Other,
+        }
+    }
+
+    /// Whether the response was cut off before the model finished.
+    pub fn is_truncated(self) -> bool {
+        matches!(self, StopReason::Length)
+    }
 }
 
 /// Incremental update for a single tool call.
