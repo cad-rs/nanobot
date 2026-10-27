@@ -25,6 +25,11 @@ pub enum LlmError {
     #[error("unknown provider: {0}")]
     UnknownProvider(String),
 
+    /// No route is declared for the requested model id, and no fallback
+    /// provider is registered to carry it.
+    #[error("unknown model: {0}")]
+    UnknownModel(String),
+
     /// The adapter was cancelled mid-stream.
     #[error("cancelled")]
     Cancelled,
