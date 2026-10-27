@@ -16,7 +16,6 @@ fn session_with_turns(turns: usize, messages_per_turn: usize) -> Session {
         for index in 0..messages_per_turn {
             session.append(SessionEvent::UserMessage {
                 content: format!("turn {turn} message {index}"),
-                selection_ref: None,
             });
             session.append(SessionEvent::AssistantMessage {
                 content: format!("turn {turn} reply {index}"),

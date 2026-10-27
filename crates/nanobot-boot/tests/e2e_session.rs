@@ -148,7 +148,6 @@ fn turns(mut events: Vec<SessionEvent>, count: usize) -> Vec<SessionEvent> {
         events.push(SessionEvent::TurnStart { turn: turn as u32 });
         events.push(SessionEvent::UserMessage {
             content: format!("turn {turn} request"),
-            selection_ref: None,
         });
         events.push(SessionEvent::AssistantMessage {
             content: format!("turn {turn} reply"),
@@ -237,7 +236,6 @@ fn a_crash_mid_call_is_repaired_and_the_session_stays_usable() {
             SessionEvent::StepStart { turn: 0, step: 0 },
             SessionEvent::UserMessage {
                 content: "build the counter".to_string(),
-                selection_ref: None,
             },
             SessionEvent::ToolCall {
                 id: "c1".into(),

@@ -24,10 +24,10 @@
 //! ## Emitting a span
 //!
 //! ```
-//! use nanobot_telemetry::{SpanKind, SpanOptions, TelemetryContext, NOOP_TELEMETRY_CONTEXT};
+//! use nanobot_telemetry::{NoopTelemetryContext, SpanKind, SpanOptions, TelemetryContext};
 //!
 //! // The default: nothing is recorded, and nothing is allocated.
-//! let span = NOOP_TELEMETRY_CONTEXT.start_span(
+//! let span = NoopTelemetryContext.start_span(
 //!     SpanOptions::new("provider.request", SpanKind::ProviderRequest),
 //! );
 //! // Dropping the guard ends the span.
@@ -93,12 +93,6 @@ impl SpanGuard {
         }
     }
 
-    /// Detach the guard: leave the span open. The caller now owns ending it,
-    /// which is the escape hatch for a span that must outlive the scope that
-    /// started it.
-    pub fn detach(mut self) {
-        self.end = None;
-    }
 }
 
 impl Drop for SpanGuard {
@@ -116,9 +110,6 @@ impl Drop for SpanGuard {
 pub trait TelemetryContext: Send + Sync {
     /// Start a span. The returned guard ends the span on drop.
     fn start_span(&self, options: SpanOptions) -> SpanGuard;
-
-    /// Record an instantaneous event (no duration).
-    fn record_event(&self, name: &str, kind: SpanKind);
 }
 
 /// The default context: records nothing and allocates nothing.
@@ -128,12 +119,8 @@ impl TelemetryContext for NoopTelemetryContext {
     fn start_span(&self, _options: SpanOptions) -> SpanGuard {
         SpanGuard::noop()
     }
-
-    fn record_event(&self, _name: &str, _kind: SpanKind) {}
 }
 
-/// The default context as a value, for `Arc::new(NOOP_TELEMETRY_CONTEXT)`.
-pub static NOOP_TELEMETRY_CONTEXT: NoopTelemetryContext = NoopTelemetryContext;
 
 /// An in-memory recorder for tests.
 ///
@@ -152,8 +139,6 @@ pub mod testing {
         Start,
         /// The span ended (its guard dropped).
         End,
-        /// An instantaneous event (not a span).
-        Event,
     }
 
     /// One recorded thing: a span start, a span end, or an event.
@@ -202,10 +187,6 @@ pub mod testing {
                 .collect()
         }
 
-        /// Forget everything recorded.
-        pub fn clear(&self) {
-            self.records.lock().unwrap().clear();
-        }
     }
 
     impl Default for RecordingTelemetryContext {
@@ -234,14 +215,6 @@ pub mod testing {
             })
         }
 
-        fn record_event(&self, name: &str, kind: SpanKind) {
-            self.records.lock().unwrap().push(Record {
-                id: None,
-                name: name.to_string(),
-                kind,
-                phase: Phase::Event,
-            });
-        }
     }
 }
 
@@ -254,23 +227,9 @@ mod tests {
         // The contract is the absence of effect: nothing is recorded and
         // nothing is allocated. A consumer that never installs a context pays
         // nothing, which is what makes instrumentation a choice.
-        let span = NOOP_TELEMETRY_CONTEXT.start_span(SpanOptions::new("x", SpanKind::AgentTurn));
+        let span = NoopTelemetryContext.start_span(SpanOptions::new("x", SpanKind::AgentTurn));
         assert!(span.end.is_none());
         drop(span);
-        NOOP_TELEMETRY_CONTEXT.record_event("e", SpanKind::Tool);
-    }
-
-    #[test]
-    fn a_detached_guard_never_ends_the_span() {
-        // The escape hatch for a span that must outlive the scope that started
-        // it: detaching leaves it open, and the recorder never sees an end.
-        let rec = testing_recorder();
-        {
-            let guard = rec.start_span(SpanOptions::new("open", SpanKind::Tool));
-            SpanGuard::detach(guard);
-        }
-        assert_eq!(rec.span_names(), vec!["open".to_string()]);
-        assert_eq!(rec.records().len(), 1);
     }
 
     #[cfg(feature = "testing")]
@@ -283,14 +242,12 @@ mod tests {
     fn the_recorder_pairs_every_start_with_an_end() {
         let rec = testing_recorder();
         drop(rec.start_span(SpanOptions::new("agent.turn", SpanKind::AgentTurn)));
-        rec.record_event("custom", SpanKind::Tool);
 
         let records = rec.records();
-        assert_eq!(records.len(), 3);
+        assert_eq!(records.len(), 2);
         assert_eq!(records[0].phase, testing::Phase::Start);
         assert_eq!(records[0].kind, SpanKind::AgentTurn);
         assert_eq!(records[1].phase, testing::Phase::End);
-        assert_eq!(records[2].phase, testing::Phase::Event);
         assert_eq!(rec.span_names(), vec!["agent.turn".to_string()]);
     }
 }

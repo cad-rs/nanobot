@@ -92,24 +92,9 @@ impl LlmRuntime {
         self.catalog.register(id, provider, model)
     }
 
-    /// Replace the whole model catalog.
-    pub fn set_catalog(&mut self, catalog: ModelCatalog) {
-        self.catalog = catalog;
-    }
-
     /// The declared model catalog.
     pub fn catalog(&self) -> &ModelCatalog {
         &self.catalog
-    }
-
-    /// Deregister an adapter by provider key.
-    pub fn deregister(&mut self, provider: &str) -> Option<Arc<dyn LlmAdapter>> {
-        self.adapters.remove(provider)
-    }
-
-    /// Check whether a provider key has a registered adapter.
-    pub fn has(&self, provider: &str) -> bool {
-        self.adapters.contains_key(provider)
     }
 
     /// List all registered provider keys.

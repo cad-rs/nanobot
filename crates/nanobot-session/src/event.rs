@@ -39,8 +39,6 @@ pub struct PlanProposal {
     pub plan_id: String,
     /// Human-readable plan summary.
     pub summary: String,
-    /// JSON-encoded plan steps.
-    pub steps: serde_json::Value,
 }
 
 /// The session event: the framework's base vocabulary plus the
@@ -64,13 +62,7 @@ pub enum SessionEvent {
 
     // -- user / assistant messages --
     /// User input message.
-    UserMessage {
-        content: String,
-        /// Optional selection reference (design-harness F2 check-item spatialization).
-        selection_ref: Option<String>,
-    },
-    /// Incremental assistant text chunk (streaming delta).
-    AssistantChunk { text: String },
+    UserMessage { content: String },
     /// Complete assistant message.
     AssistantMessage { content: String },
 
@@ -93,8 +85,6 @@ pub enum SessionEvent {
         success: bool,
         /// Tool output (text or error message).
         output: String,
-        /// Topology signature for post-replay verification (AR1).
-        topology_signature: Option<String>,
     },
 
     // -- plan state machine --
@@ -129,29 +119,6 @@ pub enum SessionEvent {
         details: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         payload: Option<serde_json::Value>,
-    },
-
-    // -- approval --
-    /// An approval request was raised (tool-level Ask).
-    ApprovalRequest {
-        tool_call_id: String,
-        reason: String,
-    },
-    /// An approval decision was made.
-    ApprovalDecision {
-        tool_call_id: String,
-        approved: bool,
-    },
-
-    // -- geometry --
-    /// Engine-side geometry revision notification.
-    GeometryRevision { revision: u32 },
-
-    // -- session management --
-    /// A new session was forked from this session's log prefix.
-    SessionForked {
-        parent_session: String,
-        parent_seq: u32,
     },
 
     /// This session was rewound to `to_seq`; `reverted` is how many events
@@ -219,7 +186,6 @@ impl SessionEvent {
             SessionEvent::StepStart { .. } => "step_start",
             SessionEvent::StepEnd { .. } => "step_end",
             SessionEvent::UserMessage { .. } => "user_message",
-            SessionEvent::AssistantChunk { .. } => "assistant_chunk",
             SessionEvent::AssistantMessage { .. } => "assistant_message",
             SessionEvent::ToolCall { .. } => "tool_call",
             SessionEvent::ToolResult { .. } => "tool_result",
@@ -230,10 +196,6 @@ impl SessionEvent {
             SessionEvent::PlanClarify { .. } => "plan_clarify",
             SessionEvent::CheckRun { .. } => "check_run",
             SessionEvent::CheckResult { .. } => "check_result",
-            SessionEvent::ApprovalRequest { .. } => "approval_request",
-            SessionEvent::ApprovalDecision { .. } => "approval_decision",
-            SessionEvent::GeometryRevision { .. } => "geometry_revision",
-            SessionEvent::SessionForked { .. } => "session_forked",
             SessionEvent::SessionReverted { .. } => "session_reverted",
             SessionEvent::CompactionEntry { .. } => "compaction_entry",
             SessionEvent::RequestHeader { .. } => "request_header",

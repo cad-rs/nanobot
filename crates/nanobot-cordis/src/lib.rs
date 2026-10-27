@@ -2,7 +2,7 @@
 //!
 //! This crate owns the core plugin infrastructure:
 //! - `Context` — named service repository with parent-child scoping
-//! - `Events` — typed event bus with 4 dispatch modes (emit/serial/waterfall/waterfall_async)
+//! - `Events` — typed event bus with 3 dispatch modes (emit/serial/waterfall)
 //! - `Fiber` — reversible effect tracker with state machine
 //! - `Disposable` — the handle returned by every registration call
 //!
@@ -22,6 +22,6 @@ pub mod events;
 pub mod fiber;
 
 pub use context::Context;
-pub use disposable::{arc, Disposable, FnDisposable, NoopDisposable};
+pub use disposable::{Disposable, FnDisposable};
 pub use events::Events;
 pub use fiber::{Fiber, FiberState};

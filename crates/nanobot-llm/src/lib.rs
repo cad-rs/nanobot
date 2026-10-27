@@ -35,7 +35,7 @@ pub mod runtime;
 pub mod scripted;
 
 pub use adapter::{
-    LlmAdapter, LlmRequest, LlmResponse, Message, Role, ToolCallRef, ToolDefinition, Usage,
+    LlmAdapter, LlmRequest, Message, Role, ToolCallRef, ToolDefinition, Usage,
 };
 pub use assembler::{AssembledToolCall, BlockAssembler, ResponseBlock};
 pub use catalog::{DEFAULT_PROVIDER, ModelCatalog, ModelRoute};

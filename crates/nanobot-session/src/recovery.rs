@@ -95,7 +95,6 @@ mod tests {
             id: "c1".into(),
             success: true,
             output: "{}".into(),
-            topology_signature: None,
         });
         assert!(dangling_tool_calls(&entries(&session)).is_empty());
     }
@@ -133,7 +132,6 @@ mod tests {
             id: "b".into(),
             success: false,
             output: "refused".into(),
-            topology_signature: None,
         });
         // The refusal is still an answer: `a` stays dangling only if nothing
         // named it, so a differently-named result does not resolve it.
@@ -157,7 +155,6 @@ mod tests {
             id: "r".into(),
             success: false,
             output: "{\"ok\":false}".into(),
-            topology_signature: None,
         });
         assert!(dangling_tool_calls(&entries(&session)).is_empty());
     }

@@ -871,7 +871,6 @@ impl Agent {
                 "error": {"code": code, "detail": detail}
             })
             .to_string(),
-            topology_signature: None,
         });
     }
 
@@ -937,7 +936,6 @@ impl Agent {
             id: id.to_string(),
             success,
             output: output.clone(),
-            topology_signature: None,
         });
 
         // The verdict lands in the check panel (the app projects `CheckResult`
@@ -1293,7 +1291,6 @@ impl Agent {
                 // user/message
                 self.inner.session.append(SessionEvent::UserMessage {
                     content: step_message,
-                    selection_ref: None,
                 });
 
                 // Derive messages from session. Compaction runs first: the
@@ -1487,7 +1484,6 @@ impl Agent {
                                 id: tc.id.clone(),
                                 success: true,
                                 output,
-                                topology_signature: None,
                             });
                             continue;
                         }
