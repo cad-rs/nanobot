@@ -17,8 +17,6 @@ use serde::{Deserialize, Serialize};
 /// A fully assembled response block, ready for the agent loop to consume.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ResponseBlock {
-    /// Concatenated reasoning text (empty if the provider does not stream reasoning).
-    pub reasoning: String,
     /// Concatenated response text.
     pub text: String,
     /// Assembled tool calls (index-ordered).
@@ -37,8 +35,6 @@ pub struct ResponseBlock {
     /// agent refuses those rather than acting on them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<StopReason>,
-    /// Whether this block represents the end of a logical response unit.
-    pub is_complete: bool,
 }
 
 /// A fully assembled tool call with complete arguments.
@@ -58,15 +54,12 @@ pub struct AssembledToolCall {
 /// `None` (the chunk was absorbed into the current block).
 #[derive(Debug, Default)]
 pub struct BlockAssembler {
-    reasoning: String,
     text: String,
     tool_calls: Vec<AssembledToolCall>,
     /// Token accounting reported by the provider, when it reports any.
     usage: Option<Usage>,
     /// Why the stream ended, when the provider said.
     stop_reason: Option<StopReason>,
-    /// Whether the last chunk signalled completion.
-    complete: bool,
 }
 
 impl BlockAssembler {
@@ -77,14 +70,10 @@ impl BlockAssembler {
 
     /// Feed one chunk into the accumulator.
     ///
-    /// Always returns `None`: no chunk in the vocabulary marks a boundary, so
-    /// the block is yielded by [`BlockAssembler::finish`] at end of stream.
-    /// The `Option` return is kept for a future completion chunk.
-    pub fn push(&mut self, chunk: StreamChunk) -> Option<ResponseBlock> {
+    /// No chunk in the vocabulary marks a boundary, so the block is yielded by
+    /// [`BlockAssembler::finish`] at end of stream.
+    pub fn push(&mut self, chunk: StreamChunk) {
         match chunk {
-            StreamChunk::Reasoning(delta) => {
-                self.reasoning.push_str(&delta);
-            }
             StreamChunk::Text(delta) => {
                 self.text.push_str(&delta);
             }
@@ -98,12 +87,6 @@ impl BlockAssembler {
                 self.stop_reason = Some(reason);
             }
         }
-
-        if self.complete {
-            Some(self.take_block())
-        } else {
-            None
-        }
     }
 
     /// Signal end-of-stream: yield whatever has been accumulated.
@@ -112,15 +95,13 @@ impl BlockAssembler {
     /// the point of that response, and dropping it would lose the numbers. The
     /// same goes for a stop reason on an otherwise empty stream.
     pub fn finish(mut self) -> Option<ResponseBlock> {
-        if self.reasoning.is_empty()
-            && self.text.is_empty()
+        if self.text.is_empty()
             && self.tool_calls.is_empty()
             && self.usage.is_none()
             && self.stop_reason.is_none()
         {
             None
         } else {
-            self.complete = true;
             Some(self.take_block())
         }
     }
@@ -154,21 +135,15 @@ impl BlockAssembler {
     }
 
     fn take_block(&mut self) -> ResponseBlock {
-        let block = ResponseBlock {
-            reasoning: std::mem::take(&mut self.reasoning),
+        ResponseBlock {
             text: std::mem::take(&mut self.text),
             tool_calls: std::mem::take(&mut self.tool_calls),
             usage: self.usage.take(),
             stop_reason: self.stop_reason.take(),
-            is_complete: self.complete,
-        };
-        self.complete = false;
-        block
+        }
     }
 }
 
-// Re-export ToolCallDelta so consumers can reference it via assembler.
-pub use crate::chunk::ToolCallDelta as ToolCallDeltaAlias;
 
 #[cfg(test)]
 mod usage_tests {
@@ -234,7 +209,7 @@ mod stop_reason_tests {
     #[test]
     fn only_length_counts_as_truncated() {
         assert!(StopReason::Length.is_truncated());
-        for reason in [StopReason::Stop, StopReason::ToolUse, StopReason::ContentFilter, StopReason::Other, StopReason::Aborted] {
+        for reason in [StopReason::Stop, StopReason::ToolUse, StopReason::ContentFilter, StopReason::Other] {
             assert!(!reason.is_truncated(), "{reason:?} must not be treated as truncated");
         }
     }

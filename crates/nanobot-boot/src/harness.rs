@@ -87,7 +87,6 @@ fn record_unknown_outcome(session: &Session, call: &DanglingCall, reason: &str) 
             }
         })
         .to_string(),
-        topology_signature: None,
     });
 }
 
@@ -1257,7 +1256,6 @@ mod tests {
                 SessionEvent::StepStart { turn: 0, step: 0 },
                 SessionEvent::UserMessage {
                     content: "build it".to_string(),
-                    selection_ref: None,
                 },
                 crashed_call("c1", "build_sfq"),
             ],

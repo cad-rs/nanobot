@@ -39,8 +39,6 @@ pub mod recovery;
 pub mod session;
 
 pub use event::{PlanProposal, SessionEvent, TurnEndReason, Usage};
-pub use persistence::default_path;
-
 #[cfg(not(target_family = "wasm"))]
 pub use persistence::{load, save};
 pub use projection::{derive_messages, ProjectedMessage};

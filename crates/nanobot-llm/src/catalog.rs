@@ -66,11 +66,6 @@ impl ModelCatalog {
         self.routes.insert(id.into(), ModelRoute::new(provider, model))
     }
 
-    /// Declare an existing route under `id`.
-    pub fn insert(&mut self, id: impl Into<String>, route: ModelRoute) -> Option<ModelRoute> {
-        self.routes.insert(id.into(), route)
-    }
-
     /// Look up a model id.
     pub fn get(&self, id: &str) -> Option<&ModelRoute> {
         self.routes.get(id)

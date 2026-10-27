@@ -29,10 +29,6 @@ pub enum LlmError {
     /// provider is registered to carry it.
     #[error("unknown model: {0}")]
     UnknownModel(String),
-
-    /// The adapter was cancelled mid-stream.
-    #[error("cancelled")]
-    Cancelled,
 }
 
 #[cfg(feature = "providers")]

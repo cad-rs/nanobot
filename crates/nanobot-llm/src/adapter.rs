@@ -128,14 +128,6 @@ pub struct LlmRequest {
     pub max_tokens: Option<u32>,
 }
 
-/// A complete (non-streaming) LLM response.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct LlmResponse {
-    pub text: String,
-    pub tool_calls: Vec<crate::assembler::AssembledToolCall>,
-    pub usage: Option<Usage>,
-}
-
 /// Token usage statistics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {

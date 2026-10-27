@@ -298,19 +298,13 @@ fn block_assembler_reassembles_fragments() {
         StreamChunk::Text("world!".into()),
     ];
 
-    let mut result = None;
+    // No chunk marks a boundary: the block comes from `finish`.
     for c in chunks {
-        if let Some(block) = asm.push(c) {
-            result = Some(block);
-        }
+        asm.push(c);
     }
-    // No completion signal yet.
-    assert!(result.is_none());
 
-    // Finish the block.
     let block = asm.finish().unwrap();
     assert_eq!(block.text, "Hello, world!");
-    assert!(block.reasoning.is_empty());
     assert!(block.tool_calls.is_empty());
 }
 

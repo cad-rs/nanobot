@@ -22,8 +22,6 @@ use crate::adapter::Usage;
 /// token limit — and refuse to act on the truncated one.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum StreamChunk {
-    /// Incremental reasoning / chain-of-thought text.
-    Reasoning(String),
     /// Incremental response text content.
     Text(String),
     /// A tool-call delta (index, id, name, arguments fragment).
@@ -48,8 +46,6 @@ pub enum StopReason {
     ContentFilter,
     /// The provider stopped for a reason this build does not name.
     Other,
-    /// The stream was cut by the client.
-    Aborted,
 }
 
 impl StopReason {

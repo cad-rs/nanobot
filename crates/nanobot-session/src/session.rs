@@ -47,8 +47,6 @@ pub struct Session {
 struct SessionInner {
     id: String,
     next_seq: Mutex<u32>,
-    next_turn: Mutex<u32>,
-    next_step: Mutex<u32>,
     events: Mutex<Vec<LogEntry>>,
     subscribers: Mutex<Vec<Subscriber>>,
 }
@@ -60,8 +58,6 @@ impl Session {
             inner: Arc::new(SessionInner {
                 id: id.into(),
                 next_seq: Mutex::new(0),
-                next_turn: Mutex::new(0),
-                next_step: Mutex::new(0),
                 events: Mutex::new(Vec::new()),
                 subscribers: Mutex::new(Vec::new()),
             }),
@@ -305,84 +301,14 @@ impl Session {
         Arc::new(NoopDisposable)
     }
 
-    /// Get the current turn counter.
-    pub fn current_turn(&self) -> u32 {
-        *self.inner.next_turn.lock().unwrap()
-    }
-
-    /// Increment and return the next turn counter.
-    pub fn next_turn(&self) -> u32 {
-        let mut next_turn = self.inner.next_turn.lock().unwrap();
-        let turn = *next_turn;
-        *next_turn += 1;
-        turn
-    }
-
-    /// Get the current step counter.
-    pub fn current_step(&self) -> u32 {
-        *self.inner.next_step.lock().unwrap()
-    }
-
-    /// Increment and return the next step counter.
-    pub fn next_step(&self) -> u32 {
-        let mut next_step = self.inner.next_step.lock().unwrap();
-        let step = *next_step;
-        *next_step += 1;
-        step
-    }
-
     /// Project model-visible messages from the event log.
     ///
-    /// Only `user/message`, `assistant/message`, and `plan/rejected` enter
-    /// model history. All other events serve UI replay and audit only.
+    /// `user/message`, `assistant/message`, the `tool/call` + `tool/result`
+    /// pairs, `plan/rejected` and compaction summaries enter model history.
+    /// Everything else serves UI replay and audit only.
     pub fn derive_messages(&self) -> Vec<crate::projection::ProjectedMessage> {
         let events = self.inner.events.lock().unwrap();
         crate::projection::derive_messages(&events)
-    }
-
-    /// Fork this session from the current log prefix, creating a new
-    /// session with a new ID. The fork source records the parent session
-    /// and the seq at which the fork occurred.
-    pub fn fork(&self, new_id: impl Into<String>) -> Session {
-        let new_session = Session::new(new_id);
-        let events = self.events();
-
-        // Record the fork event in the new session.
-        new_session.append(SessionEvent::SessionForked {
-            parent_session: self.id().to_string(),
-            parent_seq: events.last().map(|e| e.seq).unwrap_or(0),
-        });
-
-        // Replay all events from the parent log into the new session.
-        for entry in events {
-            new_session.append(entry.event);
-        }
-
-        new_session
-    }
-
-    /// Fork this session from a *prefix*: the new session replays events up to
-    /// and including `up_to_seq`.
-    ///
-    /// [`Session::fork`] copies the whole log; this lets a caller branch from an
-    /// earlier point, which is the "try two directions from here" case. The
-    /// fork marker records where the branch was taken.
-    pub fn fork_from(&self, new_id: impl Into<String>, up_to_seq: u32) -> Session {
-        let new_session = Session::new(new_id);
-        let events: Vec<LogEntry> = self
-            .events()
-            .into_iter()
-            .filter(|entry| entry.seq <= up_to_seq)
-            .collect();
-
-        new_session.append(SessionEvent::SessionForked {
-            parent_session: self.id().to_string(),
-            parent_seq: up_to_seq,
-        });
-        for entry in events {
-            new_session.append(entry.event);
-        }
-        new_session
     }
 
     /// Rewind this session to `to_seq`, recording the revert on the log.
@@ -407,4 +333,3 @@ impl Session {
 }
 
 // Re-export TurnEndReason so it is accessible from the crate root.
-pub use crate::event::TurnEndReason as TurnEndReasonAlias;

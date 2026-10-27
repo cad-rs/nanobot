@@ -19,32 +19,19 @@ pub struct Pricing {
     pub input_per_million: f64,
     /// USD per million completion/output tokens.
     pub output_per_million: f64,
-    /// USD per million cached-input tokens, when the provider charges less.
-    pub cached_input_per_million: Option<f64>,
 }
 
 impl Pricing {
-    /// A price table with no cached-input discount.
+    /// A price table: USD per million prompt and completion tokens.
     #[must_use]
     pub fn new(input_per_million: f64, output_per_million: f64) -> Self {
         Self {
             input_per_million,
             output_per_million,
-            cached_input_per_million: None,
         }
     }
 
-    /// Set the cached-input price.
-    #[must_use]
-    pub fn with_cached_input(mut self, cached_input_per_million: f64) -> Self {
-        self.cached_input_per_million = Some(cached_input_per_million);
-        self
-    }
-
     /// The cost of one usage record under this table.
-    ///
-    /// `Usage` reports prompt and completion tokens; a provider that charges
-    /// less for cache hits would be modelled by a `Usage` that splits them.
     #[must_use]
     pub fn cost_of(&self, usage: &Usage) -> f64 {
         let input = f64::from(usage.prompt_tokens) / 1e6 * self.input_per_million;

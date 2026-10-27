@@ -1,6 +1,6 @@
 //! Integration tests for nanobot-cordis: Context, Events, Fiber.
 
-use nanobot_cordis::{Context, FiberState};
+use nanobot_cordis::{Context, Fiber, FiberState};
 use std::sync::Arc;
 
 #[test]
@@ -56,14 +56,14 @@ fn events_waterfall_two_listeners() {
 
 #[test]
 fn fiber_dispose_rolls_back() {
-    let ctx = Context::root();
     let order = Arc::new(std::sync::Mutex::new(Vec::new()));
     let o = Arc::clone(&order);
 
-    let fiber = ctx.plugin("test_plugin", (), |_ctx, _cfg| {
-        o.lock().unwrap().push("plugin_ran");
-        Ok::<(), String>(())
-    });
+    // The lifecycle a plugin host runs: a fiber, effects recorded into it, and
+    // disposal unwinding them.
+    let fiber = Arc::new(Fiber::new("test_plugin"));
+    o.lock().unwrap().push("plugin_ran");
+    fiber.set_active();
     assert_eq!(fiber.state(), FiberState::Active);
     fiber.dispose();
     assert_eq!(fiber.state(), FiberState::Disposed);

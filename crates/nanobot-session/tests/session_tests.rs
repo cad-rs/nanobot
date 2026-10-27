@@ -19,7 +19,6 @@ fn derive_messages_projects_model_visible() {
     let s = Session::new("test");
     s.append(SessionEvent::UserMessage {
         content: "hello".into(),
-        selection_ref: None,
     });
     s.append(SessionEvent::AssistantMessage {
         content: "hi".into(),
@@ -50,7 +49,6 @@ fn truncate_to_rewinds_the_log_and_resumes_numbering() {
     s.append(SessionEvent::TurnStart { turn: 0 }); // seq 0
     s.append(SessionEvent::UserMessage {
         content: "keep me".into(),
-        selection_ref: None,
     }); // seq 1
     s.append(SessionEvent::ToolCall {
         id: "c1".into(),
@@ -62,7 +60,6 @@ fn truncate_to_rewinds_the_log_and_resumes_numbering() {
         id: "c1".into(),
         success: true,
         output: "{}".into(),
-        topology_signature: None,
     }); // seq 3
 
     s.truncate_to(1);
@@ -112,7 +109,6 @@ fn persist_to_writes_the_log_as_it_grows() {
     session.append(SessionEvent::TurnStart { turn: 0 });
     session.append(SessionEvent::UserMessage {
         content: "hello".into(),
-        selection_ref: None,
     });
 
     let loaded = nanobot_session::load(&path).expect("the log is readable");
@@ -138,7 +134,6 @@ fn a_rewind_reaches_the_file_on_the_next_append() {
     session.append(SessionEvent::TurnStart { turn: 0 });
     session.append(SessionEvent::UserMessage {
         content: "make a plate".into(),
-        selection_ref: None,
     });
     session.append(SessionEvent::ToolCall {
         id: "call_1".into(),
@@ -187,7 +182,6 @@ fn audit_to_records_every_tool_call_with_its_outcome() {
         id: "call_1".into(),
         success: true,
         output: r#"{"ok":true}"#.into(),
-        topology_signature: None,
     });
     session.append(SessionEvent::ToolCall {
         id: "call_2".into(),
@@ -199,7 +193,6 @@ fn audit_to_records_every_tool_call_with_its_outcome() {
         id: "call_2".into(),
         success: false,
         output: r#"{"ok":false}"#.into(),
-        topology_signature: None,
     });
 
     let text = std::fs::read_to_string(&path).expect("the audit log exists");
@@ -223,7 +216,6 @@ fn persistence_roundtrip() {
     let s = Session::new("persist_test");
     s.append(SessionEvent::UserMessage {
         content: "test".into(),
-        selection_ref: None,
     });
 
     let path = std::env::temp_dir().join("nanobot_session_test.jsonl");
@@ -235,45 +227,11 @@ fn persistence_roundtrip() {
 }
 
 #[test]
-fn fork_from_a_prefix_replays_only_that_prefix() {
-    let s = Session::new("parent");
-    s.append(SessionEvent::TurnStart { turn: 0 }); // seq 0
-    s.append(SessionEvent::UserMessage {
-        content: "a".into(),
-        selection_ref: None,
-    }); // seq 1
-    s.append(SessionEvent::UserMessage {
-        content: "b".into(),
-        selection_ref: None,
-    }); // seq 2
-
-    let forked = s.fork_from("child", 1);
-    let events = forked.events();
-    assert!(
-        matches!(events[0].event, SessionEvent::SessionForked { .. }),
-        "the fork marker comes first: {:?}",
-        events[0].event
-    );
-    let user: Vec<_> = events
-        .iter()
-        .filter(|e| matches!(e.event, SessionEvent::UserMessage { .. }))
-        .collect();
-    assert_eq!(user.len(), 1, "only the prefix is replayed: {events:?}");
-    match &user[0].event {
-        SessionEvent::UserMessage { content, .. } => assert_eq!(content, "a"),
-        other => panic!("unexpected event: {other:?}"),
-    }
-    // The parent is untouched by the fork.
-    assert_eq!(s.len(), 3);
-}
-
-#[test]
 fn revert_records_the_rollback_on_the_log() {
     let s = Session::new("revert");
     s.append(SessionEvent::TurnStart { turn: 0 }); // seq 0
     s.append(SessionEvent::UserMessage {
         content: "keep".into(),
-        selection_ref: None,
     }); // seq 1
     s.append(SessionEvent::ToolCall {
         id: "c1".into(),
