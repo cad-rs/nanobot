@@ -28,7 +28,9 @@ pub mod catalog;
 pub mod chunk;
 pub mod cost;
 pub mod error;
+#[cfg(feature = "providers")]
 pub mod openai;
+pub mod retry;
 pub mod runtime;
 pub mod scripted;
 
@@ -40,6 +42,8 @@ pub use catalog::{DEFAULT_PROVIDER, ModelCatalog, ModelRoute};
 pub use chunk::{StopReason, StreamChunk, ToolCallDelta};
 pub use cost::{BudgetDecision, ModelAccount, Pricing, UsageAccount};
 pub use error::LlmError;
+#[cfg(feature = "providers")]
 pub use openai::OpenAiCompatibleAdapter;
+pub use retry::{RetryOn, RetryPolicy};
 pub use runtime::LlmRuntime;
 pub use scripted::{ScriptedAdapter, ScriptedResponse};

@@ -8,6 +8,12 @@ description = "nanobot-boot: harness assembly + harness.toml identity + CLI/self
 [lib]
 crate-type = ["rlib"]
 
+[features]
+default = ["nanobot-llm-providers"]
+# The HTTP provider adapter from `harness.toml [provider]`. Off, boot builds
+# network-free and a `[provider]` entry falls back to the scripted adapter.
+nanobot-llm-providers = ["nanobot-llm/providers"]
+
 [dependencies]
 nanobot-cordis = { workspace = true }
 nanobot-llm = { workspace = true }

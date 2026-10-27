@@ -6,10 +6,12 @@
 
 use crate::adapter::{AdapterStream, LlmAdapter, LlmRequest, Role, Usage};
 use crate::chunk::{StopReason, StreamChunk, ToolCallDelta};
+use crate::retry::RetryPolicy;
 use crate::error::LlmError;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 /// The byte stream returned by `reqwest::Response::bytes_stream()`.
 ///
@@ -31,18 +33,61 @@ pub struct OpenAiCompatibleAdapter {
     client: reqwest::Client,
     base_url: String,
     api_key: String,
+    retry: RetryPolicy,
+    /// Sleeps for a retry backoff. Injected because the kernel carries no
+    /// timer: the default blocks the current thread, which is right for a CLI
+    /// and a test and wrong for a UI host.
+    sleep: Arc<dyn Fn(std::time::Duration) + Send + Sync>,
+}
+
+/// The default backoff sleep.
+///
+/// Blocks the current thread. A host that drives the loop on its own executor
+/// injects a real timer with [`OpenAiCompatibleAdapter::with_sleep`].
+fn blocking_sleep(duration: std::time::Duration) {
+    #[cfg(not(target_family = "wasm"))]
+    std::thread::sleep(duration);
+    #[cfg(target_family = "wasm")]
+    let _ = duration;
 }
 
 impl OpenAiCompatibleAdapter {
     /// Create a new adapter targeting `{base_url}` with the given API key.
     ///
     /// `base_url` should end with a `/` (e.g. `"https://api.openai.com/v1/"`).
+    /// Retries are off by default; [`Self::with_retry`] opts in.
     pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
         Self {
             client: reqwest::Client::new(),
             base_url: base_url.into(),
             api_key: api_key.into(),
+            retry: RetryPolicy::default(),
+            sleep: Arc::new(blocking_sleep),
         }
+    }
+
+    /// Set the retry policy.
+    ///
+    /// The policy's `timeout` bounds each attempt, not just the chain, so a
+    /// single stalled request cannot eat the budget. On native it is applied to
+    /// the HTTP client; on wasm the browser's fetch owns the abort, so the host
+    /// enforces it instead and the field is carried for the record.
+    pub fn with_retry(mut self, retry: RetryPolicy) -> Self {
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(timeout) = retry.timeout {
+            self.client = reqwest::Client::builder()
+                .timeout(timeout)
+                .build()
+                .unwrap_or_default();
+        }
+        self.retry = retry;
+        self
+    }
+
+    /// Inject the backoff timer.
+    pub fn with_sleep(mut self, sleep: Arc<dyn Fn(std::time::Duration) + Send + Sync>) -> Self {
+        self.sleep = sleep;
+        self
     }
 
     /// Build the OpenAI-compatible request body.
@@ -229,6 +274,9 @@ impl LlmAdapter for OpenAiCompatibleAdapter {
     fn stream<'a>(&'a self, request: LlmRequest) -> AdapterStream<'a> {
         let url = format!("{}chat/completions", self.base_url);
         let body = self.build_body(&request);
+        // Owned by the unfold closure: it outlives this call.
+        let retry = self.retry.clone();
+        let sleep = Arc::clone(&self.sleep);
 
         Box::pin(futures_util::stream::unfold(
             Stage::Request {
@@ -237,7 +285,11 @@ impl LlmAdapter for OpenAiCompatibleAdapter {
                 body,
                 api_key: &self.api_key,
             },
-            |stage| async move {
+            move |stage| {
+                // Cloned per call: the closure owns them and is `FnMut`.
+                let retry = retry.clone();
+                let sleep = Arc::clone(&sleep);
+                async move {
                 match stage {
                     Stage::Request {
                         client,
@@ -245,44 +297,59 @@ impl LlmAdapter for OpenAiCompatibleAdapter {
                         body,
                         api_key,
                     } => {
-                        let resp = client
-                            .post(&url)
-                            .header("Authorization", format!("Bearer {api_key}"))
-                            .header("Content-Type", "application/json")
-                            .json(&body)
-                            .send()
-                            .await;
-                        match resp {
-                            Ok(r) => {
-                                // A non-2xx response is a transport-level
-                                // failure, not an empty turn: without this the
-                                // body is parsed as SSE and a 404/401/429 either
-                                // breaks the stream with a confusing
-                                // "missing choices" error or yields a silent
-                                // empty turn the harness cannot distinguish from
-                                // the model saying nothing.
-                                let status = r.status();
-                                if !status.is_success() {
-                                    let body = r.text().await.unwrap_or_default();
+                        let mut attempt = 0u32;
+                        loop {
+                            let response = client
+                                .post(&url)
+                                .header("Authorization", format!("Bearer {api_key}"))
+                                .header("Content-Type", "application/json")
+                                .json(&body)
+                                .send()
+                                .await;
+
+                            match response {
+                                Ok(r) if r.status().is_success() => {
+                                    let byte_stream: ByteStream<'a> = Box::pin(r.bytes_stream());
+                                    let events = byte_stream.eventsource();
                                     return Some((
-                                        Err(LlmError::Http(format!(
-                                            "HTTP {status}: {}",
-                                            truncate_body(&body)
-                                        ))),
-                                        Stage::Done,
+                                        Ok(StreamChunk::Text(String::new())),
+                                        Stage::Streaming {
+                                            events,
+                                            pending: VecDeque::new(),
+                                        },
                                     ));
                                 }
-                                let byte_stream: ByteStream<'a> = Box::pin(r.bytes_stream());
-                                let events = byte_stream.eventsource();
-                                Some((
-                                    Ok(StreamChunk::Text(String::new())),
-                                    Stage::Streaming {
-                                        events,
-                                        pending: VecDeque::new(),
-                                    },
-                                ))
+                                Ok(r) => {
+                                    // A non-2xx is a transport-level failure, not
+                                    // an empty turn: without this the body is
+                                    // parsed as SSE and a 404/401/429 either
+                                    // breaks the stream with a confusing
+                                    // "missing choices" error or yields a silent
+                                    // empty turn the harness cannot distinguish
+                                    // from the model saying nothing.
+                                    let status = r.status();
+                                    let detail = truncate_body(&r.text().await.unwrap_or_default());
+                                    let error = LlmError::Http(format!("HTTP {status}: {detail}"));
+                                    // A 4xx is the provider's answer; only 429/5xx
+                                    // are transient, and the budget still bounds
+                                    // the chain.
+                                    if !retry.is_transient_status(status.as_u16())
+                                        || !retry.should_retry(attempt)
+                                    {
+                                        return Some((Err(error), Stage::Done));
+                                    }
+                                    (sleep)(retry.delay_for(attempt + 1));
+                                    attempt += 1;
+                                }
+                                Err(e) => {
+                                    let error = LlmError::Http(e.to_string());
+                                    if !retry.should_retry(attempt) {
+                                        return Some((Err(error), Stage::Done));
+                                    }
+                                    (sleep)(retry.delay_for(attempt + 1));
+                                    attempt += 1;
+                                }
                             }
-                            Err(e) => Some((Err(LlmError::Http(e.to_string())), Stage::Done)),
                         }
                     }
                     Stage::Streaming {
@@ -345,7 +412,8 @@ impl LlmAdapter for OpenAiCompatibleAdapter {
                     }
                     Stage::Done => None,
                 }
-            },
+                }
+            }
         ))
     }
 }

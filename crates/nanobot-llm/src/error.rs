@@ -35,6 +35,7 @@ pub enum LlmError {
     Cancelled,
 }
 
+#[cfg(feature = "providers")]
 impl From<reqwest::Error> for LlmError {
     fn from(e: reqwest::Error) -> Self {
         LlmError::Http(e.to_string())

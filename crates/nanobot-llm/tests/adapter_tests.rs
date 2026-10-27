@@ -3,7 +3,7 @@
 use futures_util::StreamExt;
 use nanobot_llm::{
     BlockAssembler, LlmAdapter, LlmError, LlmRequest, LlmRuntime, Message, OpenAiCompatibleAdapter,
-    Role, StreamChunk, ToolCallDelta,
+    RetryPolicy, Role, StreamChunk, ToolCallDelta,
 };
 
 /// A one-shot HTTP server that answers every request with `status` and `body`.
@@ -26,6 +26,137 @@ fn serve_once(status_line: &str, body: &'static str) -> (String, std::thread::Jo
         let _ = stream.write_all(response.as_bytes());
     });
     (format!("http://{addr}/v1/"), handle)
+}
+
+/// A server that answers the first `failures` requests with `status_line` and
+/// the rest with a 200 carrying `success_body`.
+///
+/// Returns how many requests it served, so a test can tell "retried" from "not
+/// retried" apart. Non-blocking, so a client that stops early does not hang the
+/// test.
+fn serve_failures_then_success(
+    failures: usize,
+    status_line: &str,
+    success_body: &'static str,
+) -> (String, std::thread::JoinHandle<usize>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let status_line = status_line.to_string();
+    let handle = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let mut served = 0usize;
+        let mut idle = 0usize;
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    idle = 0;
+                    let mut buf = [0_u8; 4096];
+                    let _ = stream.read(&mut buf);
+                    let (line, body) = if served < failures {
+                        (status_line.as_str(), "{}")
+                    } else {
+                        ("HTTP/1.1 200 OK", success_body)
+                    };
+                    let response = format!(
+                        "{line}\r\nContent-Type: application/json\r\nConnection: close\r\n\
+                         Content-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    served += 1;
+                }
+                Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    idle += 1;
+                    if idle > 40 || served > failures + 4 {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+        served
+    });
+    (format!("http://{addr}/v1/"), handle)
+}
+
+/// A request that carries one user message.
+fn request() -> LlmRequest {
+    LlmRequest {
+        model: "m".into(),
+        messages: vec![Message::new(Role::User, "hi")],
+        tools: vec![],
+        temperature: None,
+        max_tokens: None,
+    }
+}
+
+#[test]
+fn a_transient_failure_is_retried_and_then_succeeds() {
+    let (base_url, server) = serve_failures_then_success(
+        2,
+        "HTTP/1.1 503 Service Unavailable",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\
+         \"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+    );
+    let adapter = OpenAiCompatibleAdapter::new(base_url, "key")
+        .with_retry(RetryPolicy::transient(3))
+        .with_sleep(std::sync::Arc::new(|_| {}));
+    let mut stream = adapter.stream(request());
+
+    let chunks = block_on(async {
+        let mut out = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            out.push(chunk);
+        }
+        out
+    });
+    let served = server.join().unwrap();
+
+    assert_eq!(served, 3, "two failures, then the retry succeeded");
+    assert!(
+        chunks
+            .iter()
+            .any(|chunk| matches!(chunk, Ok(StreamChunk::Text(text)) if text == "ok")),
+        "the successful response reached the consumer: {chunks:?}"
+    );
+}
+
+#[test]
+fn a_4xx_is_the_providers_answer_and_is_not_retried() {
+    let (base_url, server) =
+        serve_failures_then_success(3, "HTTP/1.1 404 Not Found", r#"{"error":{}}"#);
+    let adapter = OpenAiCompatibleAdapter::new(base_url, "key")
+        .with_retry(RetryPolicy::transient(3))
+        .with_sleep(std::sync::Arc::new(|_| {}));
+    let mut stream = adapter.stream(request());
+
+    let first = block_on(async { stream.next().await });
+    let served = server.join().unwrap();
+
+    assert_eq!(served, 1, "a 404 is not retried");
+    match first {
+        Some(Err(LlmError::Http(message))) => assert!(message.contains("404"), "{message}"),
+        other => panic!("expected an HTTP error, got {other:?}"),
+    }
+}
+
+#[test]
+fn the_retry_budget_bounds_the_attempts() {
+    // Every request fails, so the chain stops at the budget.
+    let (base_url, server) =
+        serve_failures_then_success(99, "HTTP/1.1 500 Internal Server Error", "{}");
+    let adapter = OpenAiCompatibleAdapter::new(base_url, "key")
+        .with_retry(RetryPolicy::transient(2))
+        .with_sleep(std::sync::Arc::new(|_| {}));
+    let mut stream = adapter.stream(request());
+
+    let first = block_on(async { stream.next().await });
+    let served = server.join().unwrap();
+
+    assert_eq!(served, 3, "one attempt plus two retries");
+    assert!(matches!(first, Some(Err(LlmError::Http(_)))), "got {first:?}");
 }
 
 /// Drive a future on a current-thread tokio runtime.
