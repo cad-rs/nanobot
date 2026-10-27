@@ -168,6 +168,7 @@ fn harness_with_approval(
         parameters_schema: serde_json::json!({"type": "object"}),
         requires_approval,
         contract: nanobot_tools::ToolContract::ReadOnly,
+        validate_args: false,
     });
 
     let executor = executor.unwrap_or_else(|| Arc::new(CountingExecutor::default()));
@@ -312,6 +313,7 @@ fn a_missing_executor_is_recorded_not_fatal() {
         parameters_schema: serde_json::json!({"type": "object"}),
         requires_approval: false,
         contract: nanobot_tools::ToolContract::ReadOnly,
+        validate_args: false,
     });
     let agent = Agent::new(
         session,

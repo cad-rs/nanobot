@@ -10,9 +10,11 @@
 //! closure, so the execution backend stays the product's (an in-process
 //! engine, a worker bridge, a remote call — the framework does not care).
 //!
-//! Argument validation against the declared JSON Schema is the product's
-//! concern: the pipeline only checks that the arguments are a JSON object.
-//! (The hook point is `pre_execute` step 2.)
+//! Argument validation against the declared JSON Schema is the pipeline's
+//! [`validate`] step: `pre_execute` validates **and coerces** the arguments
+//! before anything reaches the executor, and hands back the coerced value to
+//! run with. The subset of JSON Schema it enforces is documented on the module
+//! — a product that needs a keyword outside it still validates in its executor.
 //!
 //! Provenance: extracted from the ocad design harness (see
 //! `docs/nanobot-architecture.md` in rcad-pro). The CAD tool bodies and the
@@ -24,6 +26,7 @@ pub mod error;
 pub mod mcp;
 pub mod registry;
 pub mod sandbox;
+pub mod validate;
 pub mod waterfall;
 
 pub use approval::{
@@ -35,4 +38,5 @@ pub use error::ToolError;
 pub use mcp::{McpClient, McpError, McpTool};
 pub use registry::{ToolDefinition, ToolRegistry};
 pub use sandbox::{PathSandbox, SandboxDecision, SandboxMode};
+pub use validate::{InvalidInput, validate};
 pub use waterfall::{PostExecuteResult, PreExecuteResult, ToolPipeline};

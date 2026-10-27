@@ -292,6 +292,7 @@ fn plan_tool_definition() -> nanobot_tools::ToolDefinition {
         }),
         requires_approval: false,
         contract: nanobot_tools::ToolContract::ReadOnly,
+        validate_args: false,
     }
 }
 
@@ -1062,7 +1063,7 @@ impl Agent {
                             .telemetry()
                             .start_span(SpanOptions::new("tool.execute", SpanKind::Tool));
 
-                        let args: serde_json::Value =
+                        let mut args: serde_json::Value =
                             serde_json::from_str(&tc.arguments).unwrap_or(serde_json::Value::Null);
 
                         let seq = self.inner.session.next_seq();
@@ -1090,7 +1091,14 @@ impl Agent {
                         // decision all happen here, before anything reaches the
                         // engine: an unregistered tool is refused, not run.
                         let denial = match self.inner.tools.pre_execute(&tc.name, &args) {
-                            nanobot_tools::PreExecuteResult::Allow => None,
+                            // The pipeline validated and coerced the arguments;
+                            // the coerced value is what runs, so a numeric string
+                            // the model wrote for a numeric field reaches the
+                            // executor as a number.
+                            nanobot_tools::PreExecuteResult::Allow(coerced) => {
+                                args = coerced;
+                                None
+                            }
                             // The approval policy resolves synchronously today,
                             // so `Ask` is not produced; refusing it keeps an
                             // unapproved call from slipping through.

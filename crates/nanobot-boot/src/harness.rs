@@ -895,6 +895,7 @@ mod tests {
             parameters_schema: serde_json::json!({"type": "object", "properties": {}}),
             requires_approval: false,
             contract: nanobot_tools::ToolContract::ReadOnly,
+            validate_args: false,
         };
         let _ = registry.register(definition);
 

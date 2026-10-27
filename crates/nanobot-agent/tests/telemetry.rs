@@ -72,6 +72,7 @@ fn harness(tool_first: bool) -> (Agent, Arc<RecordingTelemetryContext>) {
         parameters_schema: serde_json::json!({"type": "object"}),
         requires_approval: false,
         contract: nanobot_tools::ToolContract::ReadOnly,
+        validate_args: false,
     });
 
     let agent = Agent::new(session, llm, ToolPipeline::new(registry, Arc::new(AutoApprovalPolicy)));
@@ -161,6 +162,7 @@ fn the_default_context_emits_nothing() {
             parameters_schema: serde_json::json!({"type": "object"}),
             requires_approval: false,
             contract: nanobot_tools::ToolContract::ReadOnly,
+            validate_args: false,
         });
         let agent = Agent::new(session, llm, ToolPipeline::new(registry, Arc::new(AutoApprovalPolicy)));
         agent.set_tool_executor(Arc::new(NoopExecutor));
