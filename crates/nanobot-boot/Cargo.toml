@@ -42,3 +42,5 @@ uuid = { version = "1.0", features = ["v4", "serde", "js"] }
 
 [dev-dependencies]
 uuid = { workspace = true }
+# The end-to-end session tests drive a scripted `LlmAdapter` stream.
+futures-util = { workspace = true }
