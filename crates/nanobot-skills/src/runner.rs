@@ -190,6 +190,7 @@ mod tests {
                 scene: "test".into(),
                 inputs: SkillInputs::default(),
                 steps: vec![],
+                essential_ops: Vec::new(),
                 on_failure: FailureStrategy::Ask,
             },
             validation: None,
@@ -214,6 +215,7 @@ mod tests {
                 steps: vec![SkillStep::Ask {
                     ask: "material".into(),
                 }],
+                essential_ops: Vec::new(),
                 on_failure: FailureStrategy::Ask,
             },
             validation: None,

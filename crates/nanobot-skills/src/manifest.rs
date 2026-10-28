@@ -38,7 +38,8 @@ pub struct SkillPermissions {
     pub file_io: bool,
 }
 
-/// Skill definition: intent, scene, inputs, steps, and failure strategy.
+/// Skill definition: intent, scene, inputs, steps, the essential-ops
+/// declaration, and failure strategy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillDefinition {
     pub intent: String,
@@ -47,8 +48,20 @@ pub struct SkillDefinition {
     pub inputs: SkillInputs,
     #[serde(default)]
     pub steps: Vec<SkillStep>,
+    /// The essential-operations declaration: one entry per route group a
+    /// run must touch at least once (see [`EssentialOpsGroup`]).
+    #[serde(default)]
+    pub essential_ops: Vec<EssentialOpsGroup>,
     #[serde(default)]
     pub on_failure: FailureStrategy,
+}
+
+/// One essential-operations group: at least one of `any_of` must appear in
+/// a run's recorded tool calls for the group to count as satisfied — the
+/// route, not the result, is what the declaration pins.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EssentialOpsGroup {
+    pub any_of: Vec<String>,
 }
 
 /// Input field declarations.
@@ -98,7 +111,34 @@ pub struct SkillValidation {
     pub cases: Vec<String>,
 }
 
+/// The verdict of [`SkillManifest::essential_ops_report`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EssentialOpsReport {
+    /// Every declared group was satisfied by the recorded tool calls.
+    pub satisfied: bool,
+    /// The `any_of` lists of the groups no recorded call satisfied, in
+    /// declaration order.
+    pub unsatisfied_groups: Vec<Vec<String>>,
+}
+
 impl SkillManifest {
+    /// Grade a run's recorded tool-call names against the skill's
+    /// essential-ops declaration: each group is satisfied when at least one
+    /// of its `any_of` names appears in `used`.
+    pub fn essential_ops_report(&self, used: &[String]) -> EssentialOpsReport {
+        let unsatisfied_groups: Vec<Vec<String>> = self
+            .skill
+            .essential_ops
+            .iter()
+            .filter(|group| !group.any_of.iter().any(|op| used.iter().any(|call| call == op)))
+            .map(|group| group.any_of.clone())
+            .collect();
+        EssentialOpsReport {
+            satisfied: unsatisfied_groups.is_empty(),
+            unsatisfied_groups,
+        }
+    }
+
     /// Parse a skill manifest from TOML text.
     pub fn from_toml(text: &str) -> Result<Self, SkillError> {
         let manifest: SkillManifest =

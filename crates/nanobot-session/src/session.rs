@@ -53,6 +53,18 @@ struct SessionInner {
     subscribers: Mutex<Vec<Subscriber>>,
 }
 
+
+/// The tool names a run actually called, in call order — the run's tool
+/// record, as the essential-ops grader reads it.
+pub fn tool_call_names<'a>(events: impl Iterator<Item = &'a SessionEvent>) -> Vec<String> {
+    events
+        .filter_map(|event| match event {
+            SessionEvent::ToolCall { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 impl Session {
     /// Create a new session with the given ID.
     pub fn new(id: impl Into<String>) -> Self {

@@ -43,4 +43,4 @@ pub use persistence::default_path;
 #[cfg(not(target_family = "wasm"))]
 pub use persistence::{load, save};
 pub use projection::{derive_messages, ProjectedMessage};
-pub use session::{Disposable, LogEntry, NoopDisposable, Session};
+pub use session::{tool_call_names, Disposable, LogEntry, NoopDisposable, Session};

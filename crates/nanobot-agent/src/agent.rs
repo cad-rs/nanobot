@@ -90,14 +90,42 @@ impl WriteOutcome {
 
 /// Grades a plan's declared intent against the post-execution state.
 ///
+/// The plan-verifier's verdict: the prose notes, the raw measurements the
+/// checks recorded, and the scorer version that graded them — the regrade
+/// surface (design-harness 22.8): events carry the numbers, not just an
+/// aggregate count.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GradeVerdict {
+    /// Advisory notes on an accepted grade; the failure prose on a rejected
+    /// one.
+    pub notes: Vec<String>,
+    /// The raw per-check measurements (mm^3, IoU, ...), stamped onto the
+    /// session's check_result event.
+    pub measurements: std::collections::BTreeMap<String, f64>,
+    /// The scorer version that produced the measurements, when the checks
+    /// carry a versioned scoring contract.
+    pub scorer_version: Option<String>,
+}
+
+impl GradeVerdict {
+    /// A verdict carrying only prose (no measurements, no scorer stamp).
+    pub fn from_notes(notes: Vec<String>) -> Self {
+        GradeVerdict {
+            notes,
+            measurements: Default::default(),
+            scorer_version: None,
+        }
+    }
+}
+
 /// The intent is the agent's own declaration (opaque to the framework — the
 /// product parses it into whatever it needs). `Err` carries the failing
-/// measurements, handed back to the model so it can act on what went wrong
+/// verdict, handed back to the model so it can act on what went wrong
 /// rather than on an aggregate count.
 pub trait PlanVerifier: Send + Sync {
-    /// `Ok(notes)` accepts (notes are advisory); `Err(failures)` rejects with
-    /// the failing measurements.
-    fn grade(&self, intent: &serde_json::Value) -> Result<Vec<String>, Vec<String>>;
+    /// `Ok(verdict)` accepts (the notes are advisory); `Err(verdict)` rejects
+    /// with the failing verdict.
+    fn grade(&self, intent: &serde_json::Value) -> Result<GradeVerdict, GradeVerdict>;
 }
 
 /// Trait for tool execution backends.
@@ -332,6 +360,7 @@ impl Agent {
                 check_id,
                 passed,
                 details,
+                ..
             } = &entry.event
             {
                 let verdict = format!(
@@ -652,16 +681,25 @@ impl Agent {
         // No verifier, or no intent declared: nothing to check against, so the
         // plan passes on its own terms rather than failing vacuously.
         let passed = report.as_ref().map(|r| r.is_ok()).unwrap_or(true);
-        let detail = report
+        let verdict = report.as_ref().map(|r| match r {
+            Ok(verdict) if verdict.notes.is_empty() => GradeVerdict {
+                notes: vec!["every acceptance check passed".to_string()],
+                ..verdict.clone()
+            },
+            Ok(verdict) => GradeVerdict {
+                notes: vec![format!("passed with notes: {}", verdict.notes.join("; "))],
+                ..verdict.clone()
+            },
+            Err(verdict) => verdict.clone(),
+        });
+        let detail = verdict
             .as_ref()
-            .map(|r| match r {
-                Ok(warnings) if warnings.is_empty() => {
-                    "every acceptance check passed".to_string()
-                }
-                Ok(warnings) => format!("passed with notes: {}", warnings.join("; ")),
-                Err(failures) => failures.join("; "),
-            })
+            .map(|v| v.notes.join("; "))
             .unwrap_or_else(|| "no intent declared".to_string());
+        let (measurements, scorer_version) = verdict
+            .as_ref()
+            .map(|v| (v.measurements.clone(), v.scorer_version.clone()))
+            .unwrap_or_default();
 
         self.inner.session.append(SessionEvent::CheckRun {
             check_id: "plan:intent".to_string(),
@@ -670,6 +708,8 @@ impl Agent {
             check_id: "plan:intent".to_string(),
             passed,
             details: detail.clone(),
+            measurements,
+            scorer_version,
         });
 
         if passed {
@@ -694,7 +734,10 @@ impl Agent {
 
         let diagnostics = report
             .as_ref()
-            .map(|r| match r { Ok(w) => w.clone(), Err(f) => f.clone() })
+            .map(|r| match r {
+                Ok(v) => v.notes.clone(),
+                Err(v) => v.notes.clone(),
+            })
             .unwrap_or_default();
 
         let plan_id = {
@@ -886,6 +929,8 @@ impl Agent {
                         check_id: "llm:stream".to_string(),
                         passed: false,
                         details: detail,
+                        measurements: std::collections::BTreeMap::new(),
+                        scorer_version: None,
                     });
                     turn_reason = TurnEndReason::Error;
                     break;
@@ -1048,6 +1093,8 @@ impl Agent {
                             check_id,
                             passed: outcome.accepted,
                             details: check_details,
+                            measurements: std::collections::BTreeMap::new(),
+                            scorer_version: None,
                         });
                     }
                 }

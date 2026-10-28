@@ -605,6 +605,7 @@ mod tests {
                 scene: String::new(),
                 inputs: Default::default(),
                 steps: Vec::new(),
+                essential_ops: Vec::new(),
                 on_failure: Default::default(),
             },
             validation: None,

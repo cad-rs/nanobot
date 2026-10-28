@@ -30,7 +30,7 @@ pub mod cancellation;
 pub mod inbox;
 pub mod plan;
 
-pub use agent::{Agent, AgentState, PlanVerifier, RestorePoint, ToolExecutor, WriteCheck, WriteOutcome};
+pub use agent::{Agent, AgentState, GradeVerdict, PlanVerifier, RestorePoint, ToolExecutor, WriteCheck, WriteOutcome};
 pub use cancellation::CancellationToken;
 pub use inbox::Inbox;
 pub use plan::{Plan, PlanState};

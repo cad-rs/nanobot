@@ -14,6 +14,7 @@
 //! self-describing without making the framework know the product's nouns.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Reason a turn ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,11 +117,18 @@ pub enum SessionEvent {
     // -- check / verification --
     /// A verifier check was initiated.
     CheckRun { check_id: String },
-    /// A verifier check completed.
+    /// A verifier check completed. The raw measurements ride the event (the
+    /// regrade surface: numbers, not just prose), stamped with the scorer
+    /// version that graded them when the checks carry a versioned scoring
+    /// contract.
     CheckResult {
         check_id: String,
         passed: bool,
         details: String,
+        #[serde(default)]
+        measurements: BTreeMap<String, f64>,
+        #[serde(default)]
+        scorer_version: Option<String>,
     },
 
     // -- approval --
