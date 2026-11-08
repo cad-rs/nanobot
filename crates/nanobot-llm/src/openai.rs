@@ -85,6 +85,16 @@ impl OpenAiCompatibleAdapter {
                         "tool_calls": calls,
                     })
                 }
+                // A user message carrying an image is a multi-part content
+                // block, not a bare string: the provider would otherwise
+                // flatten the image away.
+                Role::User if m.image.is_some() => serde_json::json!({
+                    "role": "user",
+                    "content": [
+                        { "type": "text", "text": m.content },
+                        { "type": "image_url", "image_url": { "url": m.image } },
+                    ]
+                }),
                 _ => {
                     let role = match m.role {
                         Role::System => "system",
@@ -321,6 +331,32 @@ mod tests {
         assert_eq!(body["messages"][0]["content"], "be terse");
         assert!(body["messages"][0].get("tool_calls").is_none());
         assert_eq!(body["messages"][1]["role"], "user");
+    }
+
+    #[test]
+    fn a_user_message_with_an_image_is_sent_as_a_multi_part_content() {
+        let body = body_for(vec![Message::user_with_image(
+            "read the drawing",
+            "data:image/png;base64,AAAA",
+        )]);
+        let message = &body["messages"][0];
+        assert_eq!(message["role"], "user");
+        let content = message["content"].as_array().expect("multi-part content");
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "read the drawing");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(
+            content[1]["image_url"]["url"],
+            "data:image/png;base64,AAAA"
+        );
+    }
+
+    #[test]
+    fn a_text_only_user_message_keeps_the_plain_string_content() {
+        let body = body_for(vec![Message::user("hello")]);
+        let message = &body["messages"][0];
+        assert_eq!(message["content"], "hello");
+        assert!(message["content"].is_string());
     }
 
     #[test]

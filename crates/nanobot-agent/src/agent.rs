@@ -518,6 +518,21 @@ impl Agent {
         self.inner.inbox.push_turn(message.into());
     }
 
+    /// Send a followup message carrying an image, which starts a new turn.
+    ///
+    /// The image is a data URL (`data:image/png;base64,...`); the model sees it
+    /// as a multi-part user message, which is how a drawing reaches the agent.
+    pub fn followup_with_image(
+        &self,
+        message: impl Into<String>,
+        image: impl Into<String>,
+    ) {
+        self.inner.inbox.push_turn(crate::inbox::TurnMessage {
+            content: message.into(),
+            image: Some(image.into()),
+        });
+    }
+
     /// Send a steering message that will inject into the current step.
     pub fn steer(&self, message: impl Into<String>) {
         self.inner.inbox.push_step(message.into());
@@ -849,15 +864,18 @@ impl Agent {
 
                 // Get next step message (steering). For the first step, use the
                 // turn message; for subsequent steps, use steering or empty.
-                let step_message = if step == 0 {
-                    message.clone()
+                // The turn's own message may carry an image; steering messages
+                // are text-only.
+                let (step_message, step_image) = if step == 0 {
+                    (message.content.clone(), message.image.clone())
                 } else {
-                    self.inner.inbox.pop_step().unwrap_or_default()
+                    (self.inner.inbox.pop_step().unwrap_or_default(), None)
                 };
 
                 // user/message
                 self.inner.session.append(SessionEvent::UserMessage {
                     content: step_message,
+                    image: step_image,
                     selection_ref: None,
                 });
 
@@ -868,7 +886,12 @@ impl Agent {
                     projected
                         .into_iter()
                         .map(|m| match m {
-                            nanobot_session::ProjectedMessage::User(content) => Message::user(content),
+                            nanobot_session::ProjectedMessage::User { content, image } => {
+                                match image {
+                                    Some(image) => Message::user_with_image(content, image),
+                                    None => Message::user(content),
+                                }
+                            }
                             nanobot_session::ProjectedMessage::Assistant(content) => {
                                 Message::assistant(content)
                             }

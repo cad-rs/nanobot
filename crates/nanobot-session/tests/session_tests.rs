@@ -19,7 +19,8 @@ fn derive_messages_projects_model_visible() {
     let s = Session::new("test");
     s.append(SessionEvent::UserMessage {
         content: "hello".into(),
-        selection_ref: None,
+        image: None,
+            selection_ref: None,
     });
     s.append(SessionEvent::AssistantMessage {
         content: "hi".into(),
@@ -36,11 +37,36 @@ fn derive_messages_projects_model_visible() {
 
     let messages = s.derive_messages();
     assert_eq!(messages.len(), 3);
-    assert_eq!(messages[0], ProjectedMessage::User("hello".into()));
+    assert_eq!(
+        messages[0],
+        ProjectedMessage::User {
+            content: "hello".into(),
+            image: None,
+        }
+    );
     assert_eq!(messages[1], ProjectedMessage::Assistant("hi".into()));
     assert_eq!(
         messages[2],
         ProjectedMessage::System("Plan rejected: bad".into())
+    );
+}
+
+#[test]
+fn a_user_message_with_an_image_projects_the_image() {
+    let s = Session::new("image_test");
+    s.append(SessionEvent::UserMessage {
+        content: "read the drawing".into(),
+        image: Some("data:image/png;base64,AAAA".into()),
+        selection_ref: None,
+    });
+
+    let messages = s.derive_messages();
+    assert_eq!(
+        messages[0],
+        ProjectedMessage::User {
+            content: "read the drawing".into(),
+            image: Some("data:image/png;base64,AAAA".into()),
+        }
     );
 }
 
@@ -50,7 +76,8 @@ fn truncate_to_rewinds_the_log_and_resumes_numbering() {
     s.append(SessionEvent::TurnStart { turn: 0 }); // seq 0
     s.append(SessionEvent::UserMessage {
         content: "keep me".into(),
-        selection_ref: None,
+        image: None,
+            selection_ref: None,
     }); // seq 1
     s.append(SessionEvent::ToolCall {
         id: "c1".into(),
@@ -112,7 +139,8 @@ fn persist_to_writes_the_log_as_it_grows() {
     session.append(SessionEvent::TurnStart { turn: 0 });
     session.append(SessionEvent::UserMessage {
         content: "hello".into(),
-        selection_ref: None,
+        image: None,
+            selection_ref: None,
     });
 
     let loaded = nanobot_session::load(&path).expect("the log is readable");
@@ -138,7 +166,8 @@ fn a_rewind_reaches_the_file_on_the_next_append() {
     session.append(SessionEvent::TurnStart { turn: 0 });
     session.append(SessionEvent::UserMessage {
         content: "make a plate".into(),
-        selection_ref: None,
+        image: None,
+            selection_ref: None,
     });
     session.append(SessionEvent::ToolCall {
         id: "call_1".into(),
@@ -223,7 +252,8 @@ fn persistence_roundtrip() {
     let s = Session::new("persist_test");
     s.append(SessionEvent::UserMessage {
         content: "test".into(),
-        selection_ref: None,
+        image: None,
+            selection_ref: None,
     });
 
     let path = std::env::temp_dir().join("nanobot_session_test.jsonl");

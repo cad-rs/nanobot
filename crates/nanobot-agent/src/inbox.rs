@@ -11,10 +11,42 @@
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
+/// One turn-starting message: text plus an optional image.
+#[derive(Clone, Debug, Default)]
+pub struct TurnMessage {
+    /// The text content.
+    pub content: String,
+    /// An image as a data URL (`data:image/png;base64,...`), sent to the model
+    /// as a multi-part content block alongside the text.
+    pub image: Option<String>,
+}
+
+impl TurnMessage {
+    /// A text-only turn message.
+    pub fn text(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            image: None,
+        }
+    }
+}
+
+impl From<String> for TurnMessage {
+    fn from(content: String) -> Self {
+        Self::text(content)
+    }
+}
+
+impl From<&str> for TurnMessage {
+    fn from(content: &str) -> Self {
+        Self::text(content)
+    }
+}
+
 /// Dual-queue message buffer for agent input.
 #[derive(Default)]
 pub struct Inbox {
-    next_turn: Mutex<VecDeque<String>>,
+    next_turn: Mutex<VecDeque<TurnMessage>>,
     next_step: Mutex<VecDeque<String>>,
 }
 
@@ -25,7 +57,7 @@ impl Inbox {
     }
 
     /// Push a message that will start a new turn.
-    pub fn push_turn(&self, message: impl Into<String>) {
+    pub fn push_turn(&self, message: impl Into<TurnMessage>) {
         self.next_turn.lock().unwrap().push_back(message.into());
     }
 
@@ -35,7 +67,7 @@ impl Inbox {
     }
 
     /// Pop the next turn message, if any.
-    pub fn pop_turn(&self) -> Option<String> {
+    pub fn pop_turn(&self) -> Option<TurnMessage> {
         self.next_turn.lock().unwrap().pop_front()
     }
 

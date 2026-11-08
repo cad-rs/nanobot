@@ -68,6 +68,10 @@ pub enum SessionEvent {
     /// User input message.
     UserMessage {
         content: String,
+        /// Optional image as a data URL (`data:image/png;base64,...`), sent to
+        /// the model as a multi-part content block alongside the text.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        image: Option<String>,
         /// Optional selection reference (design-harness F2 check-item spatialization).
         selection_ref: Option<String>,
     },

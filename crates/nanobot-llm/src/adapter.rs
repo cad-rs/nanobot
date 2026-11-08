@@ -37,6 +37,10 @@ pub struct Message {
     /// For [`Role::Tool`]: the call id this message answers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// For [`Role::User`]: an image as a data URL (`data:image/png;base64,...`),
+    /// sent as a multi-part content block. Text-only messages carry `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
 }
 
 impl Message {
@@ -47,6 +51,7 @@ impl Message {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            image: None,
         }
     }
 
@@ -58,6 +63,14 @@ impl Message {
     /// A user message.
     pub fn user(content: impl Into<String>) -> Self {
         Self::new(Role::User, content)
+    }
+
+    /// A user message carrying an image alongside its text.
+    pub fn user_with_image(content: impl Into<String>, image: impl Into<String>) -> Self {
+        Self {
+            image: Some(image.into()),
+            ..Self::new(Role::User, content)
+        }
     }
 
     /// A plain assistant message.
@@ -80,6 +93,7 @@ impl Message {
                 arguments: arguments.into(),
             }],
             tool_call_id: None,
+            image: None,
         }
     }
 
@@ -90,6 +104,7 @@ impl Message {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: Some(id.into()),
+            image: None,
         }
     }
 }

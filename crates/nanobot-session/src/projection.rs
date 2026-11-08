@@ -18,7 +18,11 @@ use crate::session::LogEntry;
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ProjectedMessage {
     System(String),
-    User(String),
+    User {
+        content: String,
+        /// The image carried by the user message, when present.
+        image: Option<String>,
+    },
     Assistant(String),
     ToolCall {
         id: String,
@@ -41,8 +45,13 @@ pub fn derive_messages(entries: &[LogEntry]) -> Vec<ProjectedMessage> {
 
     for entry in entries {
         match &entry.event {
-            SessionEvent::UserMessage { content, .. } => {
-                messages.push(ProjectedMessage::User(content.clone()));
+            SessionEvent::UserMessage {
+                content, image, ..
+            } => {
+                messages.push(ProjectedMessage::User {
+                    content: content.clone(),
+                    image: image.clone(),
+                });
             }
             SessionEvent::AssistantMessage { content } => {
                 messages.push(ProjectedMessage::Assistant(content.clone()));
