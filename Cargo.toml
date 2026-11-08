@@ -49,7 +49,11 @@ futures-executor = "0.3"
 futures-core = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 bytes = "1"
-reqwest = { version = "0.12", default-features = false, features = ["stream", "json"] }
+# `default-tls` is required for HTTPS providers: without a TLS backend the
+# OpenAI-compatible adapter cannot complete a handshake at all (it fails with
+# "unexpected EOF during handshake" against any https:// endpoint). On Windows
+# this is schannel, on Linux OpenSSL, on macOS SecureTransport.
+reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "default-tls"] }
 eventsource-stream = { version = "0.2", default-features = false }
 wasm-bindgen-futures = "0.4"
 

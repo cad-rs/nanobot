@@ -135,18 +135,24 @@ impl OpenAiCompatibleAdapter {
     fn parse_chunk(data: &str) -> Result<StreamChunk, LlmError> {
         let value: serde_json::Value = serde_json::from_str(data)?;
 
-        let choices = value
-            .get("choices")
-            .and_then(|c| c.as_array())
-            .ok_or_else(|| LlmError::Provider("missing choices in chunk".to_string()))?;
+        // A provider may emit a final usage-only chunk (`choices: []`) after
+        // the last content chunk; the caller skips empty text, so yield that
+        // rather than failing the whole stream.
+        let choices = match value.get("choices").and_then(|c| c.as_array()) {
+            Some(choices) => choices,
+            None => return Ok(StreamChunk::Text(String::new())),
+        };
+        let choice = match choices.first() {
+            Some(choice) => choice,
+            None => return Ok(StreamChunk::Text(String::new())),
+        };
 
-        let choice = choices
-            .first()
-            .ok_or_else(|| LlmError::Provider("empty choices array".to_string()))?;
-
-        let delta = choice
-            .get("delta")
-            .ok_or_else(|| LlmError::Provider("missing delta in choice".to_string()))?;
+        let delta = match choice.get("delta") {
+            Some(delta) => delta,
+            // A usage-only chunk can also carry the totals at the choice
+            // level; there is no delta to read.
+            None => return Ok(StreamChunk::Text(String::new())),
+        };
 
         // Check for tool calls in this delta.
         if let Some(tool_calls) = delta.get("tool_calls").and_then(|tc| tc.as_array()) {
@@ -315,5 +321,20 @@ mod tests {
         assert_eq!(body["messages"][0]["content"], "be terse");
         assert!(body["messages"][0].get("tool_calls").is_none());
         assert_eq!(body["messages"][1]["role"], "user");
+    }
+
+    #[test]
+    fn a_usage_only_chunk_yields_no_text_rather_than_failing_the_stream() {
+        // LongCat (and others) close a stream with a usage-only chunk whose
+        // `choices` array is empty; the stream must survive it.
+        let chunk = OpenAiCompatibleAdapter::parse_chunk(
+            r#"{"choices":[],"usage":{"completion_tokens":1,"prompt_tokens":2,"total_tokens":3}}"#,
+        )
+        .expect("a usage-only chunk is not an error");
+        assert_eq!(chunk, StreamChunk::Text(String::new()));
+
+        let chunk = OpenAiCompatibleAdapter::parse_chunk(r#"{"usage":{"total_tokens":3}}"#)
+            .expect("a chunk with no choices is not an error");
+        assert_eq!(chunk, StreamChunk::Text(String::new()));
     }
 }

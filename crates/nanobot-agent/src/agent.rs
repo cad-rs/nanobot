@@ -211,6 +211,11 @@ struct AgentInner {
     /// post-execution state (design-harness 14.3). Absent -> a plan with an
     /// intent passes (nothing to check against).
     plan_verifier: Mutex<Option<Arc<dyn PlanVerifier>>>,
+    /// The model identifier sent on every request. The default (`"default"`)
+    /// matches the provider key the runtime is registered under, which is
+    /// what a proxy that ignores the field expects; a real provider needs
+    /// the concrete model name, so [`Agent::set_model`] overrides it.
+    model: Mutex<String>,
 }
 
 /// How many steps one turn may take before it is cut off.
@@ -305,8 +310,24 @@ impl Agent {
                 plan_start_seq: Mutex::new(None),
                 prompt_assembler: Mutex::new(None),
                 plan_verifier: Mutex::new(None),
+                model: Mutex::new("default".to_string()),
             }),
         }
+    }
+
+    /// Set the model identifier sent to the provider on every request.
+    ///
+    /// The runtime routes by provider key, but the request still carries a
+    /// model name; a real provider rejects an unknown one. Defaults to
+    /// `"default"`, which is what a proxy that maps the key to a model
+    /// expects.
+    pub fn set_model(&self, model: impl Into<String>) {
+        *self.inner.model.lock().unwrap() = model.into();
+    }
+
+    /// The model identifier the agent currently sends.
+    pub fn model(&self) -> String {
+        self.inner.model.lock().unwrap().clone()
     }
 
     /// Install the `prompt/assemble` hook.
@@ -883,7 +904,7 @@ impl Agent {
 
                 // Build LLM request.
                 let request = LlmRequest {
-                    model: "default".to_string(),
+                    model: self.inner.model.lock().unwrap().clone(),
                     messages,
                     tools: tool_defs,
                     temperature: None,
@@ -1170,4 +1191,33 @@ fn verification_feedback(diagnostics: &[String]) -> String {
         }
     }
     message
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nanobot_llm::LlmRuntime;
+    use nanobot_session::Session;
+    use nanobot_tools::{AutoApprovalPolicy, ToolPipeline, ToolRegistry};
+    use std::sync::Arc;
+
+    fn agent() -> Agent {
+        let session = Session::new("test");
+        let llm = LlmRuntime::new();
+        let registry = Arc::new(ToolRegistry::new());
+        let pipeline = ToolPipeline::new(registry, Arc::new(AutoApprovalPolicy));
+        Agent::new(session, llm, pipeline)
+    }
+
+    #[test]
+    fn the_model_name_defaults_to_the_provider_key() {
+        assert_eq!(agent().model(), "default");
+    }
+
+    #[test]
+    fn the_model_name_can_be_overridden() {
+        let agent = agent();
+        agent.set_model("a-real-model");
+        assert_eq!(agent.model(), "a-real-model");
+    }
 }
