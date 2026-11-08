@@ -12,7 +12,7 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 
 /// One turn-starting message: text plus an optional image.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TurnMessage {
     /// The text content.
     pub content: String,
