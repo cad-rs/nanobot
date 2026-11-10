@@ -43,8 +43,9 @@ use crate::model::{
 use crate::panels::{PanelArea, PanelDef, PanelHost};
 use crate::i18n::Locale;
 use crate::layout::{Divider, Fold, Layout, LayoutState, Stacked};
+use crate::stream::StreamState;
 use crate::theme::ThemeKind;
-use crate::transcript::{EntryKind, SessionBadge, ToolStatus, Transcript, TurnPhase};
+use crate::transcript::{SessionBadge, Transcript, TurnPhase};
 
 
 
@@ -157,7 +158,7 @@ pub struct HarnessShell<S: SessionView> {
     rejected_plugins: Vec<(String, String)>,
     /// The UI locale every string in this shell renders in: a user setting
     /// (`ui.locale`), defaulted from the harness profile.
-    locale: Locale,
+    pub(crate) locale: Locale,
     /// The settings panel's font-family input, created on first show.
     font_input: Rc<RefCell<Option<Entity<InputState>>>>,
     _font_input_sub: Rc<RefCell<Option<Subscription>>>,
@@ -172,6 +173,8 @@ pub struct HarnessShell<S: SessionView> {
     /// The active session's conversation as it is on screen, kept so a new
     /// projection reduces to changes at entry indices.
     transcript: Transcript,
+    /// The conversation as rows of a virtualised list.
+    pub(crate) stream: StreamState,
     /// Sessions that finished a turn while another was on screen.
     unread: RefCell<HashSet<SessionId>>,
 }
@@ -221,6 +224,7 @@ impl<S: SessionView> HarnessShell<S> {
             dragging: None,
             focus_anchor: None,
             transcript: Transcript::default(),
+            stream: StreamState::default(),
             unread: RefCell::new(HashSet::new()),
         };
         // Framework chrome: the diagnostics panel is always there (it reads
@@ -462,12 +466,12 @@ impl<S: SessionView> HarnessShell<S> {
     }
 
     /// The localized text for `key` in the shell's locale.
-    fn tr(&self, key: &'static str) -> &'static str {
+    pub(crate) fn tr(&self, key: &'static str) -> &'static str {
         crate::i18n::t(self.locale, key)
     }
 
     /// [`tr`](Self::tr) with `{placeholder}` substitution.
-    fn trf(&self, key: &str, args: &[(&str, &str)]) -> String {
+    pub(crate) fn trf(&self, key: &str, args: &[(&str, &str)]) -> String {
         crate::i18n::t_replace(self.locale, key, args)
     }
 
@@ -666,6 +670,15 @@ impl<S: SessionView> HarnessShell<S> {
         &self.transcript
     }
 
+    /// The conversation stream: its rows, and what is folded.
+    pub fn stream(&self) -> &StreamState {
+        &self.stream
+    }
+
+    pub fn stream_mut(&mut self) -> &mut StreamState {
+        &mut self.stream
+    }
+
     /// Hands a freshly baked scene to the active session's renderer.
     pub fn update_scene(&self, scene: &S::Scene) {
         let Some(id) = self.active_session_id() else {
@@ -729,6 +742,7 @@ impl<S: SessionView> HarnessShell<S> {
         let viewport = self.viewport_of(id);
         let workspace = session.build_workspace(viewport);
         self.transcript.reconcile(workspace.conversation());
+        self.stream.set_entries(self.transcript.entries());
         self.workspace = Some(workspace);
         // On screen now: it is no longer news.
         self.unread.borrow_mut().remove(id);
@@ -770,18 +784,18 @@ impl<S: SessionView> HarnessShell<S> {
 /// Color slots the panels use (copied out of the gpui-component theme so the
 /// element builders do not hold a borrow of it).
 #[derive(Clone, Copy)]
-struct Palette {
-    fg: Hsla,
-    muted: Hsla,
-    border: Hsla,
-    accent: Hsla,
-    success: Hsla,
-    info: Hsla,
-    warning: Hsla,
-    danger: Hsla,
+pub(crate) struct Palette {
+    pub(crate) fg: Hsla,
+    pub(crate) muted: Hsla,
+    pub(crate) border: Hsla,
+    pub(crate) accent: Hsla,
+    pub(crate) success: Hsla,
+    pub(crate) info: Hsla,
+    pub(crate) warning: Hsla,
+    pub(crate) danger: Hsla,
 }
 
-fn palette(cx: &App) -> Palette {
+pub(crate) fn palette(cx: &App) -> Palette {
     let theme = cx.theme();
     Palette {
         fg: theme.foreground,
@@ -829,53 +843,6 @@ fn step_color(status: StepStatus, p: Palette) -> Hsla {
         StepStatus::Pending => p.muted,
         StepStatus::InProgress => p.info,
         StepStatus::Done => p.success,
-    }
-}
-
-fn tool_color(status: ToolStatus, p: Palette) -> Hsla {
-    match status {
-        ToolStatus::AwaitingApproval => p.warning,
-        ToolStatus::Running => p.info,
-        ToolStatus::Done => p.success,
-        ToolStatus::Failed => p.danger,
-        ToolStatus::Cancelled | ToolStatus::Rejected => p.muted,
-    }
-}
-
-/// The label an entry is headed with, and its colour.
-fn entry_head(kind: &EntryKind, locale: Locale, p: Palette) -> (&'static str, Hsla) {
-    let (key, color) = match kind {
-        EntryKind::User { .. } => ("entry.user", p.fg),
-        EntryKind::Assistant { .. } => ("entry.assistant", p.info),
-        EntryKind::Thinking { .. } => ("entry.thinking", p.muted),
-        EntryKind::Tool(_) => ("entry.tool", p.success),
-        EntryKind::Plan { .. } => ("entry.plan", p.warning),
-        EntryKind::Check { passed: true, .. } => ("entry.check", p.success),
-        EntryKind::Check { passed: false, .. } => ("entry.check", p.danger),
-        EntryKind::TurnEnd { .. } => ("entry.turn_end", p.muted),
-        EntryKind::Error { .. } => ("entry.error", p.danger),
-    };
-    (crate::i18n::t(locale, key), color)
-}
-
-/// An entry's text as one plain string: how every kind is shown until the
-/// conversation stream gets its per-kind appearance.
-fn entry_text(kind: &EntryKind) -> String {
-    match kind {
-        EntryKind::User { text } | EntryKind::Thinking { text, .. } => text.clone(),
-        EntryKind::Assistant { markdown, .. } => markdown.clone(),
-        EntryKind::Tool(call) => call.title.clone(),
-        EntryKind::Plan { steps } => steps
-            .iter()
-            .map(|step| step.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n"),
-        EntryKind::Check { name, details, .. } => match details {
-            Some(details) => format!("{name}\n{details}"),
-            None => name.clone(),
-        },
-        EntryKind::TurnEnd { summary } => summary.clone(),
-        EntryKind::Error { title, message, .. } => format!("{title}\n{message}"),
     }
 }
 
@@ -1629,7 +1596,6 @@ impl<S: SessionView> HarnessShell<S> {
     fn ai_workspace(&self, ws: &S::Workspace, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
         let plan = plan_rows(&ws.plan(), p, self.locale);
-        let conversation = self.conversation_stream(p, cx);
         div()
             .flex_1()
             .h_full()
@@ -1680,20 +1646,12 @@ impl<S: SessionView> HarnessShell<S> {
             .child(
                 div()
                     .flex_1()
-                    .overflow_hidden()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
                     .border_t_1()
                     .border_color(p.border)
-                    .child(panel(
-                        self.tr("shell.conversation"),
-                        p,
-                        div()
-                            .id("harness-conversation".to_string())
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .overflow_y_scroll()
-                            .child(conversation),
-                    )),
+                    .child(self.render_stream(cx)),
             )
             .when_some(self.composer.clone(), |panel, composer| {
                 panel.child(
@@ -1839,65 +1797,6 @@ impl<S: SessionView> HarnessShell<S> {
             )
     }
 
-    /// The conversation stream of the active session.
-    fn conversation_stream(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
-        let selected = self.selected_block;
-        let mut stream = div().flex().flex_col().gap_2();
-        for entry in self.transcript.entries() {
-            let (label, color) = entry_head(&entry.kind, self.locale, p);
-            let anchor = format!("#{}", entry.seq);
-            let is_selected = selected == Some(entry.seq);
-            let seq = entry.seq;
-            let mut head = div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .child(div().text_xs().text_color(color).child(label))
-                .child(div().text_xs().text_color(p.muted).child(anchor));
-            if let EntryKind::Tool(call) = &entry.kind {
-                head = head.child(badge(
-                    call.status.label(self.locale),
-                    tool_color(call.status, p),
-                ));
-            }
-            stream = stream.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .px_2()
-                    .py_1()
-                    .rounded(px(4.))
-                    .cursor_pointer()
-                    .when(is_selected, |d| d.bg(p.accent.opacity(0.2)))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this: &mut Self, _ev: &MouseDownEvent, _w, cx| {
-                            this.select_block(Some(seq));
-                            cx.notify();
-                        }),
-                    )
-                    .child(head)
-                    .when_some(entry.anchor.as_ref(), |d, anchor| {
-                        d.child(
-                            div()
-                                .px_2()
-                                .py_0p5()
-                                .rounded(px(3.))
-                                .bg(p.info.opacity(0.16))
-                                .text_color(p.info)
-                                .text_xs()
-                                .cursor_pointer()
-                                .child(anchor.clone()),
-                        )
-                    })
-                    .child(div().text_sm().child(entry_text(&entry.kind))),
-            );
-        }
-        stream
-    }
-
     /// Renders one dock region: every registered panel of that area, stacked.
     fn dock_region(
         &self,
@@ -1906,6 +1805,9 @@ impl<S: SessionView> HarnessShell<S> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        // Only this region's panels, in their order.
+        let mut panels: Vec<&PanelDef<S>> = panels.iter().filter(|p| p.area == area).collect();
+        panels.sort_by_key(|p| p.order);
         if panels.is_empty() {
             return div().into_any_element();
         }
@@ -1947,7 +1849,6 @@ impl<S: SessionView> HarnessShell<S> {
                     .child(div().flex_1().overflow_hidden().child(body)),
             );
         }
-        let _ = area;
         column.into_any_element()
     }
 }
@@ -2363,17 +2264,16 @@ fn plan_rows(plan: &[PlanStep], p: Palette, locale: Locale) -> impl IntoElement 
 impl<S: SessionView> Render for HarnessShell<S> {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
-        // Bring the conversation on screen up to the workspace's projection.
-        // What changed comes back as changes at entry indices; nothing reads
-        // them yet (the stream is redrawn whole until it is a virtualised
-        // list), but the transcript is already what the stream draws from.
-        match self.workspace.as_ref() {
-            Some(ws) => {
-                self.transcript.reconcile(ws.conversation());
-            }
-            None => {
-                self.transcript.reconcile(Default::default());
-            }
+        // Bring the conversation on screen up to the workspace's projection:
+        // what changed reaches the list as rows to remeasure and a splice, so
+        // a streaming answer costs its last row, not the whole stream.
+        let conversation = self
+            .workspace
+            .as_ref()
+            .map(|ws| ws.conversation())
+            .unwrap_or_default();
+        if !self.transcript.reconcile(conversation).is_empty() {
+            self.stream.set_entries(self.transcript.entries());
         }
         let window_width = f32::from(window.viewport_size().width);
         self.layout.observe(window_width);

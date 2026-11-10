@@ -28,6 +28,7 @@ pub mod model;
 pub mod panels;
 pub mod poll;
 pub mod shell;
+pub mod stream;
 pub mod theme;
 pub mod transcript;
 pub mod widgets;
@@ -45,6 +46,7 @@ pub use transcript::{
 };
 pub use layout::{Divider, Fold, Layout, LayoutState, Regions, Stacked};
 pub use shell::{init, HarnessShell, ToggleDock, ToggleSidebar, KEY_CONTEXT};
+pub use stream::{Row, RowKey, RowKind, StreamState};
 pub use i18n::{t, t_replace, Locale};
 pub use theme::{
     apply, apply_font, apply_from_settings, set_theme, ThemeKind, FONT_FAMILY_KEY,
@@ -74,6 +76,9 @@ mod tests {
         parent_session: Option<SessionId>,
         parent_seq: Option<u32>,
         archived: bool,
+        /// A conversation shared with whoever drives the session, so a test
+        /// can stream into the workspace on screen.
+        live: Option<Rc<RefCell<Conversation>>>,
     }
 
     impl TestSession {
@@ -89,6 +94,7 @@ mod tests {
                 parent_session: None,
                 parent_seq: None,
                 archived: false,
+                live: None,
             }
         }
     }
@@ -104,6 +110,7 @@ mod tests {
         clarify_questions: Vec<String>,
         progress: Option<(u32, u32)>,
         settlement: Vec<(String, bool)>,
+        live: Option<Rc<RefCell<Conversation>>>,
     }
 
     impl WorkspaceView for TestWorkspace {
@@ -117,7 +124,10 @@ mod tests {
             self.status
         }
         fn conversation(&self) -> Conversation {
-            self.conversation.clone()
+            match &self.live {
+                Some(live) => live.borrow().clone(),
+                None => self.conversation.clone(),
+            }
         }
         fn plan(&self) -> Vec<PlanStep> {
             self.plan.clone()
@@ -221,6 +231,7 @@ mod tests {
                 clarify_questions: self.clarify_questions.clone(),
                 progress: None,
                 settlement: Vec::new(),
+                live: self.live.clone(),
             }
         }
     }
@@ -664,6 +675,207 @@ mod tests {
         assert_eq!(seqs(&shell), [10, 11]);
         shell.switch_session(&SessionId::new("s1"));
         assert_eq!(seqs(&shell), [1, 2, 3]);
+    }
+
+    // ---- the conversation stream, drawn ----
+
+    /// A shell in a (headless) window on one session whose conversation the
+    /// test can stream into.
+    fn streaming_shell(
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        gpui::Entity<HarnessShell<TestSession>>,
+        Rc<RefCell<Conversation>>,
+        &mut gpui::VisualTestContext,
+    ) {
+        cx.update(gpui_component::init);
+        let live = Rc::new(RefCell::new(Conversation::from_entries(vec![Entry::user(
+            1,
+            "cut four holes",
+        )])));
+        let session = TestSession {
+            live: Some(live.clone()),
+            status: SessionStatus::Running,
+            ..TestSession::new("s1")
+        };
+        let (shell, cx) = cx.add_window_view(|_, _| HarnessShell::new(one_project(vec![session])));
+        (shell, live, cx)
+    }
+
+    fn redraw(shell: &gpui::Entity<HarnessShell<TestSession>>, cx: &mut gpui::VisualTestContext) {
+        shell.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            _ = window.draw(cx);
+        });
+    }
+
+    fn paragraphs(count: usize) -> String {
+        (0..count)
+            .map(|ix| format!("Paragraph {ix}: the bracket keeps **4 mm** of wall here.\n\n"))
+            .collect()
+    }
+
+    #[gpui::test]
+    fn an_answer_streams_into_the_list_and_the_end_stays_in_view(cx: &mut gpui::TestAppContext) {
+        let (shell, live, cx) = streaming_shell(cx);
+        redraw(&shell, cx);
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.stream().rows().len(), 1);
+            assert!(shell.stream().is_following());
+        });
+
+        // The answer arrives a few hundred bytes at a time.
+        let answer = paragraphs(160);
+        let mut rows_seen = Vec::new();
+        for len in (300..answer.len()).step_by(700) {
+            let mut cut = len;
+            while !answer.is_char_boundary(cut) {
+                cut += 1;
+            }
+            live.borrow_mut().entries.truncate(1);
+            live.borrow_mut()
+                .entries
+                .push(Entry::assistant_streaming(2, &answer[..cut]));
+            redraw(&shell, cx);
+            shell.read_with(cx, |shell, _| {
+                rows_seen.push(shell.stream().rows().len());
+                assert!(shell.stream().is_following(), "at {cut} bytes");
+                assert!(shell.stream().at_end(), "at {cut} bytes");
+            });
+        }
+        assert!(
+            rows_seen.windows(2).all(|pair| pair[0] <= pair[1]),
+            "rows only ever get added: {rows_seen:?}"
+        );
+        assert!(*rows_seen.last().unwrap() > 4, "a long answer is several rows");
+
+        // It ends: a tool call, a check, the turn's end.
+        {
+            let mut live = live.borrow_mut();
+            live.entries.truncate(1);
+            live.entries.push(Entry::assistant(2, answer.as_str()));
+            live.entries.push(Entry::tool(
+                3,
+                ToolCall::new(ToolKind::Edit, "pattern_holes(4)", ToolStatus::Done)
+                    .with_output("4 holes\n"),
+            ));
+            live.entries.push(Entry::check(4, "wall thickness", true));
+            live.entries.push(Entry::turn_end(5, "12s"));
+        }
+        redraw(&shell, cx);
+        shell.read_with(cx, |shell, _| {
+            let rows = shell.stream().rows();
+            assert_eq!(rows.len(), rows_seen.last().unwrap() + 3);
+            assert!(shell.stream().at_end());
+        });
+    }
+
+    #[gpui::test]
+    fn scrolling_up_holds_the_stream_still_until_the_user_goes_back(cx: &mut gpui::TestAppContext) {
+        let (shell, live, cx) = streaming_shell(cx);
+        let answer = paragraphs(200);
+        live.borrow_mut()
+            .entries
+            .push(Entry::assistant_streaming(2, &answer[..6000]));
+        redraw(&shell, cx);
+        // Where the session column is in a default-sized test window.
+        let over_stream = gpui::point(gpui::px(500.), gpui::px(300.));
+        cx.simulate_event(gpui::ScrollEvent {
+            position: over_stream,
+            delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(400.))),
+            ..Default::default()
+        });
+        redraw(&shell, cx);
+        let held = shell.read_with(cx, |shell, _| {
+            assert!(!shell.stream().is_following(), "scrolling up stops the following");
+            shell.stream().scroll_position()
+        });
+
+        // The answer keeps arriving; what the user is reading does not move.
+        live.borrow_mut().entries.truncate(1);
+        live.borrow_mut()
+            .entries
+            .push(Entry::assistant_streaming(2, answer.as_str()));
+        redraw(&shell, cx);
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.stream().scroll_position(), held);
+            assert!(!shell.stream().at_end());
+        });
+
+        // "Jump to end".
+        shell.update(cx, |shell, _| shell.stream().follow());
+        redraw(&shell, cx);
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.stream().is_following());
+            assert!(shell.stream().at_end());
+        });
+    }
+
+    #[gpui::test]
+    fn every_kind_of_row_draws_folded_and_unfolded(cx: &mut gpui::TestAppContext) {
+        let (shell, live, cx) = streaming_shell(cx);
+        let output: String = (1..=30).map(|n| format!("line {n}\n")).collect();
+        live.borrow_mut().entries = vec![
+            Entry::user(1, "cut four holes"),
+            Entry::thinking(2, "which face is the top one?", Some(1800)),
+            Entry::assistant(3, "On it.\n\n```rhai\nlet n = 4;\n```\n"),
+            Entry::tool(4, ToolCall::new(ToolKind::Read, "Body1", ToolStatus::Done)),
+            Entry::tool(
+                5,
+                ToolCall::new(ToolKind::Search, "holes", ToolStatus::Failed).with_output("none"),
+            ),
+            Entry::tool(
+                6,
+                ToolCall::new(ToolKind::Execute, "run mesher", ToolStatus::Running)
+                    .with_input("{ \"size\": 2 }")
+                    .with_output(output),
+            )
+            .with_anchor("Body1.TopFace"),
+            Entry::tool(
+                7,
+                ToolCall::new(ToolKind::Edit, "pattern_holes(4)", ToolStatus::AwaitingApproval),
+            ),
+            Entry::tool(
+                8,
+                ToolCall::new(ToolKind::Delete, "remove sketch", ToolStatus::Rejected),
+            ),
+            Entry::plan(
+                9,
+                vec![PlanStep {
+                    text: "cut".to_string(),
+                    status: StepStatus::InProgress,
+                }],
+            ),
+            Entry {
+                kind: EntryKind::Check {
+                    name: "wall thickness".to_string(),
+                    passed: false,
+                    details: Some("2.1 mm at hole 3, minimum 3 mm".to_string()),
+                },
+                ..Entry::check(10, "", false)
+            },
+            Entry::error(11, "The mesher stopped", "out of memory"),
+            Entry::turn_end(12, "34s"),
+        ];
+        redraw(&shell, cx);
+        let keys: Vec<stream::RowKey> =
+            shell.read_with(cx, |shell, _| shell.stream().rows().iter().map(|r| r.key).collect());
+        assert_eq!(keys.len(), 11, "the read and the search share a row");
+
+        // Unfold everything, then fold it again: nothing panics, nothing is lost.
+        for round in 0..2 {
+            shell.update(cx, |shell, _| {
+                for key in &keys {
+                    shell.stream_mut().toggle(*key);
+                }
+            });
+            redraw(&shell, cx);
+            shell.read_with(cx, |shell, _| {
+                assert_eq!(shell.stream().rows().len(), 11);
+                assert_eq!(shell.stream().is_expanded(keys[1]), round == 0);
+            });
+        }
     }
 
     // ---- panel host ----
