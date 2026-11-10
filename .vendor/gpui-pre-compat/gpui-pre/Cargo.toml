@@ -1,0 +1,34 @@
+# gpui-fast's `gpui` under the name and version of the gpui-pre snapshot
+# gpui-component 0.9 pins (=0.3.11). A copy of gpui-fast's own
+# compat/gpui-pre (which still carries 0.3.9) with the version moved up, so
+# gpui-component compiles against the same gpui core as this workspace.
+# Keep `rev` equal to the gpui-fast rev in the root Cargo.toml.
+[package]
+name = "gpui-pre"
+version = "0.3.11"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "gpui"
+path = "lib.rs"
+doctest = false
+
+[features]
+default = ["gpui_fast/default"]
+bench = ["gpui_fast/bench"]
+bench-support = ["gpui_fast/bench-support"]
+font-kit = ["gpui_fast/font-kit"]
+inspector = ["gpui_fast/inspector"]
+leak-detection = ["gpui_fast/leak-detection"]
+profiler = ["gpui_fast/profiler"]
+screen-capture = ["gpui_fast/screen-capture"]
+stacker = ["gpui_fast/stacker"]
+test-support = ["gpui_fast/test-support"]
+wayland = ["gpui_fast/wayland"]
+windows-manifest = ["gpui_fast/windows-manifest"]
+x11 = ["gpui_fast/x11"]
+
+[dependencies]
+gpui_fast = { package = "gpui", git = "https://github.com/longbridge/gpui-fast", rev = "a10f393d8033c5f52f34821d6a25cddadc6174b4", default-features = false }

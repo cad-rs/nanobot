@@ -813,6 +813,7 @@ pub(crate) fn inspector_element(snapshot: &InspectorSnapshot) -> AnyElement {
             .w(px(420.0))
             .h_full()
             .overflow_y_scroll()
+            .restrict_scroll_to_axis()
             .p_3()
             .bg(rgba(0x1717_1bee))
             .text_color(rgba(0xf4f4_f5ff))
@@ -994,7 +995,8 @@ mod tests {
         ComponentInstancePath, ComponentStateSchema, EventPropagation, HostCallback, StateField,
         ValueSchema,
     };
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
+    use web_time::Instant;
 
     #[test]
     fn inspector_reports_host_handler_label_without_opaque_details() {

@@ -49,7 +49,7 @@ pub use widgets::{button, line, picker, short_hash, show, truncate, HashedRef};
 mod tests {
     use super::*;
     use gpui::{AnyElement, IntoElement as _};
-    use nanobot_gpu::{ViewportInput, ViewportProjection, ViewportSlot};
+    use nanobot_gpu::{ViewportProjection, ViewportSlot};
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -146,7 +146,6 @@ mod tests {
         fn new_handle() -> Self::Handle {
             Rc::new(RefCell::new(TestViewportHandle::default()))
         }
-        fn feed_input(_handle: &Self::Handle, _input: ViewportInput) {}
         fn update_scene(handle: &Self::Handle, _scene: &Self::Scene) {
             handle.borrow_mut().frames += 1;
         }

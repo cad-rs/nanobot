@@ -1,0 +1,30 @@
+# gpui-fast's `gpui_platform` standing in for gpui-pre-platform =0.3.11; see
+# ../gpui-pre/Cargo.toml. (gpui-fast's compat/gpui-pre-platform, version moved.)
+[package]
+name = "gpui-pre-platform"
+version = "0.3.11"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "gpui_platform"
+path = "lib.rs"
+doctest = false
+
+[features]
+default = ["gpui_fast/default"]
+bench-support = ["gpui_fast/bench-support"]
+font-kit = ["gpui_fast/font-kit"]
+inspector = ["gpui/inspector"]
+runtime_shaders = ["gpui_fast/runtime_shaders"]
+screen-capture = ["gpui_fast/screen-capture"]
+test-support = ["gpui_fast/test-support"]
+wayland = ["gpui_fast/wayland"]
+x11 = ["gpui_fast/x11"]
+
+[dependencies]
+gpui_fast = { package = "gpui_platform", git = "https://github.com/longbridge/gpui-fast", rev = "a10f393d8033c5f52f34821d6a25cddadc6174b4", default-features = false }
+# gpui-pre-platform's `inspector` turns on GPUI's; gpui-fast's gpui_platform
+# has no such feature, so it is forwarded to gpui directly.
+gpui = { git = "https://github.com/longbridge/gpui-fast", rev = "a10f393d8033c5f52f34821d6a25cddadc6174b4", default-features = false }

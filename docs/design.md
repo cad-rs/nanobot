@@ -16,6 +16,15 @@
 > `shared_gpu()` + `paint_surface()`，§4.9）。本文自本修订起在 nanobot 仓库落地
 > （NQ-1 定案）；rcad-pro 侧 `docs/nanobot-architecture.md` 只留指针。
 >
+> **修订 2026-11-10**：gpui 基座从 vendored `gpui-ce` 换成 **gpui-fast**
+> （`longbridge/gpui-fast`，钉 main 上的同一提交），组件层换成 crates.io 的
+> `gpui-component` 0.9，`gpui-rhai` 升到 0.4.2——与 workbench-rs 同栈同 pin。
+> gpui-fast 没有 `paint_surface(SurfaceSource::Texture)`，所以渲染槽的形状变了：
+> `paint_surface` / `WgpuRenderTarget` / `gpu_requirements()` 退场，换成
+> `Viewport` + `ViewportContent` + `viewport_element()`（按平台呈现），
+> 输入由槽路由而不再由壳转发。§3.2 第 5、6 条、§3.3、§4.9 已按此改写；
+> 文中其余提到 `paint_surface` / `gpui-ce` 的地方是当时的历史描述。
+>
 > 相关文档（rcad-pro 侧）：`docs/design-harness.md`（ocad 产品设计）、
 > `docs/design-harness-architecture.md`（ocad 插件化架构，本设计的输入）、
 > `docs/agent-native-layering-principles.md`（分层原则）、
@@ -230,30 +239,37 @@ rcad-agent-server ─► nanobot-session + nanobot-tools + ocad-sketch-host
 4. provider 类型只能出现在 `nanobot-llm` 的适配器实现内部；
    `nanobot-session` / plan / 锚定不得出现 provider 类型。
 5. **`nanobot-gpu` 的共享设备是唯一的 wgpu 入口**：产品与插件的自定义渲染必须经
-   `nanobot_gpu::shared_gpu()` 拿设备，不得自建设备（Windows/Web 上自建无法零拷贝合成，
+   `nanobot_gpu::shared_gpu()` 拿设备，不得自建设备（Web 上帧是 gpui 采样的纹理，
+   必须活在 gpui 的设备上；Windows 上交换链由该设备所属的 instance/adapter 创建，
    见 §4.9）。
-6. wgpu 版本在 rcad-pro 根 workspace 单一 pin（当前 29.0.3）；nanobot 与 workbench-rs
-   的 vendor 必须指向同一提交（见 §3.3）。
+6. wgpu 版本单一 pin，且必须是 gpui-fast 自己钉的那个提交（当前
+   `gfx-rs/wgpu@cddb2f5`）；nanobot 与 workbench-rs 的 gpui-fast `rev` 必须相同（见 §3.3）。
 
-### 3.3 vendor 与 wgpu 版本（裁决点 F）
+### 3.3 gpui 栈与 wgpu 版本（裁决点 F）
 
-nanobot 的壳层需要三个 vendored crate，与 workbench-rs 完全相同：
+nanobot 的壳层与 workbench-rs 用同一套 gpui 栈、同一组 pin：
 
-| crate | 用途 | workbench-rs 位置 |
+| crate | 用途 | 来源 |
 |---|---|---|
-| `gpui-ce` | UI 框架（含 `gpui_wgpu` 渲染器） | `.vendor/gpui-ce` |
-| `gpui-component` | DockArea / Panel / 组件库 | `.vendor/gpui-component` |
-| `gpui-rhai` | Rhai → 声明式 UiNode 树运行时 | `.vendor/gpui-rhai` |
+| `gpui` / `gpui_wgpu` / `gpui_web` | UI 框架（gpui-fast） | git：`longbridge/gpui-fast`，钉同一 `rev` |
+| `gpui-component` | 组件库 | crates.io 0.9（基于 `gpui-pre` =0.3.11 快照） |
+| `gpui-pre*` | 把快照包名指回 gpui-fast 的再导出垫片 | `.vendor/gpui-pre-compat`（4 个小 crate） |
+| `gpui-rhai` | Rhai → 声明式 UiNode 树运行时 | `.vendor/gpui-rhai`（发布版 0.4.2 + 3 处本地改动） |
+
+`.vendor` 只剩垫片和打过补丁的 `gpui-rhai`；`gpui-ce` 与 `gpui-component` 的整树
+vendor 已删除。
 
 **风险**：rcad-pro 同时依赖 workbench-rs（creator 基座）与 nanobot（ocad 基座）。
-两处各自 vendor `gpui-ce`，若提交不一致，**同一个构建里会出现两个 `gpui-ce`**——
-类型不互通，且 wgpu 版本错位会让零拷贝合成静默失败。
+两处的 gpui-fast `rev`（或 `gpui-pre` 垫片）若不一致，**同一个构建里会出现两个 gpui
+核**——类型不互通，wgpu 版本错位则 Web 上的纹理共享无法通过类型检查。
 
-**建议（裁决点 F）**：nanobot **自持 vendor，但钉死与 workbench-rs 相同的提交**；
-rcad-pro 根 `[patch.crates-io]` 只保留**一份** `gpui-ce` / `gpui-component` /
-`gpui-rhai` 的 patch 源（当前已镜像 workbench-rs 的表，加上 nanobot 时保持同源）。
-**若两份 vendor 将来漂移，escape hatch 是抽 `cad-rs/gpui-kit`** 作为共享 vendor 仓
+**建议（裁决点 F）**：nanobot **自持 `.vendor`，但与 workbench-rs 的内容相同、`rev`
+相同**；消费方根 workspace 的 `[patch.crates-io]` 只保留**一份** patch 源
+（`gpui-pre*` / `gpui-rhai`，外加 gpui-fast 自己的几条 git patch）。
+**若两份将来漂移，escape hatch 是抽 `cad-rs/gpui-kit`** 作为共享 vendor 仓
 （workbench-rs 与 nanobot 共同依赖）——那是独立的一次重构，不在本设计范围。
+等 gpui-fast 的 compat crate 跟上 `gpui-component` 钉的快照、`gpui-rhai` 发布版对齐后，
+`.vendor` 可以整个去掉。
 
 ---
 
@@ -533,43 +549,77 @@ fn analyze(args) { "分析完成" }
 
 **目标**：用户/插件可以自定义 wgpu 渲染，而渲染机制归框架。
 
-**为什么机制通用、内容不是**：`ocad-viewport` 的价值在三件事——
-(1) 从 gpui 渲染器拿共享设备（`WgpuContextHandle::from_window`）；
-(2) 建离屏颜色目标（`WgpuRenderTarget`）；
-(3) 零拷贝合成（`window.paint_surface(SurfaceSource::Texture)`）。
+**为什么机制通用、内容不是**：视口的机制是三件事——
+(1) 进程级的 wgpu 设备；
+(2) 一帧怎么上屏；
+(3) 视口上的指针/滚轮输入怎么到渲染器。
 这三件与渲染什么**完全无关**。而 `Mesh`/`Camera`/`SceneObjectUpload`/`WgpuRenderer`
 是 CAD 的（`rcad-render`），属于产品。
 
-**框架提供的槽**（照 `workbench-ui/src/gpu_view/mod.rs` 的 `shared_gpu`）：
+**为什么不是 `paint_surface`**：gpui-fast 的 `Element::paint` 只记录图元，不交出
+render pass，也没有「把一张外部纹理合成进来」的入口。所以视口自己用 wgpu 渲染，
+再按平台把结果交给 gpui（照 `workbench-ui/src/gpu_view/present.rs`）：
+
+| 平台 | 上屏方式 | 设备 |
+|---|---|---|
+| Web | 在 gpui 自己的设备上渲染进 `WgpuDynamicTexture`，当作 sprite 画 | gpui 的 |
+| Windows | gpui 窗口合成里的一个 DirectComposition visual，挂视口自己的 DX12 交换链；帧不离开 GPU，输入驱动的帧不需要 gpui 重绘 | 槽自建（DX12） |
+| 其他桌面，或合成不可用 | 离屏渲染 → 读回 → `paint_image` | 槽自建 |
+
+**框架提供的槽**：
 
 ```rust
-/// 进程级共享 GPU 上下文。首次调用从 `window` 初始化。
-/// 产品与插件的自定义 gpui Element 在 `paint` 里调它，在返回的设备上建自己的
-/// 管线、纹理与渲染目标。
-///
-/// 共享不是可选的：Windows / Web 上 `paint_surface` 合成的是 gpui 渲染器拥有的
-/// 纹理，该纹理必须活在那个渲染器的设备上。
+/// 进程级共享 GPU 上下文，首次调用时创建。产品与插件在返回的设备上建自己的
+/// 管线与纹理。还没有设备时返回 None，调用方跳过这一帧。
 pub fn shared_gpu(window: &Window) -> Option<Rc<Gpu>>;
 
-/// 一帧零拷贝合成：把离屏目标画进 `bounds`。
-pub fn paint_surface(window: &mut Window, target: &WgpuRenderTarget, bounds: Bounds<Pixels>);
+/// 产品渲染器在设备创建前声明额外的 features / limits（CAD 渲染器的 cull compute
+/// 需要 5 个 storage buffer）。
+pub fn set_gpu_requirements(requirements: GpuRequirements);
+
+/// 渲染器要实现的全部内容。
+pub trait ViewportContent: 'static {
+    /// 视口上的指针/滚轮输入；返回 true 表示视图变了，需要新的一帧。
+    fn input(&mut self, input: ViewportInput) -> bool;
+    /// 往 `view`（`gpu.target_format`，`size` 为设备像素）画一帧并 submit。
+    fn draw(&mut self, gpu: &Gpu, view: &wgpu::TextureView, size: (u32, u32));
+}
+
+/// 内容 + 上屏方式 + 脏标记 + 输入路由。
+pub struct Viewport<C> { pub content: C, .. }
+/// 挂进界面的 gpui 元素。
+pub fn viewport_element<C: ViewportContent>(viewport: &Rc<RefCell<Viewport<C>>>) -> AnyElement;
 ```
 
-`Gpu` 暴露 `device()` / `queue()` / `target_format()`，以及 `gpu_requirements()`
-（告诉宿主在开窗前声明额外 limits——CAD 渲染器的 cull compute 需要 5 个
-storage buffer，而 gpui 设备基线只给 4）。
+`Gpu` 暴露 `device` / `queue` / `target_format`。Web 端宿主启动时还要调一次
+`set_web_platform()`，把持有 wgpu 上下文的 `WebPlatform` 交给槽。
 
-**产品契约**：产品提供**渲染器**（一个在共享设备上建管线、吃自己的场景类型、
-调 `paint_surface` 的 gpui `Element`）；框架提供**槽**。
+**输入归槽，不归壳**：Windows 上原生 surface 盖在 gpui 内容之上，gpui 的监听器
+收不到它上面的事件，输入只能从 surface 进来。所以 `ViewportSlot` 不再有
+`feed_input`，壳也不再转发鼠标事件；三条上屏路径的输入都由 `Viewport` 统一成
+`ViewportInput` 交给 `ViewportContent::input`。
+
+**产品契约**：产品提供**渲染器**（一个 `ViewportContent`：在共享设备上建管线、
+吃自己的场景类型、往给定的 view 里画）；框架提供**槽**。
 
 ```rust
-// 产品侧（ocad-gpu 或 ocad-shell 的视口元素）
-impl Element for CadViewportElement {
-    fn paint(&mut self, .., window: &mut Window, ..) {
-        let Some(gpu) = nanobot_gpu::shared_gpu(window) else { return; };  // 渲染器未就绪，下帧重试
-        self.renderer.render(&gpu, self.target.view(), self.camera, ..);
-        nanobot_gpu::paint_surface(window, &self.target, bounds);
+// 产品侧（ocad-gpu 或 ocad-shell 的视口）
+impl nanobot_gpu::ViewportContent for CadViewport {
+    fn input(&mut self, input: ViewportInput) -> bool { self.camera.apply(input) }
+    fn draw(&mut self, gpu: &Gpu, view: &wgpu::TextureView, size: (u32, u32)) {
+        self.renderer.render(gpu, view, size, &self.camera);
     }
+}
+
+impl nanobot_gpu::ViewportSlot for CadViewportSlot {
+    type Handle = Rc<RefCell<Viewport<CadViewport>>>;
+    fn update_scene(handle: &Self::Handle, scene: &Self::Scene) {
+        let mut viewport = handle.borrow_mut();
+        viewport.content.set_scene(scene);
+        viewport.invalidate();
+    }
+    fn element(handle: &Self::Handle) -> AnyElement { nanobot_gpu::viewport_element(handle) }
+    // ...
 }
 ```
 

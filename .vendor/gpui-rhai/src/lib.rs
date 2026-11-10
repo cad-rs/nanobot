@@ -1,8 +1,18 @@
 //! Runtime foundations for building GPUI applications from Rhai source.
 
+#[cfg(all(feature = "gpui-pre", feature = "gpui-fast"))]
+compile_error!("features `gpui-pre` and `gpui-fast` are mutually exclusive");
+#[cfg(not(any(feature = "gpui-pre", feature = "gpui-fast")))]
+compile_error!("enable exactly one GPUI backend feature: `gpui-pre` or `gpui-fast`");
+#[cfg(feature = "gpui-fast")]
+pub extern crate gpui_fast as gpui;
+#[cfg(feature = "gpui-fast")]
+pub extern crate gpui_fast_platform as gpui_platform;
+
 pub mod column_resize;
 pub mod component;
 pub mod component_styles;
+pub mod composition_audit;
 pub mod context;
 pub mod date;
 pub mod dependency;
@@ -10,6 +20,8 @@ pub mod devtools;
 pub mod diagnostic;
 pub mod document;
 pub mod document_view;
+pub mod drag_drop;
+pub mod draggable;
 pub mod effect;
 pub mod element_ref;
 pub mod engine;
@@ -17,37 +29,66 @@ mod environment_dependency;
 pub mod event;
 pub mod font;
 pub mod geometry;
+mod handle_state;
 pub mod host_slot;
 pub mod inline_svg;
+mod interaction;
+mod intrinsic;
 mod invocation;
 pub mod lifecycle;
 pub mod locale;
+mod markdown;
+mod markdown_preparation;
+pub mod markdown_view;
+pub mod system;
+pub use markdown_preparation::{
+    MarkdownPreparation, MarkdownPreparationCache, MarkdownPreparationKey, PreparedMarkdown,
+};
+pub use markdown_view::{
+    MarkdownViewerPrimitiveHandler, init_markdown_view, markdown_viewer_primitive_descriptor,
+};
 pub mod native_collection;
 pub mod native_handler;
 pub mod node;
 pub mod overlay;
 mod overlay_element;
+pub mod pan_zoom;
+mod presentation_diagnostic;
 pub mod primitive;
+pub use presentation_diagnostic::PresentationDiagnostic;
 pub mod range_input;
+pub mod range_slider;
+mod read_dependency;
 pub mod reload;
 pub mod renderer;
+pub mod resizable;
 pub mod responsive;
 pub mod retained;
+mod retained_page;
+pub mod rotatable;
 pub mod schema;
+pub mod script_docs;
 mod script_lint;
 pub mod script_source;
 pub mod scrollbar;
+pub mod selection_area;
 pub mod signal;
 mod slot_runtime;
+pub mod sortable;
 pub mod source;
+pub mod split_resize;
 pub mod state;
 pub mod store;
 pub mod style;
+mod table_layout;
 pub mod text_area;
 mod text_edit;
 pub mod text_input;
 pub mod theme;
+mod theme_source;
+pub mod time;
 pub mod timer;
+pub mod token;
 pub mod value;
 pub mod virtual_list;
 mod virtual_list_element;
@@ -58,27 +99,44 @@ pub mod chart;
 
 pub mod accessibility;
 pub mod action;
+mod auto_grid;
+pub use auto_grid::AutoGridColumns;
 pub mod app;
 pub mod asset;
 pub mod async_runtime;
 pub mod automation;
 mod backend;
+mod baseline;
 pub mod budget;
 pub mod canvas;
 pub mod capability;
 pub mod clock;
+mod collection_projection;
+mod island;
 pub mod motion;
 
+#[cfg(feature = "gpui-pre")]
 pub use gpui;
+#[cfg(feature = "gpui-pre")]
+pub use gpui_platform;
+pub use retained_page::NavigationStackInfo;
+/// The Rhai crate the runtime is built on, for `RuntimeEngine::engine` and
+/// `ScriptViewExtension::configure_rhai_engine`.
+pub use rhai;
 
-pub use accessibility::{AccessibilityError, AccessibilityNode, AccessibilityTree};
+pub use accessibility::{
+    AccessibilityError, AccessibilityNode, AccessibilityTree, CommittedSemanticFrame,
+};
 pub use action::{
-    ActionError, ActionId, ActionInvocation, ActionRegistry, DispatchScriptAction, KeyBindingSpec,
+    ActionError, ActionId, ActionInvocation, ActionRegistry, ActionShortcut, DispatchScriptAction,
+    KeyBindingSpec, KeyChord,
 };
 pub use app::{
-    EmbeddedScriptView, FileScriptView, PreparedScriptView, ScriptApplication, ScriptViewConfig,
-    ScriptViewError, ScriptViewExtension, ScriptViewHandle, ScriptViewHost,
-    ScriptViewPerformanceSnapshot, ScriptViewState, ThemeHandle, install,
+    EmbeddedScriptView, FileScriptView, FocusIndicators, NavigateBack, PreparedScriptView,
+    ScriptApplication, ScriptErrorDomain, ScriptErrorReport, ScriptViewConfig, ScriptViewError,
+    ScriptViewExtension, ScriptViewFrameDigest, ScriptViewHandle, ScriptViewHost,
+    ScriptViewPerformanceSnapshot, ScriptViewRenderStatistics, ScriptViewState, ThemeHandle,
+    install,
 };
 pub use asset::{
     AssetData, AssetError, AssetId, AssetProvider, AssetRegistry, DirectoryAssetProvider,
@@ -101,8 +159,8 @@ pub use canvas::{
 };
 pub use capability::{
     AppManifest, AsyncCapabilityHandler, CapabilityDescriptor, CapabilityError, CapabilityHandler,
-    CapabilityId, CapabilityMethod, CapabilityRegistry, SubscriptionCapabilityHandler,
-    SubscriptionWork, TaskWork,
+    CapabilityId, CapabilityMethod, CapabilityRegistry, InvocationContext, InvocationOrigin,
+    SubscriptionCapabilityHandler, SubscriptionWork, TaskWork,
 };
 #[cfg(feature = "charts")]
 pub use chart::*;
@@ -115,9 +173,12 @@ pub use component::{
     EventSchema, RuntimeApiRange, SlotSchema, parse_component_header,
 };
 pub use component_styles::{ComponentStyleError, ComponentStyleSheet, load_component_styles};
+pub use composition_audit::{
+    AuditFinding, AuditRule, AuditRules, Profile, STATIC_RULES, load_profile_source,
+};
 pub use context::{
-    ComponentIncarnation, ExecutionPhase, PendingEvent, UiContext, UiContextError, UiMutationBatch,
-    UiRuntimeState, UiStateSnapshot, UiTransactionError,
+    ComponentIncarnation, ExecutionPhase, PendingEvent, SemanticDispatchOwner, UiContext,
+    UiContextError, UiMutationBatch, UiRuntimeState, UiStateSnapshot, UiTransactionError,
 };
 pub use date::{CalendarClock, CalendarClockSource, DateError, GregorianDate, Weekday};
 pub use dependency::{
@@ -139,20 +200,25 @@ pub use diagnostic::{
 pub use document::{
     DiffAlignedRow, DiffDisplayRow, DiffRowKind, DiffViewMode, DiffWhitespace, DocumentDescriptor,
     DocumentError, DocumentLimits, DocumentLine, DocumentRuntimeConfig, DocumentSource,
-    DocumentWrap, NativeTextDocument, NativeTextDocumentRegistry, PreparedDiff, PreparedDocument,
-    SyntaxRegistry, SyntaxSpan, SyntaxTokenKind, prepare_diff, prepare_diff_with_limits,
-    prepare_document, prepare_document_with_limits,
+    DocumentWrap, MarkdownPreparationStats, NativeTextDocument, NativeTextDocumentRegistry,
+    PreparedDiff, PreparedDocument, SyntaxRegistry, SyntaxSpan, SyntaxTokenKind, prepare_diff,
+    prepare_diff_with_limits, prepare_document, prepare_document_with_limits,
 };
 pub use document_view::{
     CodeViewerPrimitiveHandler, DiffSide, DiffViewerPrimitiveHandler, RevealDocumentLine,
     code_viewer_primitive_descriptor, diff_viewer_primitive_descriptor, init_document_view,
 };
+pub use drag_drop::{
+    DragSourcePrimitiveHandler, DropZonePrimitiveHandler, drag_source_primitive_descriptor,
+    drop_zone_primitive_descriptor,
+};
+pub use draggable::{DraggablePrimitiveHandler, draggable_primitive_descriptor};
 pub use effect::{EffectDescriptor, EffectError, EffectId, EffectRegistry};
 pub use element_ref::{ElementRef, ElementRefError, ElementRefId, ElementRefRegistry};
 pub use engine::{
-    CompiledUi, ComponentInvocationRecipe, ExecutionOperation, ExecutionTiming,
-    MAX_SCRIPT_OPERATIONS, OPERATION_SEMANTICS_VERSION, RuntimeEngine, RuntimeError,
-    ScriptCallback, ScriptCallbackDefinitionError, ScriptGeneration,
+    CompiledUi, ComponentInvocationRecipe, DEFAULT_SCRIPT_OPERATION_LIMIT, ExecutionOperation,
+    ExecutionTiming, OPERATION_SEMANTICS_VERSION, RuntimeEngine, RuntimeError, ScriptCallback,
+    ScriptCallbackDefinitionError, ScriptGeneration,
 };
 pub use event::{
     EventDispatchReport, EventModifiers, EventPhase, EventPropagation, EventResponse, EventRouter,
@@ -160,7 +226,9 @@ pub use event::{
     PropagationControl, UiEvent, UiEventBinding, UiEventHandler, WheelEventData,
 };
 pub use font::{FontError, FontSource, validate_font_sources};
-pub use geometry::{ElementGeometry, GeometryBounds, GeometryError, GeometryRegistry};
+pub use geometry::{
+    Affine2D, ElementGeometry, GeometryBounds, GeometryError, GeometryRegistry, PresentedGeometry,
+};
 pub use host_slot::{HostSlotError, HostSlotRegistry};
 pub use inline_svg::{InlineSvg, InlineSvgError};
 pub use lifecycle::{LifecycleError, LifecycleState, ScriptLifecycle};
@@ -173,9 +241,9 @@ pub use motion::{
     MotionEasing, MotionError, MotionFrame, MotionHandle, MotionInertia, MotionIntent, MotionKey,
     MotionKeyframe, MotionKeyframes, MotionPlaybackState, MotionPreference, MotionProgressBinding,
     MotionProgressDriver, MotionProperty, MotionQuality, MotionResourceUsage, MotionRuntime,
-    MotionSnapshot, MotionSource, MotionSpring, MotionTimeline, MotionTimelineEvent,
-    MotionTimelineEventKind, MotionTimelineSnapshot, MotionTimelineStep, MotionTrack,
-    MotionTransition,
+    MotionSignalTrigger, MotionSnapshot, MotionSource, MotionSpring, MotionTimeline,
+    MotionTimelineEvent, MotionTimelineEventKind, MotionTimelineSnapshot, MotionTimelineStep,
+    MotionTrack, MotionTransition,
 };
 pub use native_collection::{
     NativeCollection, NativeCollectionError, NativeCollectionRegistry, VirtualCollectionData,
@@ -190,39 +258,53 @@ pub use node::{
     UiNode, UiNodeKind, UiNodeKindTag,
 };
 pub use overlay::{
-    DismissReport, FocusToken, OverlayBounds, OverlayError, OverlayId, OverlayKind, OverlayManager,
-    OverlayPlacement, OverlaySpec, PlacementResult, TooltipScheduler, TooltipTransition,
+    DismissReport, FocusToken, OpenOverlay, OverlayAlign, OverlayBounds, OverlayError, OverlayId,
+    OverlayKind, OverlayLookupError, OverlayManager, OverlayPlacement, OverlaySpec,
+    PlacementResult, TooltipScheduler, TooltipTransition,
 };
+pub use pan_zoom::{PanZoomPrimitiveHandler, pan_zoom_primitive_descriptor};
 pub use primitive::{
-    EffectPrimitiveDescriptor, PrimitiveAccessibilityProjection, PrimitiveDescriptor,
-    PrimitiveError, PrimitiveEventEmitter, PrimitiveHandler, PrimitiveId, PrimitiveInstance,
+    EffectPrimitiveDescriptor, PrimitiveAccessibilityProjection, PrimitiveContext,
+    PrimitiveDescriptor, PrimitiveError, PrimitiveHandler, PrimitiveId, PrimitiveInstance,
     PrimitiveInstanceId, PrimitiveNode, PrimitivePlatform, PrimitiveProps, PrimitiveRegistry,
-    PrimitiveResourceError, PrimitiveResourceHandle, PrimitiveResourceScope, PrimitiveTheme,
-    PrimitiveValue,
+    PrimitiveResourceError, PrimitiveResourceHandle, PrimitiveResourceScope,
+    PrimitiveSemanticProposal, PrimitiveTheme, PrimitiveValue,
 };
 pub use range_input::{RangeInputPrimitiveHandler, range_input_primitive_descriptor};
+pub use range_slider::{RangeSliderPrimitiveHandler, range_slider_primitive_descriptor};
 pub use reload::{LiveScript, ReloadOutcome};
 pub use renderer::{
     ColorResolver, GpuiNodeRenderer, LiteralColorResolver, NodeEventDispatcher, StaticUiView,
+    StaticUiViewError,
 };
+pub use resizable::{ResizablePrimitiveHandler, resizable_primitive_descriptor};
 pub use responsive::{ResponsiveError, ResponsiveRuntime, ViewportBreakpoints, ViewportClass};
 pub use retained::{
     NodeId, ReconcileError, ReconcileMetrics, ReconcileReport, RetainedChildLink, RetainedNode,
     RetainedUiTree,
 };
+pub use rotatable::{RotatablePrimitiveHandler, rotatable_primitive_descriptor};
 pub use schema::{
     ObjectField, SchemaDefinitionError, SchemaIssue, SchemaValidationError, ValueSchema,
 };
-pub use script_lint::{KnownCallDiagnostic, KnownCallLintError};
+pub use script_lint::{
+    HostFunction, HostFunctionError, KnownCallDiagnostic, KnownCallLintError, ShadowedBuiltin,
+};
 pub use script_source::{
     EmbeddedScriptSource, FileScriptSource, ScriptAsset, ScriptSource, ScriptSourceError,
 };
-pub use scrollbar::{ScrollbarSpec, ScrollbarVisibility};
+pub use scrollbar::{
+    SCROLLBAR_TRACK_WIDTH, ScrollbarContext, ScrollbarSource, ScrollbarSourceHandle, ScrollbarSpec,
+    ScrollbarVisibility,
+};
+pub use selection_area::{SelectionAreaPrimitiveHandler, selection_area_primitive_descriptor};
 pub use signal::{
     NativeSignal, SignalError, SignalId, SignalKind, SignalProperty, SignalRegistry,
     SignalSnapshot, SignalValue, SignalWriter,
 };
+pub use sortable::{SortablePrimitiveHandler, sortable_primitive_descriptor};
 pub use source::{ModuleId, ModuleIdError, RestrictedModuleResolver};
+pub use split_resize::{SplitResizePrimitiveHandler, split_resize_primitive_descriptor};
 pub use state::{
     ComponentInstancePath, ComponentStateSchema, RenderStateTransaction, StateError, StateField,
     StateInstanceSnapshot, StateReconcileReport, StateStore, StateValueSnapshot,
@@ -232,32 +314,45 @@ pub use style::{
     Align, AutoLength, BorderLineStyle, ColorParseError, ColorValue, CornerLengths, CursorKind,
     DisplayMode, EdgeLengths, FlexDirection, FlexWrapMode, FontSlant, HitTestBehavior,
     InteractionState, Justify, LayoutEdgeLengths, LayoutLength, Length, LengthError,
-    LinearGradientSpec, OverflowMode, PositionMode, PseudoState, RadiusToken, Rgba8, ShadowSpec,
-    SignedLength, SpacingToken, Style, StyleProperties, StyleValueError, TextAlignMode,
-    WhiteSpaceMode,
+    LinearGradientSpec, OverflowMode, PositionMode, PseudoState, Rgba8, ShadowSpec, SignedLength,
+    Style, StyleProperties, StyleValueError, TextAlignMode, WhiteSpaceMode,
 };
 pub use text_area::{TextAreaPrimitiveHandler, init_text_area, text_area_primitive_descriptor};
 pub use text_input::{
     TextBuffer, TextInputPrimitiveHandler, init_text_input, text_input_primitive_descriptor,
 };
 pub use theme::{
-    REQUIRED_TYPOGRAPHY, ResolvedTheme, ResolvedTypography, SystemAppearance, ThemeError,
-    ThemeFamily, ThemeManager, ThemeMode, ThemeMotion, ThemeMotionOverrides, ThemeMotionSpring,
-    ThemePreference, ThemeSelection, ThemeSnapshot, ThemeTokenOverrides, ThemeTokenValue,
-    ThemeTokens, ThemeTypography, ThemeTypographyOverrides, ThemeVariant, TypographyToken,
-    load_theme_source,
+    ResolvedTheme, ResolvedTypography, SCALE_ENVIRONMENT, SCALE_STEPS, SystemAppearance,
+    ThemeError, ThemeFamily, ThemeLength, ThemeManager, ThemeMode, ThemeMotion,
+    ThemeMotionOverrides, ThemeMotionSpring, ThemePreference, ThemeSelection, ThemeSnapshot,
+    ThemeTokenOverrides, ThemeTokenValue, ThemeTokens, ThemeTypography, ThemeTypographyOverrides,
+    ThemeVariant, ThemeVariantInfo, TokenLayer, TypographyRole, TypographyToken, contrast_ratio,
+    load_theme_source, load_theme_with_layers, load_token_base,
+};
+pub use theme_source::EnvTableSource;
+pub use time::{
+    TimeError, TimeMetadata, TimeParts, TimeRange, TimeZone, WallClock, WallClockSource,
 };
 pub use timer::{TimerDescriptor, TimerError, TimerId, TimerRegistry, TimerSnapshot};
+pub use token::{
+    EnvTable, Environment, EnvironmentDeclaration, EnvironmentDeclarations, LengthToken, Symbol,
+    TokenError, Variable,
+};
 pub use value::{
     OpaqueHandle, UiValue, UiValueError, UiValuePath, UiValuePathError, UiValuePathSegment,
 };
 pub use virtual_list::{
-    VariableListSpec, VariableListState, VariableListWindow, VirtualCollectionId,
-    VirtualCollectionMetrics, VirtualCollectionNodeSpec, VirtualListError, VirtualRequestRegistry,
+    DEFAULT_VIRTUAL_BATCH_ITEMS, DEFAULT_VIRTUAL_RETAIN_ITEMS, MAX_VIRTUAL_BATCH_ITEMS,
+    MAX_VIRTUAL_OVERSCAN_ITEMS, MAX_VIRTUAL_RETAIN_ITEMS, VariableListSpec, VariableListState,
+    VariableListWindow, VirtualCollectionFollowStatus, VirtualCollectionId,
+    VirtualCollectionMetrics, VirtualCollectionNodeSpec, VirtualCollectionPolicy,
+    VirtualCollectionScrollHandle, VirtualListError, VirtualRequestRegistry,
 };
 pub use window::{
-    ScriptWindowSpec, WindowCommand, WindowCommandError, WindowCommandPolicy, WindowCommandRegistry,
+    QueuedWindowCommand, ScriptWindowSpec, WindowCommand, WindowCommandError, WindowCommandPolicy,
+    WindowCommandRegistry,
 };
 
-/// The first runtime API generation understood by component source.
-pub const RUNTIME_API_VERSION: u32 = 2;
+/// The runtime API generation understood by component source. Generation 3
+/// adds component token and environment declarations.
+pub const RUNTIME_API_VERSION: u32 = 3;

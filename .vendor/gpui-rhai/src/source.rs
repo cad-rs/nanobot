@@ -212,15 +212,27 @@ impl ModuleResolver for RestrictedModuleResolver {
         let id = ModuleId::parse(path)
             .map_err(|error| Box::new(runtime_error(error.to_string(), position)))?;
         let source = self.sources.get(&id).ok_or_else(|| {
-            Box::new(EvalAltResult::ErrorModuleNotFound(
-                path.to_owned(),
-                position,
-            ))
+            if crate::script_lint::is_theme_id(path) {
+                Box::new(runtime_error(
+                    format!("`{path}` is {}", crate::script_lint::THEME_IMPORT),
+                    position,
+                ))
+            } else {
+                Box::new(EvalAltResult::ErrorModuleNotFound(
+                    path.to_owned(),
+                    position,
+                ))
+            }
         })?;
 
         self.begin_resolution(&id, position)?;
         let result = (|| {
-            crate::extract_imports(source).map_err(|error| {
+            crate::dependency::extract_imports_with_depths(
+                source,
+                engine.max_expr_depth(),
+                engine.max_function_expr_depth(),
+            )
+            .map_err(|error| {
                 Box::new(EvalAltResult::ErrorInModule(
                     path.to_owned(),
                     Box::new(runtime_error(error.to_string(), position)),
@@ -233,11 +245,11 @@ impl ModuleResolver for RestrictedModuleResolver {
                 let mut ast = engine.compile(source).map_err(|error| {
                     Box::new(EvalAltResult::ErrorInModule(
                         path.to_owned(),
-                        error.into(),
+                        crate::engine::explain_keyword_name(source, error).into(),
                         position,
                     ))
                 })?;
-                crate::engine::validate_assignment_targets(&ast).map_err(|error| {
+                crate::engine::validate_runtime_ast(&ast).map_err(|error| {
                     Box::new(EvalAltResult::ErrorInModule(
                         path.to_owned(),
                         Box::new(runtime_error(error.to_string(), position)),
@@ -268,6 +280,9 @@ fn validate_module_init(
     ast: &AST,
     import_position: Position,
 ) -> Result<(), Box<EvalAltResult>> {
+    // Cached ASTs follow the same declaration rules as freshly compiled ones.
+    crate::engine::validate_runtime_ast(ast)
+        .map_err(|error| Box::new(runtime_error(error.to_string(), import_position)))?;
     let mut definitions = 0_usize;
     for statement in ast.statements() {
         let accepted = match statement {
@@ -320,7 +335,7 @@ fn pure_component_definition(expression: &Expr) -> bool {
             .iter()
             .all(|(_, value)| pure_component_definition(value)),
         Expr::FnCall(call, ..)
-            if call.name == "Fn"
+            if (call.name == "Fn" || call.name == crate::invocation::NAMED_FUNCTION)
                 && !call.is_qualified()
                 && call.args.len() == 1
                 && matches!(call.args[0], Expr::StringConstant(..)) =>
@@ -378,6 +393,20 @@ mod tests {
             )
             .unwrap();
         assert_eq!(value, "hello");
+    }
+
+    #[test]
+    fn importing_a_theme_says_themes_are_not_modules() {
+        let mut engine = Engine::new();
+        engine.set_module_resolver(RestrictedModuleResolver::new());
+        let error = engine
+            .run(r#"import "themes/dracula" as dracula;"#)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("`themes/dracula` is a theme, not a module"),
+            "{error}"
+        );
     }
 
     #[test]

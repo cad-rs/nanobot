@@ -78,7 +78,7 @@ pub fn load_component_styles(
     let mut ast = engine
         .compile(source)
         .map_err(|error| ComponentStyleError::Script(error.to_string()))?;
-    crate::engine::validate_assignment_targets(&ast)
+    crate::engine::validate_runtime_ast(&ast)
         .map_err(|error| ComponentStyleError::Script(error.to_string()))?;
     ast.set_source(source_name);
     let raw: Dynamic = engine
@@ -158,10 +158,12 @@ mod tests {
                         id: ModuleId::parse("components/button").unwrap(),
                         export: "Button".to_owned(),
                         version: Version::new(0, 1, 0),
-                        runtime_api: RuntimeApiRange::new(2, 3),
+                        runtime_api: RuntimeApiRange::new(3, 4),
                         dependencies: std::collections::BTreeSet::default(),
                         capabilities: BTreeMap::default(),
                         assets: std::collections::BTreeSet::default(),
+                        tokens: std::collections::BTreeSet::new(),
+                        environment: std::collections::BTreeSet::new(),
                     },
                     ComponentSchema {
                         parts: ["root".to_owned(), "label".to_owned()]
@@ -237,7 +239,7 @@ mod tests {
                     define_component(#{
                         metadata: #{
                             id: "components/button", "export": "Button", version: "0.1.0",
-                            runtime_api: #{ min_inclusive: 2, max_exclusive: 3 },
+                            runtime_api: #{ min_inclusive: 3, max_exclusive: 4 },
                             dependencies: [], capabilities: #{}
                         },
                         schema: #{ props: #{}, state: #{ fields: #{} }, events: #{},

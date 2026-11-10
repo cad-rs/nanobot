@@ -1,10 +1,11 @@
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 use rhai::{
     AST, ASTNode, Array, Dynamic, Engine, EvalAltResult, Expr, FnPtr, FuncArgs, FuncRegistration,
@@ -23,6 +24,11 @@ use crate::column_resize::{
 use crate::component::{ComponentExportCollector, ComponentExportError, ComponentRegistry};
 use crate::context::{UiContext, register_ui_context_api};
 use crate::date::register_date_api;
+use crate::drag_drop::{
+    DragSourcePrimitiveHandler, DropZonePrimitiveHandler, drag_source_primitive_descriptor,
+    drop_zone_primitive_descriptor,
+};
+use crate::draggable::{DraggablePrimitiveHandler, draggable_primitive_descriptor};
 use crate::motion::register_motion_api;
 use crate::node::{
     asset_image_node, box_node, canvas_node, column_node, directional_asset_image_node,
@@ -30,8 +36,15 @@ use crate::node::{
     generic_image_node, image_node, layer_node, lazy_error_boundary_node, motion_group_node,
     overlay_node, rich_text_node, row_node, span_value, stack_node, svg_node, text_node,
 };
+use crate::pan_zoom::{PanZoomPrimitiveHandler, pan_zoom_primitive_descriptor};
 use crate::primitive::{PrimitiveDescriptor, PrimitiveError, PrimitiveHandler, PrimitiveRegistry};
 use crate::range_input::{RangeInputPrimitiveHandler, range_input_primitive_descriptor};
+use crate::range_slider::{RangeSliderPrimitiveHandler, range_slider_primitive_descriptor};
+use crate::resizable::{ResizablePrimitiveHandler, resizable_primitive_descriptor};
+use crate::rotatable::{RotatablePrimitiveHandler, rotatable_primitive_descriptor};
+use crate::selection_area::{SelectionAreaPrimitiveHandler, selection_area_primitive_descriptor};
+use crate::sortable::{SortablePrimitiveHandler, sortable_primitive_descriptor};
+use crate::split_resize::{SplitResizePrimitiveHandler, split_resize_primitive_descriptor};
 use crate::style::register_style_api;
 use crate::text_area::{
     TextAreaPrimitiveHandler, register_text_area_api, text_area_primitive_descriptor,
@@ -92,6 +105,11 @@ pub struct ExecutionTiming {
     pub source: String,
     pub duration: Duration,
     pub operations: u64,
+    /// The effective Host quota captured at the start of this execution.
+    pub operation_limit: u64,
+    /// Cumulative consumption of the enclosing execution round. `operations`
+    /// remains this timing span's delta for performance attribution.
+    pub round_operations: u64,
     pub operation_semantics: u32,
     pub slow: bool,
     pub succeeded: bool,
@@ -163,6 +181,7 @@ struct ComponentCallbackBinding {
     incarnation: crate::ComponentIncarnation,
     events: BTreeMap<String, EventSchema>,
     context: Option<crate::invocation::ScriptInvocationContext>,
+    is_node_factory: bool,
 }
 
 #[derive(Clone)]
@@ -181,6 +200,7 @@ pub struct ScriptCallback {
     events: BTreeMap<String, EventSchema>,
     #[allow(deprecated)]
     native_context: Option<crate::invocation::ScriptInvocationContext>,
+    is_node_factory: bool,
 }
 
 impl PartialEq for ScriptCallback {
@@ -190,6 +210,12 @@ impl PartialEq for ScriptCallback {
             && self.generation == other.generation
             && self.component == other.component
             && self.incarnation == other.incarnation
+            && self.is_node_factory == other.is_node_factory
+            && (match (&self.native_context, &other.native_context) {
+                (Some(left), Some(right)) => left.same_environment(right),
+                (None, None) => true,
+                _ => false,
+            })
     }
 }
 
@@ -213,6 +239,7 @@ impl ScriptCallback {
         if function.is_anonymous() {
             return Err(ScriptCallbackDefinitionError::Anonymous);
         }
+        let lexical_context = crate::invocation::take_function_environment(&mut function);
         let mut binding = None;
         let mut curry = Vec::new();
         for (index, value) in function.iter_curry().cloned().enumerate() {
@@ -227,17 +254,19 @@ impl ScriptCallback {
             );
         }
         function.set_curry(curry.iter().cloned().map(UiValue::into_dynamic));
-        let (component, incarnation, events, native_context) = binding.map_or_else(
-            || (None, None, BTreeMap::new(), None),
-            |binding| {
-                (
-                    Some(binding.component),
-                    Some(binding.incarnation),
-                    binding.events,
-                    binding.context,
-                )
-            },
-        );
+        let (component, incarnation, events, native_context, is_node_factory) = binding
+            .map_or_else(
+                || (None, None, BTreeMap::new(), None, false),
+                |binding| {
+                    (
+                        Some(binding.component),
+                        Some(binding.incarnation),
+                        binding.events,
+                        binding.context,
+                        binding.is_node_factory,
+                    )
+                },
+            );
         Ok(Self {
             function,
             curry,
@@ -245,7 +274,8 @@ impl ScriptCallback {
             component,
             incarnation,
             events,
-            native_context,
+            native_context: lexical_context.or(native_context),
+            is_node_factory,
         })
     }
 
@@ -304,6 +334,61 @@ impl ScriptCallback {
     pub(crate) fn native_context(&self) -> Option<&crate::invocation::ScriptInvocationContext> {
         self.native_context.as_ref()
     }
+
+    pub(crate) const fn is_node_factory(&self) -> bool {
+        self.is_node_factory
+    }
+
+    pub(crate) fn render_node(
+        &self,
+        call: &rhai::NativeCallContext<'_>,
+        context: UiContext,
+        detail: Dynamic,
+    ) -> Result<UiNode, Box<EvalAltResult>> {
+        let args = (context, detail);
+        if let Some(environment) = &self.native_context {
+            environment.call_synchronous(call, &self.function, args)
+        } else {
+            self.function.call_within_context(call, args)
+        }
+    }
+
+    /// The scope a bound Node factory calls back into: where it was bound.
+    fn factory_scope_binding(&self) -> Option<ComponentCallbackBinding> {
+        Some(ComponentCallbackBinding {
+            component: self.component.clone()?,
+            incarnation: self.incarnation?,
+            events: self.events.clone(),
+            context: self.native_context.clone(),
+            is_node_factory: false,
+        })
+    }
+
+    pub(crate) fn bind_node_factory(
+        mut function: FnPtr,
+        context: &UiContext,
+        call: &rhai::NativeCallContext<'_>,
+    ) -> FnPtr {
+        let mut already_bound = false;
+        for value in function.iter_curry_mut() {
+            if value.is::<ComponentCallbackBinding>() {
+                let mut binding = value.clone_cast::<ComponentCallbackBinding>();
+                binding.is_node_factory = true;
+                *value = Dynamic::from(binding);
+                already_bound = true;
+            }
+        }
+        if !already_bound {
+            function.add_curry(Dynamic::from(ComponentCallbackBinding {
+                component: context.callback_component_path().clone(),
+                incarnation: context.callback_component_incarnation(),
+                events: context.callback_event_schemas().clone(),
+                context: Some(crate::invocation::ScriptInvocationContext::capture_retained(call)),
+                is_node_factory: true,
+            }));
+        }
+        function
+    }
 }
 
 impl CompiledUi {
@@ -341,6 +426,19 @@ struct ActiveComponentRender {
     reuse: Option<ComponentReuseSnapshot>,
     reused: Vec<(String, usize)>,
     failed_component: Option<ComponentInstancePath>,
+    /// The Node factories rendering, innermost last ([`FactoryScope`]).
+    factory_scopes: Vec<FactoryScope>,
+}
+
+/// A Node factory while it renders for the component that received it. The
+/// factory runs with the receiving component's `ctx`, but the callbacks it
+/// creates belong to the scope that bound it: the nodes it returns and the
+/// components it renders directly call back into that scope.
+struct FactoryScope {
+    /// The receiving component's callback scope.
+    receiver: ComponentInstancePath,
+    /// The scope that bound the factory.
+    binding: ComponentCallbackBinding,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -403,11 +501,58 @@ struct VirtualCollectionRecipe {
     id: crate::VirtualCollectionId,
     data: crate::VirtualCollectionData,
     renderer: FnPtr,
-    renderer_events: BTreeMap<String, crate::EventSchema>,
     renderer_context: crate::invocation::ScriptInvocationContext,
     context: UiContext,
-    event_context: UiContext,
     generation: ScriptGeneration,
+    /// Items rendered beyond the needed ones when a scroll needs new items.
+    batch_items: usize,
+    /// Items released from the realized range, shared by the clones of this
+    /// recipe. A new render of the collection makes a new recipe, so what it
+    /// kept is dropped with the data and renderer it was rendered from.
+    offscreen: Rc<RefCell<OffscreenItems>>,
+}
+
+/// Rendered items a virtual collection keeps after they leave its realized
+/// range, by index into its recipe's data, least recently released first.
+#[derive(Debug, Default)]
+struct OffscreenItems {
+    capacity: usize,
+    items: BTreeMap<usize, UiNode>,
+    order: VecDeque<usize>,
+}
+
+impl OffscreenItems {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            ..Self::default()
+        }
+    }
+
+    /// Keep `node`, released at `index`, dropping the least recently released
+    /// items beyond the capacity.
+    fn keep(&mut self, index: usize, node: UiNode) {
+        if self.capacity == 0 {
+            return;
+        }
+        if self.items.insert(index, node).is_some() {
+            self.order.retain(|kept| *kept != index);
+        }
+        self.order.push_back(index);
+        while self.items.len() > self.capacity {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.items.remove(&oldest);
+        }
+    }
+
+    /// Take back the item kept for `index`.
+    fn take(&mut self, index: usize) -> Option<UiNode> {
+        let node = self.items.remove(&index)?;
+        self.order.retain(|kept| *kept != index);
+        Some(node)
+    }
 }
 
 type ActiveComponentRenderState = Rc<RefCell<Option<ActiveComponentRender>>>;
@@ -416,7 +561,7 @@ type ActiveComponentRenderState = Rc<RefCell<Option<ActiveComponentRender>>>;
 struct PendingComponentCommit {
     root: ComponentInstancePath,
     previous: BTreeSet<ComponentInstancePath>,
-    active: BTreeSet<ComponentInstancePath>,
+    retained_root: Option<ComponentInstancePath>,
     transaction: RenderStateTransaction,
     event_handlers: BTreeMap<(ComponentInstancePath, String), ScriptCallback>,
 }
@@ -512,6 +657,7 @@ pub struct RuntimeEngine {
     last_failed_timing: RefCell<Option<ExecutionTiming>>,
     last_failed_component: RefCell<Option<ComponentInstancePath>>,
     operation_tracker: Rc<OperationTracker>,
+    operation_limit: Rc<Cell<u64>>,
     slow_threshold: Duration,
     component_render: ActiveComponentRenderState,
     component_invocations: BTreeMap<ComponentInstancePath, ComponentInvocationRecipe>,
@@ -521,6 +667,7 @@ pub struct RuntimeEngine {
     component_element_refs: BTreeSet<crate::ElementRefId>,
     pending_component_commits: BTreeMap<ComponentInstancePath, PendingComponentCommit>,
     component_renderers: ComponentRenderRegistry,
+    virtual_collection_policy: Rc<Cell<crate::VirtualCollectionPolicy>>,
     native_handlers: crate::NativeHandlerRegistry,
     syntax_registry: crate::SyntaxRegistry,
     document_runtime: crate::DocumentRuntimeConfig,
@@ -535,7 +682,7 @@ pub struct RuntimeEngine {
     virtual_collections: BTreeMap<crate::VirtualCollectionId, VirtualCollectionRecipe>,
 }
 
-pub const MAX_SCRIPT_OPERATIONS: u64 = 1_000_000;
+pub const DEFAULT_SCRIPT_OPERATION_LIMIT: u64 = 1_000_000;
 
 #[derive(Debug, Default)]
 struct OperationTracker {
@@ -578,6 +725,7 @@ impl OperationTracker {
 struct ExecutionTimingStart {
     instant: Instant,
     operations: u64,
+    operation_limit: u64,
 }
 
 #[derive(Clone)]
@@ -605,6 +753,9 @@ impl RuntimeEngine {
     pub(crate) fn candidate_engine(&self) -> Self {
         let mut candidate = Self::new();
         candidate.slow_threshold = self.slow_threshold;
+        candidate.operation_limit.set(self.operation_limit.get());
+        let (global, functions) = self.expression_depth_limits();
+        candidate.set_expression_depth_limits(global, functions);
         #[cfg(feature = "charts")]
         {
             candidate.chart_transforms.copy_from(&self.chart_transforms);
@@ -622,16 +773,20 @@ impl RuntimeEngine {
     /// Panics only if a compile-time built-in descriptor violates the same
     /// validation rules enforced for downstream custom primitives.
     #[must_use]
+    #[allow(clippy::too_many_lines)] // Wires every runtime registry into one engine.
     pub fn new() -> Self {
         let mut engine = Engine::new();
         engine.set_module_resolver(crate::source::RestrictedModuleResolver::new());
         let operation_tracker = Rc::new(OperationTracker::default());
         let progress = Rc::clone(&operation_tracker);
+        let operation_limit = Rc::new(Cell::new(DEFAULT_SCRIPT_OPERATION_LIMIT));
+        let limit_probe = Rc::clone(&operation_limit);
         engine.on_progress(move |operations| {
             let total = progress.observe(operations);
-            (total > MAX_SCRIPT_OPERATIONS).then(|| {
+            let limit = limit_probe.get();
+            (total > limit).then(|| {
                 Dynamic::from(format!(
-                    "script operation budget exceeded: {total} > {MAX_SCRIPT_OPERATIONS}"
+                    "script operation budget exceeded: {total} > {limit}"
                 ))
             })
         });
@@ -648,20 +803,28 @@ impl RuntimeEngine {
         crate::native_collection::register_native_collection_api(&mut engine);
         crate::document::register_document_api(&mut engine);
         #[cfg(feature = "charts")]
-        crate::chart::register_chart_data_api(&mut engine);
+        {
+            crate::chart::register_chart_data_api(&mut engine);
+            register_chart_validation_api(&mut engine);
+        }
         engine.build_type::<crate::Span>();
         register_ui_context_api(&mut engine);
         register_date_api(&mut engine);
+        crate::time::register_time_api(&mut engine);
         register_style_api(&mut engine);
         register_motion_api(&mut engine);
         register_text_area_api(&mut engine);
         register_canvas_api(&mut engine);
+        crate::collection_projection::register_collection_projection_api(&mut engine);
         let evaluation_generation = Rc::new(Cell::new(ScriptGeneration::default()));
         let component_exports = ComponentExportCollector::new();
+        let virtual_collection_policy =
+            Rc::new(Cell::new(crate::VirtualCollectionPolicy::default()));
         let (component_render, component_renderers) = register_component_runtime_apis(
             &mut engine,
             &component_exports,
             &evaluation_generation,
+            &virtual_collection_policy,
         );
         let primitives = PrimitiveRegistry::new();
         let native_handlers = crate::NativeHandlerRegistry::new();
@@ -693,6 +856,7 @@ impl RuntimeEngine {
             last_failed_timing: RefCell::new(None),
             last_failed_component: RefCell::new(None),
             operation_tracker,
+            operation_limit,
             slow_threshold: Duration::from_millis(16),
             component_render,
             component_invocations: BTreeMap::new(),
@@ -702,6 +866,7 @@ impl RuntimeEngine {
             component_element_refs: BTreeSet::new(),
             pending_component_commits: BTreeMap::new(),
             component_renderers,
+            virtual_collection_policy,
             native_handlers,
             syntax_registry,
             document_runtime,
@@ -719,6 +884,7 @@ impl RuntimeEngine {
         runtime
     }
 
+    #[allow(clippy::too_many_lines)] // Declarative registration of the built-in primitive set.
     fn register_builtin_primitives(&mut self) {
         let column_measurements = ColumnMeasurementRegistry::default();
         self.register_primitive(
@@ -731,6 +897,47 @@ impl RuntimeEngine {
             IntrinsicTextMeasurePrimitiveHandler::new(column_measurements),
         )
         .expect("built-in intrinsic text measurement primitive descriptor is valid");
+        self.register_primitive(
+            split_resize_primitive_descriptor(),
+            SplitResizePrimitiveHandler,
+        )
+        .expect("built-in split resize primitive descriptor is valid");
+        self.register_primitive(
+            resizable_primitive_descriptor(),
+            ResizablePrimitiveHandler::default(),
+        )
+        .expect("built-in resizable primitive descriptor is valid");
+        self.register_primitive(draggable_primitive_descriptor(), DraggablePrimitiveHandler)
+            .expect("built-in draggable primitive descriptor is valid");
+        self.register_primitive(
+            drag_source_primitive_descriptor(),
+            DragSourcePrimitiveHandler::default(),
+        )
+        .expect("built-in drag source primitive descriptor is valid");
+        self.register_primitive(drop_zone_primitive_descriptor(), DropZonePrimitiveHandler)
+            .expect("built-in drop zone primitive descriptor is valid");
+        self.register_primitive(
+            sortable_primitive_descriptor(),
+            SortablePrimitiveHandler::default(),
+        )
+        .expect("built-in sortable primitive descriptor is valid");
+        self.register_primitive(
+            pan_zoom_primitive_descriptor(),
+            PanZoomPrimitiveHandler::default(),
+        )
+        .expect("built-in pan zoom primitive descriptor is valid");
+        self.register_primitive(
+            range_slider_primitive_descriptor(),
+            RangeSliderPrimitiveHandler::default(),
+        )
+        .expect("built-in range slider primitive descriptor is valid");
+        self.register_primitive(rotatable_primitive_descriptor(), RotatablePrimitiveHandler)
+            .expect("built-in rotatable primitive descriptor is valid");
+        self.register_primitive(
+            selection_area_primitive_descriptor(),
+            SelectionAreaPrimitiveHandler::default(),
+        )
+        .expect("built-in selection area primitive descriptor is valid");
         self.register_primitive(
             text_input_primitive_descriptor(),
             TextInputPrimitiveHandler::default(),
@@ -754,6 +961,14 @@ impl RuntimeEngine {
             ),
         )
         .expect("built-in CodeViewer primitive descriptor is valid");
+        self.register_primitive(
+            crate::markdown_view::markdown_viewer_primitive_descriptor(),
+            crate::markdown_view::MarkdownViewerPrimitiveHandler::new(
+                self.syntax_registry.clone(),
+                self.document_runtime.clone(),
+            ),
+        )
+        .expect("built-in MarkdownViewer primitive descriptor is valid");
         self.register_primitive(
             crate::diff_viewer_primitive_descriptor(),
             crate::DiffViewerPrimitiveHandler::new(
@@ -805,8 +1020,9 @@ impl RuntimeEngine {
             started,
             result.is_ok(),
         );
-        let mut ast = result.map_err(|error| RuntimeError::Compile(error.into()))?;
-        validate_assignment_targets(&ast)?;
+        let mut ast = result
+            .map_err(|error| RuntimeError::Compile(explain_keyword_name(source, error).into()))?;
+        validate_runtime_ast(&ast)?;
         ast.set_source(source_name);
         Ok(CompiledUi { ast, generation })
     }
@@ -834,9 +1050,14 @@ impl RuntimeEngine {
             started,
             result.is_ok(),
         );
-        let mut ast = result.map_err(RuntimeError::Compile)?;
+        let mut ast = result.map_err(|error| match *error {
+            EvalAltResult::ErrorParsing(kind, position) => RuntimeError::Compile(
+                explain_keyword_name(source, rhai::ParseError(Box::new(kind), position)).into(),
+            ),
+            error => RuntimeError::Compile(Box::new(error)),
+        })?;
         validate_literal_imports(&ast)?;
-        validate_assignment_targets(&ast)?;
+        validate_runtime_ast(&ast)?;
         ast.set_source(source_name);
         Ok(CompiledUi { ast, generation })
     }
@@ -866,6 +1087,7 @@ impl RuntimeEngine {
         result
     }
 
+    #[allow(clippy::too_many_lines)]
     fn begin_component_render(
         &self,
         context: UiContext,
@@ -888,7 +1110,10 @@ impl RuntimeEngine {
                         .locale
                         .as_ref()
                         .map(crate::LocaleManager::generation),
-                    calendar_day: runtime.calendar_clock.today(),
+                    calendar_day: runtime
+                        .calendar_clock
+                        .presentation_today(&runtime.wall_clock)
+                        .map_err(|error| RuntimeError::ComponentRuntime(error.to_string()))?,
                 },
                 reuse_plan
                     .as_ref()
@@ -968,6 +1193,7 @@ impl RuntimeEngine {
             reuse,
             reused: Vec::new(),
             failed_component: None,
+            factory_scopes: Vec::new(),
         });
         Ok(())
     }
@@ -997,6 +1223,8 @@ impl RuntimeEngine {
                             source: source.clone(),
                             duration: Duration::ZERO,
                             operations: 0,
+                            operation_limit: self.operation_limit(),
+                            round_operations: self.operation_total(),
                             operation_semantics: OPERATION_SEMANTICS_VERSION,
                             slow: false,
                             succeeded: true,
@@ -1009,7 +1237,9 @@ impl RuntimeEngine {
                 PendingComponentCommit {
                     root: root.clone(),
                     previous,
-                    active: active.seen,
+                    retained_root: (!active.invocations.contains_key(&root)
+                        && active.transaction.retains_root())
+                    .then_some(root.clone()),
                     transaction: active.transaction,
                     event_handlers: active.event_handlers,
                 },
@@ -1359,12 +1589,43 @@ impl RuntimeEngine {
         runtime: &mut UiRuntimeState,
     ) -> Result<(), RuntimeError> {
         let commits = std::mem::take(&mut self.pending_component_commits);
+        if commits.is_empty() {
+            return Ok(());
+        }
+        // One batch has one final invocation graph. Intermediate ancestor
+        // manifests must not retire descendants prepared by later targets.
+        let mut active = self
+            .component_invocations
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        active.extend(
+            self.virtual_collections
+                .keys()
+                .map(|id| id.component.child("VirtualCollection", id.key.clone())),
+        );
+        active.extend(
+            commits
+                .values()
+                .filter_map(|commit| commit.retained_root.clone()),
+        );
+        let roots = crate::state::topmost_paths(&commits.keys().cloned().collect());
+        let previous = commits
+            .values()
+            .flat_map(|commit| commit.previous.iter().cloned())
+            .collect();
+        let mut transactions = Vec::with_capacity(commits.len());
         for (_, commit) in commits {
-            runtime
-                .reconcile_component_lifetimes(&commit.root, &commit.active, &commit.previous)
-                .map_err(|error| RuntimeError::ComponentRuntime(error.to_string()))?;
             runtime.replace_component_event_handlers(&commit.root, commit.event_handlers);
-            runtime.component_state.commit_render(commit.transaction);
+            transactions.push(commit.transaction);
+        }
+        runtime
+            .component_state
+            .commit_render_batch(transactions, &active);
+        for root in roots {
+            runtime
+                .reconcile_component_lifetimes(&root, &active, &previous)
+                .map_err(|error| RuntimeError::ComponentRuntime(error.to_string()))?;
         }
         Ok(())
     }
@@ -1428,6 +1689,7 @@ impl RuntimeEngine {
         &mut self,
         id: &crate::VirtualCollectionId,
         indices: &BTreeSet<usize>,
+        previous: &BTreeMap<usize, UiNode>,
     ) -> Result<BTreeMap<usize, UiNode>, RuntimeError> {
         let recipe = self.virtual_collections.get(id).cloned().ok_or_else(|| {
             RuntimeError::ComponentRuntime(format!(
@@ -1442,19 +1704,66 @@ impl RuntimeEngine {
                 current_generation: self.generation,
             });
         }
+        let batched = batched_indices(indices, previous, recipe.batch_items, recipe.data.len());
+        if batched == *indices {
+            return self.realize_virtual_items(&recipe, indices, previous);
+        }
+        // The items rendered ahead are a bonus: when one of them fails, the realization
+        // renders only the requested ones, and the failure it recovered from stays out of
+        // the reports. A failing requested item still fails it.
+        let failures = (
+            self.last_failed_timing.borrow().clone(),
+            self.last_failed_component.borrow().clone(),
+        );
+        self.realize_virtual_items(&recipe, &batched, previous)
+            .or_else(|_| {
+                let result = self.realize_virtual_items(&recipe, indices, previous);
+                if result.is_ok() {
+                    *self.last_failed_timing.borrow_mut() = failures.0;
+                    *self.last_failed_component.borrow_mut() = failures.1;
+                }
+                result
+            })
+    }
+
+    /// Realize exactly `indices` of `recipe`'s collection, reusing what `previous` and
+    /// the kept items have and rendering the rest.
+    fn realize_virtual_items(
+        &mut self,
+        recipe: &VirtualCollectionRecipe,
+        indices: &BTreeSet<usize>,
+        previous: &BTreeMap<usize, UiNode>,
+    ) -> Result<BTreeMap<usize, UiNode>, RuntimeError> {
+        let id = &recipe.id;
         let scope = id.component.child("VirtualCollection", id.key.clone());
         let context = recipe
             .context
-            .for_component(scope, BTreeMap::new())
+            .for_structural_scope(scope, BTreeMap::new())
             .with_generation(recipe.generation);
-        self.begin_component_render(context.clone(), recipe.generation, None, None)?;
+        let (retained, plan, contributing) = self.reuse_kept_items(recipe, indices, previous);
+        let previous_root = Rc::new(UiNode::box_node(plan));
+        prune_virtual_read_contributions(
+            &context,
+            id,
+            &recipe.data,
+            &contributing,
+            &previous_root,
+        )?;
+        self.begin_component_render(
+            context.clone(),
+            recipe.generation,
+            None,
+            Some(ComponentReusePlan::new(previous_root, BTreeSet::new())),
+        )?;
+        retain_virtual_component_manifest(&self.component_render)?;
         let result = (|| {
-            let mut realized = BTreeMap::new();
-            for index in indices
+            let mut realized = retained;
+            let missing = indices
                 .iter()
                 .copied()
-                .filter(|index| *index < recipe.data.len())
-            {
+                .filter(|index| *index < recipe.data.len() && !realized.contains_key(index))
+                .collect::<Vec<_>>();
+            for index in missing {
                 let item = recipe
                     .data
                     .item(index)
@@ -1464,16 +1773,21 @@ impl RuntimeEngine {
                             "virtual collection item {index} disappeared"
                         ))
                     })?;
-                let (key, payload) =
+                let (key, mut payload) =
                     collection_payload(&item, index).map_err(RuntimeError::Evaluate)?;
+                add_collection_neighbors(&recipe.data, index, &mut payload);
                 let invocation = &recipe.renderer_context;
                 self.align_execution_session_to(invocation.operation_base());
                 let started = self.begin_timing();
+                let item_context = virtual_item_context(&context, id, &key);
+                enter_virtual_collection_scope(&self.component_render, item_context.clone())
+                    .map_err(RuntimeError::Evaluate)?;
                 let item = invocation.call::<UiNode>(
                     self.engine(),
                     &recipe.renderer,
-                    (context.clone(), Dynamic::from_map(payload)),
+                    (item_context, Dynamic::from_map(payload)),
                 );
+                leave_component_render(&self.component_render).map_err(RuntimeError::Evaluate)?;
                 self.record_timing(
                     ExecutionOperation::VirtualCollection(id.key.clone()),
                     id.key.as_str(),
@@ -1483,9 +1797,9 @@ impl RuntimeEngine {
                 let mut node = item.map_err(RuntimeError::Evaluate)?.with_key(key);
                 node.bind_generation(recipe.generation);
                 node.bind_component_scope(
-                    recipe.event_context.component_path(),
-                    recipe.event_context.component_incarnation(),
-                    &recipe.renderer_events,
+                    recipe.context.callback_component_path(),
+                    recipe.context.callback_component_incarnation(),
+                    recipe.context.callback_event_schemas(),
                     Some(&recipe.renderer_context),
                 );
                 realized.insert(index, node);
@@ -1499,26 +1813,131 @@ impl RuntimeEngine {
         result
     }
 
+    /// Move the items leaving the realized range to the recipe's kept items and take back
+    /// the kept items `indices` needs. Returns the items that need no render, the nodes
+    /// the reuse plan keeps alive (those and every kept item) and the indices whose read
+    /// dependencies stay.
+    fn reuse_kept_items(
+        &self,
+        recipe: &VirtualCollectionRecipe,
+        indices: &BTreeSet<usize>,
+        previous: &BTreeMap<usize, UiNode>,
+    ) -> (BTreeMap<usize, UiNode>, Vec<UiNode>, BTreeSet<usize>) {
+        let mut retained = previous
+            .iter()
+            .filter(|(index, _)| indices.contains(index))
+            .map(|(index, node)| (*index, node.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let mut offscreen = recipe.offscreen.borrow_mut();
+        // A failed realization rolls the items back but not what it kept: an item that is
+        // realized again has no kept copy.
+        for index in previous.keys() {
+            offscreen.take(*index);
+        }
+        // Items leaving the realized range are kept, unless a component inside one owns an
+        // effect, a timer or a signal: that item is released, so its work stops as before.
+        for (index, node) in previous
+            .iter()
+            .filter(|(index, _)| !indices.contains(index))
+        {
+            let owns_work = recipe
+                .data
+                .key(*index)
+                .is_some_and(|key| self.virtual_item_owns_work(&recipe.id, key));
+            if !owns_work {
+                offscreen.keep(*index, node.clone());
+            }
+        }
+        // Kept items come back without running the renderer.
+        let unrendered = indices
+            .iter()
+            .copied()
+            .filter(|index| !retained.contains_key(index))
+            .collect::<Vec<_>>();
+        for index in unrendered {
+            if let Some(node) = offscreen.take(index)
+                && node.key().map(crate::NodeKey::as_str) == recipe.data.key(index)
+            {
+                retained.insert(index, node);
+            }
+        }
+        // Kept items stay in the reuse plan and keep their read dependencies, so the
+        // components inside them live on until they come back or are dropped, and a change
+        // they read renders the collection again, which drops them.
+        let mut contributing = indices.clone();
+        contributing.extend(offscreen.items.keys().copied());
+        let mut plan = retained.values().cloned().collect::<Vec<_>>();
+        plan.extend(offscreen.items.values().cloned());
+        (retained, plan, contributing)
+    }
+
+    /// The read contributions of the items the virtual collections in `scope` keep. They
+    /// stay with the committed items' contributions, so a change a kept item read renders
+    /// its collection again, which drops it.
+    pub(crate) fn kept_virtual_read_contributions(
+        &self,
+        scope: &ComponentInstancePath,
+    ) -> BTreeSet<crate::read_dependency::ReadContribution> {
+        let mut active = BTreeSet::new();
+        for recipe in self
+            .virtual_collections
+            .values()
+            .filter(|recipe| recipe.id.component.is_within(scope))
+        {
+            let kept = recipe.offscreen.borrow();
+            for (index, node) in &kept.items {
+                if let Some(key) = recipe.data.key(*index) {
+                    active.insert(crate::read_dependency::ReadContribution::VirtualItem {
+                        collection: recipe.id.clone(),
+                        key: key.to_owned(),
+                    });
+                }
+                active.extend(node.virtual_read_contributions());
+            }
+        }
+        active
+    }
+
+    /// Whether a formal component inside item `key` of collection `id` owns an
+    /// effect, a timer or a signal.
+    fn virtual_item_owns_work(&self, id: &crate::VirtualCollectionId, key: &str) -> bool {
+        let item = id
+            .component
+            .child("VirtualCollection", id.key.clone())
+            .child("Item", key);
+        self.component_effects
+            .keys()
+            .any(|effect| effect.component().is_within(&item))
+            || self
+                .component_timers
+                .keys()
+                .any(|timer| timer.component().is_within(&item))
+            || self
+                .component_signals
+                .keys()
+                .any(|signal| signal.component().is_within(&item))
+    }
+
     pub(crate) fn update_virtual_collection_snapshot(
         &mut self,
         id: &crate::VirtualCollectionId,
         items: &BTreeMap<usize, UiNode>,
-    ) -> Result<(), RuntimeError> {
-        let Some(owner) = self.component_invocations.get_mut(&id.component) else {
-            return Ok(());
-        };
-        let Some(current) = owner.snapshot.current() else {
-            return Ok(());
-        };
-        let mut rendered = current.as_ref().clone();
-        if !rendered.replace_virtual_collection_items(id, items.clone()) {
-            return Err(RuntimeError::ComponentRuntime(format!(
-                "virtual collection `{}` is missing from its owning component snapshot",
-                id.key
-            )));
+    ) {
+        // Structural collection scopes are not executable component owners.
+        // Update every containing invocation snapshot so a later parent bailout
+        // cannot resurrect an older realized window (including nested lists).
+        let mut path = Some(id.component.clone());
+        while let Some(current_path) = path {
+            if let Some(owner) = self.component_invocations.get_mut(&current_path)
+                && let Some(current) = owner.snapshot.current()
+                && current.virtual_collection_spec(id).is_some()
+            {
+                let mut rendered = current.as_ref().clone();
+                rendered.replace_virtual_collection_items(id, items.clone());
+                owner.snapshot.replace_if_active(Rc::new(rendered));
+            }
+            path = current_path.parent();
         }
-        owner.snapshot.replace_if_active(Rc::new(rendered));
-        Ok(())
     }
 
     /// Invoke an optional one-argument lifecycle function.
@@ -1604,6 +2023,8 @@ impl RuntimeEngine {
             let raw: Dynamic = self
                 .engine
                 .call_fn(&mut Scope::new(), &compiled.ast, "state_schema", ())
+                .map_err(RuntimeError::Evaluate)?;
+            validate_state_default_encoding(&raw, "state_schema")
                 .map_err(RuntimeError::Evaluate)?;
             rhai::serde::from_dynamic(&raw).map_err(RuntimeError::Evaluate)
         })();
@@ -1708,16 +2129,28 @@ impl RuntimeEngine {
         &self.engine
     }
 
+    /// The Rhai engine for [`crate::ScriptViewExtension::configure_rhai_engine`].
+    pub(crate) fn engine_mut(&mut self) -> &mut Engine {
+        &mut self.engine
+    }
+
     /// Generate the official Rhai language-server definition source for every
     /// function/type/module registered on this engine.
     ///
     /// Standard packages are omitted because the language server supplies them.
     #[must_use]
     pub fn definition_source(&self) -> String {
-        self.engine
-            .definitions()
-            .include_standard_packages(false)
-            .single_file()
+        // Parameter names, doc comments and readable return types come from the
+        // script docs; Rhai's own printer is the fallback.
+        crate::script_docs::ScriptApi::from_engine(&self.engine).map_or_else(
+            |_| {
+                self.engine
+                    .definitions()
+                    .include_standard_packages(false)
+                    .single_file()
+            },
+            |api| api.definitions(),
+        )
     }
 
     /// Validate statically visible direct and method call arities in an entry
@@ -1737,7 +2170,60 @@ impl RuntimeEngine {
         entry_source: &str,
         modules: &BTreeMap<ModuleId, String>,
     ) -> Result<Vec<crate::KnownCallDiagnostic>, crate::KnownCallLintError> {
-        crate::script_lint::lint_known_calls(&mut self.engine, entry_name, entry_source, modules)
+        crate::script_lint::lint_known_calls(
+            &mut self.engine,
+            entry_name,
+            entry_source,
+            modules,
+            &BTreeSet::new(),
+        )
+        .map(|(diagnostics, _)| diagnostics)
+    }
+
+    /// [`Self::lint_known_calls`] for scripts that also call functions the
+    /// Host registers on its own engine, such as the `[host]` declarations
+    /// `gpui-rhai check` reads: calls to `host` count as known. Returns the
+    /// diagnostics and the declared functions the sources call.
+    ///
+    /// # Errors
+    ///
+    /// Returns a metadata or parse error if the lint catalog cannot be built.
+    pub fn lint_known_calls_with_host(
+        &mut self,
+        entry_name: &str,
+        entry_source: &str,
+        modules: &BTreeMap<ModuleId, String>,
+        host: &BTreeSet<crate::HostFunction>,
+    ) -> Result<
+        (
+            Vec<crate::KnownCallDiagnostic>,
+            BTreeSet<crate::HostFunction>,
+        ),
+        crate::KnownCallLintError,
+    > {
+        crate::script_lint::lint_known_calls(
+            &mut self.engine,
+            entry_name,
+            entry_source,
+            modules,
+            host,
+        )
+    }
+
+    /// List entry-script functions that replace a native function of the same
+    /// name and arity. Rhai prefers the script function for every call,
+    /// including method calls inside imported components, so a helper named
+    /// like a built-in breaks code that never mentions it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a metadata or parse error if the lint catalog cannot be built.
+    pub fn lint_shadowed_builtins(
+        &mut self,
+        entry_name: &str,
+        entry_source: &str,
+    ) -> Result<Vec<crate::ShadowedBuiltin>, crate::KnownCallLintError> {
+        crate::script_lint::lint_shadowed_builtins(&mut self.engine, entry_name, entry_source)
     }
 
     /// Return a snapshot of components exported through this engine.
@@ -1889,6 +2375,21 @@ impl RuntimeEngine {
         self.document_runtime.clone()
     }
 
+    /// The Host defaults for data-backed virtual collections.
+    #[must_use]
+    pub fn virtual_collection_policy(&self) -> crate::VirtualCollectionPolicy {
+        self.virtual_collection_policy.get()
+    }
+
+    /// Set the Host defaults for data-backed virtual collections, usually in
+    /// `ScriptViewExtension::configure_engine`. A collection's own
+    /// `overscan_items`, `batch_items` and `retain_items` take precedence. The
+    /// policy applies from each collection's next render; values are clamped
+    /// to their bounds.
+    pub fn set_virtual_collection_policy(&self, policy: crate::VirtualCollectionPolicy) {
+        self.virtual_collection_policy.set(policy.clamped());
+    }
+
     /// Register one trusted Rust chart transform.
     ///
     /// # Errors
@@ -1983,6 +2484,43 @@ impl RuntimeEngine {
         self.slow_threshold = threshold;
     }
 
+    /// Set the per-execution script operation budget.
+    ///
+    /// The default is [`DEFAULT_SCRIPT_OPERATION_LIMIT`]. This is a cumulative
+    /// operation quota for each execution round, not a frame-time guarantee.
+    /// A host that runs known one-shot, cacheable
+    /// script phases (a layout pass, an analysis sweep) may raise it; the
+    /// wall-clock slow threshold still flags anything that stalls the
+    /// foreground. Scripts cannot change this limit; only the embedding
+    /// application can.
+    /// Zero normalizes to one; it never disables protection. Changes apply to
+    /// subsequent calls. Native Rust work is not preempted by this quota.
+    pub fn set_operation_limit(&mut self, limit: u64) {
+        self.operation_limit.set(limit.max(1));
+    }
+
+    /// The per-execution script operation budget in force.
+    #[must_use]
+    pub fn operation_limit(&self) -> u64 {
+        self.operation_limit.get()
+    }
+
+    /// Configure parser depth independently of execution/recursion/data limits.
+    /// Defaults are global=64/function=64 in both debug and release. Zero
+    /// normalizes to one rather than adopting Rhai's unlimited convention.
+    pub fn set_expression_depth_limits(&mut self, global: usize, functions: usize) {
+        self.engine
+            .set_max_expr_depths(global.max(1), functions.max(1));
+    }
+
+    #[must_use]
+    pub fn expression_depth_limits(&self) -> (usize, usize) {
+        (
+            self.engine.max_expr_depth(),
+            self.engine.max_function_expr_depth(),
+        )
+    }
+
     #[must_use]
     pub fn take_timings(&self) -> Vec<ExecutionTiming> {
         std::mem::take(&mut *self.timings.borrow_mut())
@@ -2014,6 +2552,8 @@ impl RuntimeEngine {
             source: source.to_owned(),
             duration,
             operations,
+            operation_limit: started.operation_limit,
+            round_operations: self.operation_total(),
             operation_semantics: OPERATION_SEMANTICS_VERSION,
             slow: duration >= self.slow_threshold,
             succeeded,
@@ -2046,6 +2586,7 @@ impl RuntimeEngine {
         ExecutionTimingStart {
             instant: Instant::now(),
             operations: self.operation_total(),
+            operation_limit: self.operation_limit(),
         }
     }
 
@@ -2060,7 +2601,15 @@ impl RuntimeEngine {
     }
 }
 
-pub(crate) fn validate_assignment_targets(ast: &AST) -> Result<(), RuntimeError> {
+pub(crate) fn validate_runtime_ast(ast: &AST) -> Result<(), RuntimeError> {
+    if ast
+        .iter_functions()
+        .any(|function| function.name == crate::invocation::NAMED_FUNCTION)
+    {
+        return Err(RuntimeError::Compile(Box::new(component_render_error(
+            "`named_function` is reserved by the SDK's lexical Fn constructor",
+        ))));
+    }
     let mut invalid = None;
     ast.walk(&mut |path| {
         let Some(ASTNode::Stmt(Stmt::Assignment(assignment))) = path.last() else {
@@ -2101,6 +2650,15 @@ fn validate_literal_imports(ast: &AST) -> Result<(), RuntimeError> {
 }
 
 fn register_node_apis(engine: &mut Engine) {
+    // A caller-written shortcut as `#{ label, keystrokes, chords }`, formatted
+    // like a bound action's (`cmd-p` is `⌘P` on macOS); a legend stays as is.
+    FuncRegistration::new("key_shortcut")
+        .in_global_namespace()
+        .register_into_engine(engine, |text: ImmutableString| {
+            crate::ActionShortcut::from_text(text.as_str())
+                .to_ui_value()
+                .into_dynamic()
+        });
     FuncRegistration::new("text")
         .in_global_namespace()
         .register_into_engine(engine, text_node);
@@ -2194,16 +2752,73 @@ fn register_native_handler_api(engine: &mut Engine, registry: &crate::NativeHand
         );
 }
 
+pub(crate) const RHAI_MAX_ARRAY_SIZE: usize = 10_000;
+pub(crate) const RHAI_MAX_MAP_SIZE: usize = 100_000;
+pub(crate) const RHAI_MAX_STRING_SIZE: usize = 1_048_576;
+pub(crate) const RHAI_MAX_DATA_DEPTH: usize = 64;
+
+/// The parser's expression depth at the top level and inside a function. A
+/// builder-style style chain in a node in a closure costs a level per call, so
+/// 32 in a function rejected ordinary view code; 64 still stays clear of the
+/// main thread's stack, where scripts compile and run.
+pub(crate) const EXPRESSION_DEPTHS: (usize, usize) = (64, 64);
+
+/// Rhai reports a keyword where a name belongs as a missing name: `import
+/// "components/switch" as switch;` fails with "Expecting name of a variable".
+/// Say which keyword it was instead.
+pub(crate) fn explain_keyword_name(source: &str, error: rhai::ParseError) -> rhai::ParseError {
+    let rhai::ParseError(kind, position) = &error;
+    let (Some(line), Some(column)) = (position.line(), position.position()) else {
+        return error;
+    };
+    let word: String = source
+        .lines()
+        .nth(line - 1)
+        .unwrap_or_default()
+        .chars()
+        .skip(column - 1)
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+        .collect();
+    // `word` holds only identifier characters, so any token it spells is a keyword.
+    if rhai::Token::lookup_symbol_from_syntax(&word).is_none() {
+        return error;
+    }
+    let misuse = match &**kind {
+        rhai::ParseErrorType::VariableExpected => "name a variable or an import alias".to_owned(),
+        rhai::ParseErrorType::FnMissingName => "name a function".to_owned(),
+        rhai::ParseErrorType::PropertyExpected => {
+            format!("name a property; index it as `[\"{word}\"]`")
+        }
+        rhai::ParseErrorType::MissingToken(token, description)
+            if token == "}" && description.contains("object map literal") =>
+        {
+            format!("be a bare map key; quote it as `\"{word}\"`")
+        }
+        _ => return error,
+    };
+    let message = format!("`{word}` is a Rhai keyword and cannot {misuse}");
+    rhai::ParseError(
+        Box::new(rhai::ParseErrorType::BadInput(
+            rhai::LexError::ImproperSymbol(word, message),
+        )),
+        *position,
+    )
+}
+
 fn configure_engine_limits(engine: &mut Engine) {
+    crate::invocation::register_named_functions(engine);
     engine.set_max_call_levels(64);
-    engine.set_max_expr_depths(64, 32);
+    // Explicit defaults avoid Rhai's profile-dependent parser defaults. A
+    // trusted Host may configure these separately; ordinary applications do
+    // not inherit another application's deeper expression policy.
+    engine.set_max_expr_depths(EXPRESSION_DEPTHS.0, EXPRESSION_DEPTHS.1);
     // Rhai's counter is evaluator-local and cloned into stored callback
     // contexts. The runtime's progress adapter enforces one cumulative budget
     // across nested evaluators and starts delayed callbacks with fresh quota.
     engine.set_max_operations(0);
-    engine.set_max_array_size(10_000);
-    engine.set_max_map_size(100_000);
-    engine.set_max_string_size(1_048_576);
+    engine.set_max_array_size(RHAI_MAX_ARRAY_SIZE);
+    engine.set_max_map_size(RHAI_MAX_MAP_SIZE);
+    engine.set_max_string_size(RHAI_MAX_STRING_SIZE);
 }
 
 fn register_define_component_api(
@@ -2230,11 +2845,18 @@ fn register_define_component_api(
                         "define_component `render` must be a function pointer",
                     )));
                 }
-                let render = render.cast::<FnPtr>();
+                let mut render = render.cast::<FnPtr>();
+                crate::invocation::take_function_environment(&mut render);
                 if render.is_anonymous() || render.is_curried() {
                     return Err(Box::new(component_render_error(
                         "formal component render must be an uncurried named function",
                     )));
+                }
+                if let Some(schema) = raw.get("schema")
+                    && schema.is::<Map>()
+                    && let Some(state) = schema.clone_cast::<Map>().get("state")
+                {
+                    validate_state_default_encoding(state, "component.schema.state")?;
                 }
                 let decoded: crate::ComponentDefinition =
                     rhai::serde::from_dynamic(&Dynamic::from_map(raw))?;
@@ -2263,10 +2885,35 @@ fn register_define_component_api(
         );
 }
 
+fn validate_state_default_encoding(raw: &Dynamic, path: &str) -> Result<(), Box<EvalAltResult>> {
+    if !raw.is::<Map>() {
+        return Ok(());
+    }
+    let raw = raw.clone_cast::<Map>();
+    let Some(fields) = raw.get("fields").filter(|fields| fields.is::<Map>()) else {
+        return Ok(());
+    };
+    for (name, field) in fields.clone_cast::<Map>() {
+        if !field.is::<Map>() {
+            continue;
+        }
+        let field = field.cast::<Map>();
+        if let Some(value) = field.get("default") {
+            rhai::serde::from_dynamic::<UiValue>(value).map_err(|source| {
+                Box::new(component_render_error(format!(
+                    "{path}.fields.{name}.default: expected recursively tagged UiValue; map entries and array items each require type/value descriptors ({source})"
+                )))
+            })?;
+        }
+    }
+    Ok(())
+}
+
 fn register_component_runtime_apis(
     engine: &mut Engine,
     exports: &ComponentExportCollector,
     generation: &Rc<Cell<ScriptGeneration>>,
+    virtual_policy: &Rc<Cell<crate::VirtualCollectionPolicy>>,
 ) -> (ActiveComponentRenderState, ComponentRenderRegistry) {
     let active = Rc::new(RefCell::new(None));
     let renderers = Rc::new(RefCell::new(BTreeMap::new()));
@@ -2276,7 +2923,8 @@ fn register_component_runtime_apis(
     register_timer_api(engine, &active);
     register_signal_api(engine, &active);
     register_element_ref_api(engine, &active);
-    register_virtual_collection_api(engine, &active);
+    register_virtual_collection_api(engine, &active, virtual_policy);
+    register_node_factory_api(engine, &active);
     (active, renderers)
 }
 
@@ -2389,8 +3037,9 @@ fn execute_component_render(
     )? {
         return Ok(node);
     }
-    let native_context = crate::invocation::ScriptInvocationContext::capture(call);
-    let caller_binding = caller_component_binding(call, &caller_context);
+    let native_context = crate::invocation::ScriptInvocationContext::capture_retained(call);
+    let caller_binding = factory_binding(active, &caller_context)
+        .unwrap_or_else(|| caller_component_binding(call, &caller_context));
     bind_component_callback_props(
         &mut invocation.props,
         &component.schema.props,
@@ -2462,20 +3111,30 @@ fn execute_component_render(
     Ok(node)
 }
 
+/// The binding of the Node factory rendering for `caller`, when the caller is the
+/// component that received it: a component the factory renders directly calls back
+/// into the factory's scope, not into the component that rendered the factory.
+fn factory_binding(
+    active: &ActiveComponentRenderState,
+    caller: &UiContext,
+) -> Option<ComponentCallbackBinding> {
+    let guard = active.try_borrow().ok()?;
+    let scope = guard.as_ref()?.factory_scopes.last()?;
+    (scope.receiver == *caller.callback_component_path()).then(|| scope.binding.clone())
+}
+
 fn caller_component_binding(
     call: &rhai::NativeCallContext<'_>,
     caller_context: &UiContext,
 ) -> ComponentCallbackBinding {
     ComponentCallbackBinding {
-        component: caller_context.component_path().clone(),
-        incarnation: caller_context.component_incarnation(),
-        events: caller_context.event_schemas().clone(),
-        context: Some(
-            caller_context
-                .native_context()
-                .cloned()
-                .unwrap_or_else(|| crate::invocation::ScriptInvocationContext::capture_entry(call)),
-        ),
+        component: caller_context.callback_component_path().clone(),
+        incarnation: caller_context.callback_component_incarnation(),
+        events: caller_context.callback_event_schemas().clone(),
+        context: Some(caller_context.native_context().cloned().unwrap_or_else(|| {
+            crate::invocation::ScriptInvocationContext::capture_entry_retained(call)
+        })),
+        is_node_factory: false,
     }
 }
 
@@ -2554,6 +3213,128 @@ fn try_reuse_component_subtree(
         .reused
         .push((component.metadata.id.to_string(), reused_components));
     Ok(Some(scope.node))
+}
+
+fn prune_virtual_read_contributions(
+    context: &UiContext,
+    id: &crate::VirtualCollectionId,
+    data: &crate::VirtualCollectionData,
+    indices: &BTreeSet<usize>,
+    retained: &UiNode,
+) -> Result<(), RuntimeError> {
+    let mut active = retained.virtual_read_contributions();
+    active.extend(
+        indices
+            .iter()
+            .filter_map(|index| data.key(*index))
+            .map(
+                |key| crate::read_dependency::ReadContribution::VirtualItem {
+                    collection: id.clone(),
+                    key: key.to_owned(),
+                },
+            ),
+    );
+    context
+        .runtime()
+        .try_borrow_mut()
+        .map_err(|_| RuntimeError::ComponentRuntime("UI state is already borrowed".into()))?
+        .retain_virtual_read_contributions(context.component_path(), &active);
+    Ok(())
+}
+
+fn retain_virtual_component_manifest(
+    shared: &ActiveComponentRenderState,
+) -> Result<(), RuntimeError> {
+    let mut guard = shared.try_borrow_mut().map_err(|_| {
+        RuntimeError::ComponentRuntime("component render stack is already borrowed".to_owned())
+    })?;
+    let active = guard.as_mut().ok_or_else(|| {
+        RuntimeError::ComponentRuntime("virtual render has no active transaction".to_owned())
+    })?;
+    let Some(reuse) = active.reuse.as_ref() else {
+        return Ok(());
+    };
+    let mut retained = reuse
+        .invocations
+        .keys()
+        .filter(|path| reuse.subtrees.contains(path))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    // A transparent component can share its display root with its parent.
+    // Follow committed invocation ownership, not only display-root markers.
+    let mut children = BTreeMap::<ComponentInstancePath, Vec<ComponentInstancePath>>::new();
+    for (path, recipe) in &reuse.invocations {
+        children
+            .entry(recipe.parent.clone())
+            .or_default()
+            .push(path.clone());
+    }
+    let mut pending = retained.iter().cloned().collect::<Vec<_>>();
+    while let Some(parent) = pending.pop() {
+        for child in children.get(&parent).into_iter().flatten() {
+            if retained.insert(child.clone()) {
+                pending.push(child.clone());
+            }
+        }
+    }
+    for path in &retained {
+        if !active.transaction.retain_existing(path) {
+            return Err(RuntimeError::ComponentRuntime(format!(
+                "retained virtual component `{path}` has no committed state"
+            )));
+        }
+    }
+    active.seen.extend(retained.iter().cloned());
+    active.invocations.extend(
+        reuse
+            .invocations
+            .iter()
+            .filter(|(path, _)| retained.contains(*path))
+            .map(|(path, recipe)| (path.clone(), recipe.clone())),
+    );
+    active.event_handlers.extend(
+        reuse
+            .event_handlers
+            .iter()
+            .filter(|((path, _), _)| retained.contains(path))
+            .map(|(id, callback)| (id.clone(), callback.clone())),
+    );
+    active.effects.extend(
+        reuse
+            .effects
+            .iter()
+            .filter(|(id, _)| retained.contains(id.component()))
+            .map(|(id, descriptor)| (id.clone(), descriptor.clone())),
+    );
+    active.timers.extend(
+        reuse
+            .timers
+            .iter()
+            .filter(|(id, _)| retained.contains(id.component()))
+            .map(|(id, descriptor)| (id.clone(), descriptor.clone())),
+    );
+    active.signals.extend(
+        reuse
+            .signals
+            .iter()
+            .filter(|(id, _)| retained.contains(id.component()))
+            .map(|(id, descriptor)| (id.clone(), descriptor.clone())),
+    );
+    active.element_refs.extend(
+        reuse
+            .element_refs
+            .iter()
+            .filter(|id| retained.contains(id.component()))
+            .cloned(),
+    );
+    active.virtual_collections.extend(
+        reuse
+            .virtual_collections
+            .iter()
+            .filter(|(id, _)| reuse.previous_root.virtual_collection_spec(id).is_some())
+            .map(|(id, recipe)| (id.clone(), recipe.clone())),
+    );
+    Ok(())
 }
 
 fn reusable_component_scope(
@@ -2873,7 +3654,8 @@ fn register_effect_api(engine: &mut Engine, active: &ActiveComponentRenderState)
                     .map_err(|error| Box::new(component_render_error(error.to_string())))?;
                 let dependencies = UiValue::from_dynamic(dependencies)
                     .map_err(|error| Box::new(component_render_error(error.to_string())))?;
-                let native_context = crate::invocation::ScriptInvocationContext::capture(&call);
+                let native_context =
+                    crate::invocation::ScriptInvocationContext::capture_retained(&call);
                 let mut start = ScriptCallback::try_from_fn_ptr(start, generation)
                     .map_err(|error| Box::new(component_render_error(error.to_string())))?;
                 start.bind_component_scope_if_unset(
@@ -2913,82 +3695,94 @@ fn register_effect_api(engine: &mut Engine, active: &ActiveComponentRenderState)
 }
 
 fn register_timer_api(engine: &mut Engine, active: &ActiveComponentRenderState) {
-    let active = Rc::clone(active);
-    FuncRegistration::new("timeout")
-        .in_global_namespace()
-        .register_into_engine(
-            engine,
-            move |call: rhai::NativeCallContext<'_>,
-                  key: ImmutableString,
-                  delay_ms: rhai::INT,
-                  paused: bool,
-                  callback: FnPtr,
-                  payload: Dynamic|
-                  -> Result<(), Box<EvalAltResult>> {
-                let (component, context, generation) = {
-                    let guard = active.try_borrow().map_err(|_| {
+    // `timeout` fires once; `interval` fires every period until removed,
+    // changed or cancelled. Both share one key space per component.
+    for (name, repeat) in [("timeout", false), ("interval", true)] {
+        let active = Rc::clone(active);
+        FuncRegistration::new(name)
+            .in_global_namespace()
+            .register_into_engine(
+                engine,
+                move |call: rhai::NativeCallContext<'_>,
+                      key: ImmutableString,
+                      delay_ms: rhai::INT,
+                      paused: bool,
+                      callback: FnPtr,
+                      payload: Dynamic|
+                      -> Result<(), Box<EvalAltResult>> {
+                    let (component, context, generation) = {
+                        let guard = active.try_borrow().map_err(|_| {
+                            Box::new(component_render_error(
+                                "component render stack is already borrowed",
+                            ))
+                        })?;
+                        let render = guard.as_ref().ok_or_else(|| {
+                            Box::new(component_render_error(format!(
+                                "{name} may run only during formal component render"
+                            )))
+                        })?;
+                        let context = render.contexts.last().cloned().ok_or_else(|| {
+                            Box::new(component_render_error(
+                                "component render context stack is empty",
+                            ))
+                        })?;
+                        (context.component_path().clone(), context, render.generation)
+                    };
+                    let delay_ms = u64::try_from(delay_ms).map_err(|_| {
+                        Box::new(component_render_error(format!(
+                            "{name} delay must be a positive integer"
+                        )))
+                    })?;
+                    let id = crate::TimerId::new(component.clone(), key.to_string())
+                        .map_err(|error| Box::new(component_render_error(error.to_string())))?;
+                    let payload = UiValue::from_dynamic(payload)
+                        .map_err(|error| Box::new(component_render_error(error.to_string())))?;
+                    let native_context =
+                        crate::invocation::ScriptInvocationContext::capture_retained(&call);
+                    let mut callback = ScriptCallback::try_from_fn_ptr(callback, generation)
+                        .map_err(|error| Box::new(component_render_error(error.to_string())))?;
+                    callback.bind_component_scope_if_unset(
+                        &component,
+                        context.component_incarnation(),
+                        context.event_schemas().clone(),
+                    );
+                    callback.bind_native_context_if_unset(native_context);
+                    let descriptor = crate::TimerDescriptor::new(
+                        id.clone(),
+                        Duration::from_millis(delay_ms),
+                        paused,
+                        callback,
+                        payload,
+                    )
+                    .and_then(|descriptor| {
+                        if repeat {
+                            descriptor.repeating()
+                        } else {
+                            Ok(descriptor)
+                        }
+                    })
+                    .map_err(|error| Box::new(component_render_error(error.to_string())))?;
+                    let mut guard = active.try_borrow_mut().map_err(|_| {
                         Box::new(component_render_error(
                             "component render stack is already borrowed",
                         ))
                     })?;
-                    let render = guard.as_ref().ok_or_else(|| {
-                        Box::new(component_render_error(
-                            "timeout may run only during formal component render",
-                        ))
+                    let render = guard.as_mut().ok_or_else(|| {
+                        Box::new(component_render_error(format!(
+                            "{name} may run only during formal component render"
+                        )))
                     })?;
-                    let context = render.contexts.last().cloned().ok_or_else(|| {
-                        Box::new(component_render_error(
-                            "component render context stack is empty",
-                        ))
-                    })?;
-                    (context.component_path().clone(), context, render.generation)
-                };
-                let delay_ms = u64::try_from(delay_ms).map_err(|_| {
-                    Box::new(component_render_error(
-                        "timeout delay must be a positive integer",
-                    ))
-                })?;
-                let id = crate::TimerId::new(component.clone(), key.to_string())
-                    .map_err(|error| Box::new(component_render_error(error.to_string())))?;
-                let payload = UiValue::from_dynamic(payload)
-                    .map_err(|error| Box::new(component_render_error(error.to_string())))?;
-                let native_context = crate::invocation::ScriptInvocationContext::capture(&call);
-                let mut callback = ScriptCallback::try_from_fn_ptr(callback, generation)
-                    .map_err(|error| Box::new(component_render_error(error.to_string())))?;
-                callback.bind_component_scope_if_unset(
-                    &component,
-                    context.component_incarnation(),
-                    context.event_schemas().clone(),
-                );
-                callback.bind_native_context_if_unset(native_context);
-                let descriptor = crate::TimerDescriptor::new(
-                    id.clone(),
-                    Duration::from_millis(delay_ms),
-                    paused,
-                    callback,
-                    payload,
-                )
-                .map_err(|error| Box::new(component_render_error(error.to_string())))?;
-                let mut guard = active.try_borrow_mut().map_err(|_| {
-                    Box::new(component_render_error(
-                        "component render stack is already borrowed",
-                    ))
-                })?;
-                let render = guard.as_mut().ok_or_else(|| {
-                    Box::new(component_render_error(
-                        "timeout may run only during formal component render",
-                    ))
-                })?;
-                if render.timers.insert(id.clone(), descriptor).is_some() {
-                    return Err(Box::new(component_render_error(format!(
-                        "timeout `{}` is declared more than once in `{}`",
-                        id.key(),
-                        id.component()
-                    ))));
-                }
-                Ok(())
-            },
-        );
+                    if render.timers.insert(id.clone(), descriptor).is_some() {
+                        return Err(Box::new(component_render_error(format!(
+                            "{name} `{}` is declared more than once in `{}`",
+                            id.key(),
+                            id.component()
+                        ))));
+                    }
+                    Ok(())
+                },
+            );
+    }
 }
 
 fn register_signal_api(engine: &mut Engine, active: &ActiveComponentRenderState) {
@@ -3018,6 +3812,43 @@ fn register_signal_api(engine: &mut Engine, active: &ActiveComponentRenderState)
                     key.to_string(),
                     crate::SignalValue::OptionalFloat(None),
                 )
+            },
+        );
+
+    let parent_active = Rc::clone(active);
+    FuncRegistration::new("bind_parent_signal")
+        .in_global_namespace()
+        .register_into_engine(
+            engine,
+            move |node: &mut UiNode,
+                  context: UiContext,
+                  property: ImmutableString,
+                  key: ImmutableString|
+                  -> Result<UiNode, Box<EvalAltResult>> {
+                let property = crate::SignalProperty::parse(property.as_str())
+                    .map_err(|error| Box::new(crate::signal::signal_runtime_error(&error)))?;
+                if property.signal_kind() != crate::SignalKind::OptionalFloat {
+                    return Err(Box::new(crate::signal::signal_runtime_error(
+                        &"parent signal binding currently supports optional-float properties",
+                    )));
+                }
+                // An owner rendering in this pass has declared its signals but
+                // not committed them yet.
+                let pending = parent_active
+                    .try_borrow()
+                    .ok()
+                    .and_then(|guard| {
+                        guard
+                            .as_ref()
+                            .map(|render| render.signals.keys().cloned().collect::<Vec<_>>())
+                    })
+                    .unwrap_or_default();
+                let signal = context
+                    .parent_optional_float_signal_ref(key.as_str(), &pending)
+                    .map_err(|error| Box::new(crate::signal::signal_runtime_error(&error)))?;
+                node.clone()
+                    .with_signal_binding(property, signal)
+                    .map_err(|error| Box::new(crate::signal::signal_runtime_error(&error)))
             },
         );
 }
@@ -3120,8 +3951,11 @@ struct DecodedVirtualCollection {
     estimated_height: f64,
     height: Option<f64>,
     overdraw_pixels: f64,
+    /// The collection's own render-ahead settings, before the Host policy.
+    ahead: RenderAhead,
     bottom_align: bool,
     follow_tail: bool,
+    on_follow_change: Option<FnPtr>,
     reveal_key: Option<String>,
     sticky_headers: Arc<BTreeSet<usize>>,
 }
@@ -3142,10 +3976,45 @@ impl DecodedVirtualCollection {
             overdraw_pixels: self.overdraw_pixels,
             bottom_align: self.bottom_align,
             follow_tail: self.follow_tail,
+            on_follow_change: None,
             reveal_key: self.reveal_key,
             sticky_headers: self.sticky_headers,
             inherited_motion_group: None,
+            inherited_motion_scope: None,
         }
+    }
+}
+
+/// A collection's own `overscan_items`, `batch_items` and `retain_items`.
+#[derive(Clone, Copy, Debug)]
+struct RenderAhead {
+    overscan: Option<usize>,
+    batch: Option<usize>,
+    retain: Option<usize>,
+}
+
+impl RenderAhead {
+    fn decode(config: &mut Map) -> Result<Self, Box<EvalAltResult>> {
+        Ok(Self {
+            overscan: collection_optional_count(
+                config,
+                "overscan_items",
+                0,
+                crate::MAX_VIRTUAL_OVERSCAN_ITEMS,
+            )?,
+            batch: collection_optional_count(
+                config,
+                "batch_items",
+                1,
+                crate::MAX_VIRTUAL_BATCH_ITEMS,
+            )?,
+            retain: collection_optional_count(
+                config,
+                "retain_items",
+                0,
+                crate::MAX_VIRTUAL_RETAIN_ITEMS,
+            )?,
+        })
     }
 }
 
@@ -3183,6 +4052,7 @@ fn decode_virtual_collection(
             "virtual collection overdraw_pixels must be between 0 and 10000",
         )));
     }
+    let ahead = RenderAhead::decode(&mut config)?;
     let alignment =
         collection_optional_string(&mut config, "alignment")?.unwrap_or_else(|| "top".to_owned());
     let bottom_align = match alignment.as_str() {
@@ -3195,6 +4065,7 @@ fn decode_virtual_collection(
         }
     };
     let follow_tail = collection_optional_bool(&mut config, "follow_tail")?.unwrap_or(false);
+    let on_follow_change = collection_optional_follow_callback(&mut config)?;
     let data = collection_data(&mut config)?;
     let reveal_key = collection_optional_string(&mut config, "reveal_key")?;
     if reveal_key.as_deref() == Some("") {
@@ -3239,46 +4110,129 @@ fn decode_virtual_collection(
         estimated_height,
         height,
         overdraw_pixels,
+        ahead,
         bottom_align,
         follow_tail,
+        on_follow_change,
         reveal_key,
         sticky_headers,
     })
 }
 
-fn register_virtual_collection_api(engine: &mut Engine, active: &ActiveComponentRenderState) {
+/// `ctx.render_node(factory, detail)`: renders a Node factory with the receiving
+/// component's `ctx`. Callbacks in the nodes it returns, and in the components it
+/// renders directly, belong to the scope that bound the factory.
+fn register_node_factory_api(engine: &mut Engine, active: &ActiveComponentRenderState) {
     let active = Rc::clone(active);
+    engine.register_fn(
+        "render_node",
+        move |call: rhai::NativeCallContext<'_>,
+              context: &mut UiContext,
+              renderer: Dynamic,
+              detail: Dynamic|
+              -> Result<UiNode, Box<EvalAltResult>> {
+            let callback = context.node_factory_callback(renderer)?;
+            let binding = callback.factory_scope_binding();
+            let pushed = binding.as_ref().is_some_and(|binding| {
+                active
+                    .try_borrow_mut()
+                    .ok()
+                    .and_then(|mut guard| {
+                        guard.as_mut().map(|render| {
+                            render.factory_scopes.push(FactoryScope {
+                                receiver: context.callback_component_path().clone(),
+                                binding: binding.clone(),
+                            });
+                        })
+                    })
+                    .is_some()
+            });
+            let result = callback.render_node(&call, context.clone(), detail);
+            if pushed
+                && let Ok(mut guard) = active.try_borrow_mut()
+                && let Some(render) = guard.as_mut()
+            {
+                render.factory_scopes.pop();
+            }
+            let mut node = result?;
+            if let Some(binding) = &binding {
+                node.bind_component_scope(
+                    &binding.component,
+                    binding.incarnation,
+                    &binding.events,
+                    binding.context.as_ref(),
+                );
+            }
+            Ok(node)
+        },
+    );
+}
+
+fn register_virtual_collection_api(
+    engine: &mut Engine,
+    active: &ActiveComponentRenderState,
+    policy: &Rc<Cell<crate::VirtualCollectionPolicy>>,
+) {
+    let active = Rc::clone(active);
+    let policy = Rc::clone(policy);
     FuncRegistration::new("virtual_collection")
         .in_global_namespace()
         .register_into_engine(
             engine,
             move |call: rhai::NativeCallContext<'_>,
                   config: Map,
-                  renderer: FnPtr|
+                  mut renderer: FnPtr|
                   -> Result<UiNode, Box<EvalAltResult>> {
+                let renderer_context = crate::invocation::take_function_environment(&mut renderer);
                 validate_virtual_renderer(&renderer)?;
-                let decoded = decode_virtual_collection(config)?;
+                let mut decoded = decode_virtual_collection(config)?;
+                // The collection's own settings, then the Host's, then the built-in values.
+                // An overscan in items replaces the collection's own `overdraw_pixels`.
+                let policy = policy.get();
+                if let Some(items) = policy.overscan_for(decoded.ahead.overscan) {
+                    decoded.overdraw_pixels =
+                        (usize_to_f64(items) * decoded.estimated_height).min(10_000.0);
+                }
+                let batch_items = policy.batch_for(decoded.ahead.batch);
+                let retain_items = policy.retain_for(decoded.ahead.retain);
 
                 let VirtualCollectionContext {
                     component,
                     context,
                     generation,
-                    events,
                 } = virtual_collection_context(&active)?;
                 let id = crate::VirtualCollectionId {
                     component: component.clone(),
                     key: decoded.key.clone(),
                 };
                 let collection_context = context
-                    .for_component(
+                    .for_structural_scope(
                         component.child("VirtualCollection", decoded.key.clone()),
                         BTreeMap::new(),
                     )
                     .with_generation(generation);
-                let native_context = crate::invocation::ScriptInvocationContext::capture(&call);
+                let native_context =
+                    crate::invocation::ScriptInvocationContext::capture_retained(&call);
+                let renderer_context = renderer_context.unwrap_or_else(|| native_context.clone());
+                let on_follow_change = decoded
+                    .on_follow_change
+                    .take()
+                    .map(|callback| {
+                        let mut callback = ScriptCallback::try_from_fn_ptr(callback, generation)
+                            .map_err(|error| Box::new(component_render_error(error.to_string())))?;
+                        callback.bind_component_scope_if_unset(
+                            context.callback_component_path(),
+                            context.callback_component_incarnation(),
+                            context.callback_event_schemas().clone(),
+                        );
+                        callback.bind_native_context_if_unset(native_context.clone());
+                        Ok::<_, Box<EvalAltResult>>(callback)
+                    })
+                    .transpose()?;
                 let realized = realize_seeded_virtual_collection(
                     &call,
                     &renderer,
+                    &renderer_context,
                     &collection_context,
                     &active,
                     &id,
@@ -3288,11 +4242,11 @@ fn register_virtual_collection_api(engine: &mut Engine, active: &ActiveComponent
                     id: id.clone(),
                     data: decoded.data.clone(),
                     renderer,
-                    renderer_events: events,
-                    renderer_context: native_context,
+                    renderer_context,
                     context: collection_context,
-                    event_context: context,
                     generation,
+                    batch_items,
+                    offscreen: Rc::new(RefCell::new(OffscreenItems::new(retain_items))),
                 };
                 let mut guard = active.try_borrow_mut().map_err(|_| {
                     Box::new(component_render_error(
@@ -3314,9 +4268,27 @@ fn register_virtual_collection_api(engine: &mut Engine, active: &ActiveComponent
                         decoded.key, id.component
                     ))));
                 }
-                Ok(UiNode::virtual_collection(decoded.into_spec(id, realized)))
+                let mut spec = decoded.into_spec(id, realized);
+                spec.on_follow_change = on_follow_change.map(Box::new);
+                Ok(UiNode::virtual_collection(spec))
             },
         );
+}
+
+fn collection_optional_follow_callback(
+    config: &mut Map,
+) -> Result<Option<FnPtr>, Box<EvalAltResult>> {
+    config
+        .remove("on_follow_change")
+        .filter(|value| !value.is_unit())
+        .map(|value| {
+            value.try_cast::<FnPtr>().ok_or_else(|| {
+                Box::new(component_render_error(
+                    "virtual collection on_follow_change must be a named callback",
+                ))
+            })
+        })
+        .transpose()
 }
 
 fn validate_virtual_renderer(renderer: &FnPtr) -> Result<(), Box<EvalAltResult>> {
@@ -3336,7 +4308,7 @@ fn validate_virtual_renderer(renderer: &FnPtr) -> Result<(), Box<EvalAltResult>>
 }
 
 fn validate_virtual_renderer_curry(value: &Dynamic) -> Result<(), crate::UiValueError> {
-    if value.is::<UiNode>() || value.is::<crate::NativeSignal>() {
+    if value.is::<UiNode>() || value.is::<crate::NativeSignal>() || is_bound_node_factory(value) {
         return Ok(());
     }
     if value.is::<Array>() {
@@ -3354,13 +4326,42 @@ fn validate_virtual_renderer_curry(value: &Dynamic) -> Result<(), crate::UiValue
     UiValue::from_dynamic(value.clone()).map(|_| ())
 }
 
+/// A Node factory bound with `ctx.node_factory`: an item renderer may carry one,
+/// since it keeps the environment and scope it was bound in, and call it with
+/// `ctx.render_node` whenever the collection realizes an item.
+fn is_bound_node_factory(value: &Dynamic) -> bool {
+    value.is::<FnPtr>()
+        && value.clone_cast::<FnPtr>().iter_curry().any(|value| {
+            value.is::<ComponentCallbackBinding>()
+                && value
+                    .clone_cast::<ComponentCallbackBinding>()
+                    .is_node_factory
+        })
+}
+
+/// The context an item renderer runs in: a structural `Item[<key>]` scope under
+/// the collection, so components inside an item are named by the item, not by
+/// how many items the batch rendered before it.
+fn virtual_item_context(
+    context: &UiContext,
+    id: &crate::VirtualCollectionId,
+    key: &str,
+) -> UiContext {
+    context
+        .for_structural_scope(context.component_path().child("Item", key), BTreeMap::new())
+        .for_virtual_item(id, key)
+}
+
 fn realize_initial_collection(
     call: &rhai::NativeCallContext<'_>,
-    renderer: &FnPtr,
+    renderer: (&FnPtr, &crate::invocation::ScriptInvocationContext),
     context: &UiContext,
+    active: &ActiveComponentRenderState,
+    id: &crate::VirtualCollectionId,
     data: &crate::VirtualCollectionData,
     indices: &BTreeSet<usize>,
 ) -> Result<BTreeMap<usize, UiNode>, Box<EvalAltResult>> {
+    let (renderer, renderer_context) = renderer;
     let mut realized = BTreeMap::new();
     for index in indices.iter().copied().filter(|index| *index < data.len()) {
         let item = data
@@ -3371,11 +4372,14 @@ fn realize_initial_collection(
                     "virtual collection item {index} disappeared"
                 )))
             })?;
-        let (item_key, payload) = collection_payload(&item, index)?;
-        let node = renderer
-            .call_within_context::<UiNode>(call, (context.clone(), payload))?
-            .with_key(item_key);
-        realized.insert(index, node);
+        let (item_key, mut payload) = collection_payload(&item, index)?;
+        add_collection_neighbors(data, index, &mut payload);
+        let item_context = virtual_item_context(context, id, &item_key);
+        enter_virtual_collection_scope(active, item_context.clone())?;
+        let node =
+            renderer_context.call_synchronous::<UiNode>(call, renderer, (item_context, payload));
+        leave_component_render(active)?;
+        realized.insert(index, node?.with_key(item_key));
     }
     Ok(realized)
 }
@@ -3383,6 +4387,7 @@ fn realize_initial_collection(
 fn realize_seeded_virtual_collection(
     call: &rhai::NativeCallContext<'_>,
     renderer: &FnPtr,
+    renderer_context: &crate::invocation::ScriptInvocationContext,
     context: &UiContext,
     active: &ActiveComponentRenderState,
     id: &crate::VirtualCollectionId,
@@ -3416,7 +4421,15 @@ fn realize_seeded_virtual_collection(
     let indices =
         virtual_collection_seed_indices(active, id, decoded, count, previous_metrics.as_ref())?;
     enter_virtual_collection_scope(active, context.clone())?;
-    let realized = realize_initial_collection(call, renderer, context, &decoded.data, &indices);
+    let realized = realize_initial_collection(
+        call,
+        (renderer, renderer_context),
+        context,
+        active,
+        id,
+        &decoded.data,
+        &indices,
+    );
     leave_component_render(active)?;
     realized
 }
@@ -3444,8 +4457,24 @@ fn virtual_collection_seed_indices(
     });
 
     if preserves_scroll {
+        let overdraw = virtual_overdraw_items(decoded);
+        // A new render keeps the items around the last presented viewport, not the batch
+        // a scroll rendered ahead: rendering again is what the batch saved. Before a
+        // frame has reported what it showed, every realized item stays.
+        let around = metrics
+            .filter(|metrics| !metrics.visible_range.is_empty())
+            .map(|metrics| {
+                metrics.visible_range.start.saturating_sub(overdraw)
+                    ..metrics.visible_range.end.saturating_add(overdraw)
+            });
         if let Some(previous) = previous {
-            indices.extend(previous.realized.keys().copied());
+            indices.extend(
+                previous
+                    .realized
+                    .keys()
+                    .copied()
+                    .filter(|index| around.as_ref().is_none_or(|around| around.contains(index))),
+            );
         }
         if let Some(metrics) = metrics {
             extend_virtual_window(
@@ -3453,7 +4482,7 @@ fn virtual_collection_seed_indices(
                 metrics.scroll_item,
                 count,
                 decoded.data.len(),
-                virtual_overdraw_items(decoded),
+                overdraw,
             );
         }
     } else if decoded.reveal_key.is_none() && !decoded.bottom_align && !decoded.follow_tail {
@@ -3491,6 +4520,48 @@ fn same_collection_key_order(
         && (0..current.len()).all(|index| current.key(index) == next.key(index))
 }
 
+/// The indices a realization renders: the requested ones, and when a scroll
+/// needs items that are not rendered yet, `batch - 1` more beyond the farthest
+/// requested index on each side the new items lie, so the next scroll steps
+/// find their items rendered.
+fn batched_indices(
+    requested: &BTreeSet<usize>,
+    previous: &BTreeMap<usize, UiNode>,
+    batch: usize,
+    len: usize,
+) -> BTreeSet<usize> {
+    let mut indices = requested.clone();
+    let extra = batch.saturating_sub(1);
+    let (Some(&first), Some(&last)) = (requested.first(), requested.last()) else {
+        return indices;
+    };
+    if extra == 0 {
+        return indices;
+    }
+    let realized = (previous.keys().next(), previous.keys().next_back());
+    let (mut after, mut before) = (false, false);
+    for index in requested
+        .iter()
+        .filter(|index| !previous.contains_key(index))
+    {
+        match realized {
+            (Some(start), Some(end)) => {
+                after |= index > end;
+                before |= index < start;
+            }
+            _ => after = true,
+        }
+    }
+    if after {
+        let end = last.saturating_add(extra).saturating_add(1).min(len);
+        indices.extend(last.saturating_add(1)..end);
+    }
+    if before {
+        indices.extend(first.saturating_sub(extra)..first);
+    }
+    indices
+}
+
 fn virtual_overdraw_items(decoded: &DecodedVirtualCollection) -> usize {
     nonnegative_usize((decoded.overdraw_pixels / decoded.estimated_height).ceil())
 }
@@ -3511,7 +4582,6 @@ struct VirtualCollectionContext {
     component: ComponentInstancePath,
     context: UiContext,
     generation: ScriptGeneration,
-    events: BTreeMap<String, EventSchema>,
 }
 
 fn enter_virtual_collection_scope(
@@ -3556,7 +4626,6 @@ fn virtual_collection_context(
         component: context.component_path().clone(),
         context: context.clone(),
         generation: render.generation,
-        events: context.event_schemas().clone(),
     })
 }
 
@@ -3611,6 +4680,29 @@ fn collection_optional_number(
                     "virtual collection `{name}` must be a number"
                 ))))
             }
+        })
+        .transpose()
+}
+
+/// An optional item count between `min` and `max`.
+fn collection_optional_count(
+    config: &mut Map,
+    name: &str,
+    min: usize,
+    max: usize,
+) -> Result<Option<usize>, Box<EvalAltResult>> {
+    config
+        .remove(name)
+        .map(|value| {
+            let count = value
+                .try_cast::<rhai::INT>()
+                .and_then(|count| usize::try_from(count).ok())
+                .filter(|count| (min..=max).contains(count));
+            count.ok_or_else(|| {
+                Box::new(component_render_error(format!(
+                    "virtual collection `{name}` must be an integer from {min} to {max}"
+                )))
+            })
         })
         .transpose()
 }
@@ -3741,8 +4833,28 @@ fn collection_payload(item: &UiValue, index: usize) -> Result<(String, Map), Box
     ))
 }
 
+fn add_collection_neighbors(data: &crate::VirtualCollectionData, index: usize, payload: &mut Map) {
+    let key = |index: Option<usize>| {
+        index
+            .and_then(|index| data.key(index))
+            .map_or(Dynamic::UNIT, |key| Dynamic::from(key.to_owned()))
+    };
+    payload.insert("previous_key".into(), key(index.checked_sub(1)));
+    payload.insert(
+        "next_key".into(),
+        key(index.checked_add(1).filter(|index| *index < data.len())),
+    );
+    payload.insert("first_key".into(), key((!data.is_empty()).then_some(0)));
+    payload.insert("last_key".into(), key(data.len().checked_sub(1)));
+}
+
 fn nonnegative_usize(value: f64) -> usize {
     value.to_string().parse().unwrap_or(usize::MAX)
+}
+
+/// An item count as pixels' factor; counts here are bounded far below `u32::MAX`.
+fn usize_to_f64(value: usize) -> f64 {
+    f64::from(u32::try_from(value).unwrap_or(u32::MAX))
 }
 
 fn component_event_callbacks(
@@ -4018,9 +5130,126 @@ fn component_render_error(message: impl Into<String>) -> EvalAltResult {
     EvalAltResult::ErrorRuntime(Dynamic::from(message.into()), Position::NONE)
 }
 
+#[cfg(feature = "charts")]
+fn register_chart_validation_api(engine: &mut Engine) {
+    engine.register_fn(
+        "chart_validate",
+        |spec: Map, data: Dynamic, key_dimension: Dynamic| -> Result<(), Box<EvalAltResult>> {
+            let spec = UiValue::from_dynamic(Dynamic::from_map(spec))
+                .map_err(|error| Box::new(component_render_error(error.to_string())))?;
+            crate::ChartSpec::from_ui_value(&spec)
+                .map_err(|error| Box::new(component_render_error(error.to_string())))?;
+            let key_dimension = if key_dimension.is_unit() {
+                None
+            } else if key_dimension.is::<ImmutableString>() {
+                Some(key_dimension.cast::<ImmutableString>().to_string())
+            } else {
+                return Err(Box::new(component_render_error(
+                    "chart key_dimension must be a string or null",
+                )));
+            };
+            if data.is::<crate::NativeChartData>() {
+                return Ok(());
+            }
+            if !data.is::<Array>() {
+                return Err(Box::new(component_render_error(
+                    "chart data must be an array of objects or NativeChartData",
+                )));
+            }
+            let data = UiValue::from_dynamic(Dynamic::from_array(data.cast::<Array>()))
+                .map_err(|error| Box::new(component_render_error(error.to_string())))?;
+            let UiValue::Array(rows) = data else {
+                unreachable!()
+            };
+            if rows.len() > 10_000 {
+                return Err(Box::new(component_render_error(
+                    "inline chart data is limited to 10000 rows; use NativeChartData",
+                )));
+            }
+            let rows = rows
+                .into_iter()
+                .enumerate()
+                .map(|(index, row)| match row {
+                    UiValue::Map(row) => Ok(row),
+                    _ => Err(Box::new(component_render_error(format!(
+                        "chart inline row {index} must be an object"
+                    )))),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            crate::ChartDataset::from_rows(
+                "main",
+                &rows,
+                key_dimension,
+                crate::ChartDataLimits::default(),
+            )
+            .map_err(|error| Box::new(component_render_error(error.to_string())))?;
+            Ok(())
+        },
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offscreen_items_drop_the_least_recently_released_beyond_capacity() {
+        let mut kept = OffscreenItems::new(3);
+        for index in 0..5 {
+            kept.keep(index, UiNode::text(format!("{index}")));
+        }
+        assert_eq!(kept.items.keys().copied().collect::<Vec<_>>(), [2, 3, 4]);
+        // Releasing 2 again makes it the newest, so 3 goes first.
+        kept.keep(2, UiNode::text("2"));
+        kept.keep(5, UiNode::text("5"));
+        assert_eq!(kept.items.keys().copied().collect::<Vec<_>>(), [2, 4, 5]);
+        assert!(kept.take(4).is_some());
+        assert!(kept.take(4).is_none());
+        assert_eq!(kept.order, [2, 5]);
+
+        let mut none = OffscreenItems::new(0);
+        none.keep(0, UiNode::text("0"));
+        assert!(none.items.is_empty());
+    }
+
+    #[test]
+    fn a_batch_extends_toward_the_items_a_scroll_needs() {
+        let realized = |range: std::ops::Range<usize>| {
+            range
+                .map(|index| (index, UiNode::text(format!("{index}"))))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let set = |range: std::ops::Range<usize>| range.collect::<BTreeSet<_>>();
+        // Down: rows after the realized ones are needed.
+        assert_eq!(
+            batched_indices(&set(2..8), &realized(0..6), 4, 100),
+            set(2..11)
+        );
+        // Up: rows before them are needed, clamped at the first row.
+        assert_eq!(
+            batched_indices(&set(1..6), &realized(2..8), 4, 100),
+            set(0..6)
+        );
+        // Nothing needed, or a batch of one: the request as it is.
+        assert_eq!(
+            batched_indices(&set(2..6), &realized(0..8), 4, 100),
+            set(2..6)
+        );
+        assert_eq!(
+            batched_indices(&set(2..8), &realized(0..6), 1, 100),
+            set(2..8)
+        );
+        // Clamped at the last row.
+        assert_eq!(
+            batched_indices(&set(96..100), &realized(90..98), 8, 100),
+            set(96..100)
+        );
+        // Nothing realized yet: ahead.
+        assert_eq!(
+            batched_indices(&set(0..2), &BTreeMap::new(), 3, 100),
+            set(0..4)
+        );
+    }
 
     fn virtual_config(sticky: &[i64], alignment: &str) -> Map {
         let mut item = Map::new();
@@ -4140,6 +5369,65 @@ mod tests {
     }
 
     #[test]
+    fn node_factory_marker_preserves_curry_and_compares_callback_environments() {
+        let captures = Rc::new(RefCell::new(Vec::new()));
+        let sink = captures.clone();
+        let context = UiContext::new(
+            Rc::new(RefCell::new(crate::UiRuntimeState::new())),
+            ComponentInstancePath::root("Factory", "root"),
+            None,
+            crate::ExecutionPhase::Render,
+            BTreeMap::new(),
+        );
+        let mut engine = Engine::new();
+        engine.register_fn(
+            "capture_factory",
+            move |call: rhai::NativeCallContext<'_>, function: FnPtr| {
+                let bound = ScriptCallback::bind_node_factory(function, &context, &call);
+                // Forwarding through an ordinary callback prop cannot discard
+                // the explicit factory marker or its original environment.
+                let mut forwarded = Dynamic::from(bound);
+                bind_component_callback_value(
+                    &crate::ValueSchema::Callback,
+                    &mut forwarded,
+                    &caller_component_binding(&call, &context),
+                );
+                let callback = ScriptCallback::try_from_fn_ptr(
+                    forwarded.cast::<FnPtr>(),
+                    ScriptGeneration::initial(),
+                )
+                .unwrap();
+                sink.borrow_mut().push(callback);
+            },
+        );
+        let source = r#"
+            fn make(length, ctx, detail) { length }
+            capture_factory(Fn("make").curry("short"));
+            capture_factory(Fn("make").curry("short"));
+        "#;
+        engine.eval::<()>(source).unwrap();
+        // Recompiling gives the same function name, owner and curry a new
+        // script library, as switching between helper-module factories does.
+        engine.eval::<()>(source).unwrap();
+        let captures = captures.borrow();
+        let first = &captures[0];
+        assert!(first.is_node_factory);
+        assert_eq!(first.curry, vec![UiValue::String("short".to_owned())]);
+        assert_eq!(first.function.iter_curry().count(), 1);
+        assert_eq!(first, &captures[1]);
+        assert_ne!(first, &captures[2]);
+
+        let mut event_before = first.clone();
+        let mut event_after = captures[2].clone();
+        event_before.is_node_factory = false;
+        event_after.is_node_factory = false;
+        assert_ne!(
+            event_before, event_after,
+            "event equality must also distinguish lexical environments"
+        );
+    }
+
+    #[test]
     fn replay_hydrates_formal_subtrees_inside_nested_dynamic_node_shapes() {
         let root = ComponentInstancePath::root("View", "main");
         let outer = root.child("Outer", "outer");
@@ -4201,7 +5489,7 @@ mod tests {
                     define_component(#{
                         metadata: #{
                             id: "components/message", "export": "Message", version: "0.1.0",
-                            runtime_api: #{ min_inclusive: 2, max_exclusive: 3 },
+                            runtime_api: #{ min_inclusive: 3, max_exclusive: 4 },
                             dependencies: [], capabilities: #{}
                         },
                         schema: #{ props: #{}, state: #{ fields: #{} }, events: #{}, slots: #{}, parts: [] },
@@ -4332,7 +5620,7 @@ mod tests {
             .unwrap();
         let root = runtime.render(&compiled).unwrap();
         assert_eq!(
-            root.handler_payload("click"),
+            root.event_handlers("click")[0].value(),
             Some(&crate::UiValue::Map(BTreeMap::from([
                 ("checked".to_owned(), crate::UiValue::Bool(true)),
                 (
@@ -4597,7 +5885,7 @@ mod tests {
                     define_component(#{
                         metadata: #{ id: "components/broken", "export": "Broken",
                             version: "0.1.3",
-                            runtime_api: #{ min_inclusive: 2, max_exclusive: 3 },
+                            runtime_api: #{ min_inclusive: 3, max_exclusive: 4 },
                             dependencies: [], capabilities: #{} },
                         schema: #{ props: #{}, state: #{ fields: #{} }, events: #{},
                             slots: #{}, parts: [] },
@@ -4742,7 +6030,7 @@ mod tests {
         let module = r#"
             define_component(#{
                 metadata: #{ id: "components/heavy", "export": "Heavy", version: "0.1.1",
-                    runtime_api: #{ min_inclusive: 2, max_exclusive: 3 }, dependencies: [], capabilities: #{} },
+                    runtime_api: #{ min_inclusive: 3, max_exclusive: 4 }, dependencies: [], capabilities: #{} },
                 schema: #{ props: #{}, state: #{ fields: #{} }, events: #{}, slots: #{}, parts: ["root"] },
                 render: Fn("render_Heavy")
             });
@@ -4770,8 +6058,105 @@ mod tests {
             runtime
                 .take_timings()
                 .iter()
-                .any(|timing| timing.operations > MAX_SCRIPT_OPERATIONS)
+                .any(|timing| timing.operations > DEFAULT_SCRIPT_OPERATION_LIMIT)
         );
+    }
+
+    #[test]
+    fn operation_limit_is_host_configurable() {
+        let heavy = r"fn view() { let n = 0; for i in 0..400000 { n += 1; } text(`${n}`) }";
+        let mut runtime = RuntimeEngine::new();
+        assert_eq!(runtime.operation_limit(), DEFAULT_SCRIPT_OPERATION_LIMIT);
+        let compiled = runtime
+            .compile_self_contained_named("limit", heavy)
+            .unwrap();
+        assert!(
+            runtime.render(&compiled).is_err(),
+            "this finite workload actually exceeds the default budget"
+        );
+        assert!(runtime.last_failed_timing().unwrap().operations > DEFAULT_SCRIPT_OPERATION_LIMIT);
+
+        runtime.set_operation_limit(10_000);
+        let compiled = runtime
+            .compile_self_contained_named("limit-low", heavy)
+            .unwrap();
+        assert!(
+            runtime.render(&compiled).is_err(),
+            "a lowered budget rejects the same script"
+        );
+
+        runtime.set_operation_limit(50_000_000);
+        let compiled = runtime
+            .compile_self_contained_named("limit-high", heavy)
+            .unwrap();
+        assert!(
+            runtime.render(&compiled).is_ok(),
+            "a raised budget admits heavier one-shot work"
+        );
+    }
+
+    #[test]
+    fn a_keyword_used_as_a_name_is_named_in_the_parse_error() {
+        let mut runtime = RuntimeEngine::new();
+        for (source, expected) in [
+            (
+                "import \"components/switch\" as switch;\nfn view(ctx) { text(\"\") }",
+                "`switch` is a Rhai keyword and cannot name a variable or an import alias",
+            ),
+            (
+                "fn view(ctx) { let loop = 1; text(\"\") }",
+                "`loop` is a Rhai keyword and cannot name a variable or an import alias",
+            ),
+            (
+                "fn switch() { 1 }\nfn view(ctx) { text(\"\") }",
+                "`switch` is a Rhai keyword and cannot name a function",
+            ),
+            (
+                "fn view(ctx) { let options = #{ switch: 1 }; text(\"\") }",
+                "`switch` is a Rhai keyword and cannot be a bare map key; quote it as `\"switch\"`",
+            ),
+            (
+                "fn view(ctx) { let options = #{}; text(`${options.switch}`) }",
+                "`switch` is a Rhai keyword and cannot name a property; index it as `[\"switch\"]`",
+            ),
+        ] {
+            let error = runtime
+                .compile_named("ui/main.rhai", source)
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(error.contains(expected), "{source}: {error}");
+        }
+        let error = runtime
+            .compile_named("ui/main.rhai", "fn view(ctx) { let a = 1 else 2; a }")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(!error.contains("keyword"), "{error}");
+    }
+
+    #[test]
+    fn host_policies_are_independent_and_reload_candidates_do_not_share_mutable_quota() {
+        let mut engine = RuntimeEngine::new();
+        assert_eq!(engine.expression_depth_limits(), (64, 64));
+        engine.set_operation_limit(2_000_000);
+        engine.set_expression_depth_limits(80, 64);
+        assert_eq!(engine.engine().max_call_levels(), 64);
+        assert_eq!(engine.engine().max_array_size(), RHAI_MAX_ARRAY_SIZE);
+        #[cfg(feature = "dev-reload")]
+        {
+            let mut candidate = engine.candidate_engine();
+            assert_eq!(candidate.operation_limit(), 2_000_000);
+            assert_eq!(candidate.expression_depth_limits(), (80, 64));
+            candidate.set_operation_limit(10);
+            candidate.set_expression_depth_limits(20, 10);
+            assert_eq!(engine.operation_limit(), 2_000_000);
+            assert_eq!(engine.expression_depth_limits(), (80, 64));
+        }
+        engine.set_operation_limit(0);
+        engine.set_expression_depth_limits(0, 0);
+        assert_eq!(engine.operation_limit(), 1);
+        assert_eq!(engine.expression_depth_limits(), (1, 1));
     }
 
     #[test]
@@ -4779,7 +6164,7 @@ mod tests {
         let module = r#"
             define_component(#{
                 metadata: #{ id: "components/probe", "export": "Probe", version: "0.1.1",
-                    runtime_api: #{ min_inclusive: 2, max_exclusive: 3 }, dependencies: [], capabilities: #{} },
+                    runtime_api: #{ min_inclusive: 3, max_exclusive: 4 }, dependencies: [], capabilities: #{} },
                 schema: #{ props: #{ key: #{ schema: #{ type: "string" }, required: true, sensitive: false } },
                     state: #{ fields: #{ heavy: #{ schema: #{ type: "bool" }, "default": #{ type: "bool", value: false } } } },
                     events: #{}, slots: #{}, parts: ["root"] },
@@ -4838,7 +6223,10 @@ mod tests {
                 .filter(|timing| timing.operation == ExecutionOperation::Render)
                 .map(|timing| timing.operations)
                 .sum::<u64>();
-            assert!(operations < MAX_SCRIPT_OPERATIONS / 2, "{operations}");
+            assert!(
+                operations < DEFAULT_SCRIPT_OPERATION_LIMIT / 2,
+                "{operations}"
+            );
             measured.push(operations);
         }
         assert_eq!(measured[0], measured[1]);
@@ -4849,7 +6237,7 @@ mod tests {
         let module = r#"
             define_component(#{
                 metadata: #{ id: "components/probe", "export": "Probe", version: "0.1.1",
-                    runtime_api: #{ min_inclusive: 2, max_exclusive: 3 }, dependencies: [], capabilities: #{} },
+                    runtime_api: #{ min_inclusive: 3, max_exclusive: 4 }, dependencies: [], capabilities: #{} },
                 schema: #{ props: #{ key: #{ schema: #{ type: "string" }, required: true, sensitive: false } },
                     state: #{ fields: #{ heavy: #{ schema: #{ type: "bool" }, "default": #{ type: "bool", value: false } } } },
                     events: #{}, slots: #{}, parts: ["root"] }, render: Fn("render_Probe") }
@@ -4958,7 +6346,10 @@ mod tests {
                 })
                 .map(|timing| timing.operations)
                 .sum::<u64>();
-            assert!(operations < MAX_SCRIPT_OPERATIONS / 2, "{operations}");
+            assert!(
+                operations < DEFAULT_SCRIPT_OPERATION_LIMIT / 2,
+                "{operations}"
+            );
             measured.push(operations);
         }
         assert_eq!(measured[0], measured[1]);
@@ -5020,11 +6411,133 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn virtual_row_formal_component_preserves_the_real_callback_owner() {
+        let mut engine = RuntimeEngine::new();
+        let compiled = engine
+            .compile_named(
+                "virtual-callback-owner",
+                r#"
+                    define_component(#{
+                        metadata: #{ id: "test/action", "export": "Action", version: "0.1.8",
+                            runtime_api: #{ min_inclusive: 3, max_exclusive: 4 },
+                            dependencies: [], capabilities: #{} },
+                        schema: #{ props: #{
+                                key: #{ schema: #{ type: "string" }, required: true, sensitive: false },
+                                on_action: #{ schema: #{ type: "callback" }, required: true, sensitive: false },
+                            }, state: #{ fields: #{} }, events: #{}, slots: #{}, parts: [] },
+                        render: Fn("render_Action")
+                    });
+                    fn Action(props) { render_component("test/action", props) }
+                    fn render_Action(ctx, props) { text("Action").on_click(props.on_action) }
+                    fn increment(ctx, payload) { ctx.set_state("count", ctx.get_state("count") + 1); }
+                    fn render_item(ctx, payload) {
+                        Action(#{ key: payload.key, on_action: Fn("increment") })
+                    }
+                    fn view(ctx) {
+                        let data=[];for index in 0..32 {data.push(#{key:`row-${index}`});}
+                        virtual_collection(#{
+                            key: "rows", label: "Rows", data: data,
+                            estimated_height: 24, height: 24, overdraw_pixels: 0,
+                            alignment: "top", follow_tail: false,
+                        }, Fn("render_item"))
+                    }
+                "#,
+            )
+            .unwrap();
+        let runtime = Rc::new(RefCell::new(crate::UiRuntimeState::new()));
+        let root_path = ComponentInstancePath::root("App", "virtual-callback");
+        let schema = ComponentStateSchema::new(BTreeMap::from([(
+            "count".to_owned(),
+            crate::StateField::new(
+                crate::ValueSchema::Integer {
+                    min: None,
+                    max: None,
+                },
+                UiValue::Integer(0),
+            ),
+        )]))
+        .unwrap();
+        let mut lifecycle = crate::ScriptLifecycle::new(
+            compiled,
+            Rc::clone(&runtime),
+            root_path.clone(),
+            None,
+            BTreeMap::new(),
+            &schema,
+        )
+        .unwrap();
+        lifecycle.start(&mut engine).unwrap();
+        let crate::UiNodeKind::VirtualCollection { spec } = lifecycle.root().unwrap().kind() else {
+            unreachable!()
+        };
+        let crate::UiEventHandler::Script(callback) =
+            spec.realized[&0].handlers()["click"][0].handler()
+        else {
+            panic!("formal row component must retain its callback");
+        };
+        let _ = lifecycle
+            .invoke_callback_transactional(&engine, callback, UiValue::Null)
+            .unwrap();
+        assert_eq!(
+            runtime.borrow().component_state.get(&root_path, "count"),
+            Some(&UiValue::Integer(1))
+        );
+        let id = engine
+            .virtual_collection_ids_in_scope(&root_path)
+            .into_iter()
+            .next()
+            .unwrap();
+        assert!(
+            !lifecycle
+                .root()
+                .unwrap()
+                .virtual_collection_items(&id)
+                .unwrap()
+                .contains_key(&31)
+        );
+        runtime.borrow().virtual_requests.request(id.clone(), [31]);
+        lifecycle.realize_virtual_requests(&mut engine).unwrap();
+        let callback = lifecycle
+            .root()
+            .unwrap()
+            .virtual_collection_items(&id)
+            .unwrap()[&31]
+            .handler("click")
+            .unwrap()
+            .as_script()
+            .unwrap();
+        let _ = lifecycle
+            .invoke_callback_transactional(&engine, callback, UiValue::Null)
+            .unwrap();
+        assert_eq!(
+            runtime.borrow().component_state.get(&root_path, "count"),
+            Some(&UiValue::Integer(2))
+        );
+    }
+
+    #[test]
+    fn invalid_state_default_reports_the_field_and_tagged_encoding() {
+        let mut engine = RuntimeEngine::new();
+        let compiled = engine.compile(r#"
+            fn state_schema() {#{fields:#{current_theme:#{schema:#{type:"map",values:#{type:"ui_value"}},
+                "default":#{type:"map",value:#{family:"Default"}}}}}}
+            fn view(ctx) {text("view")}
+        "#).unwrap();
+        let error = engine.root_state_schema(&compiled).unwrap_err().to_string();
+        assert!(
+            error.contains("state_schema.fields.current_theme.default"),
+            "{error}"
+        );
+        assert!(error.contains("recursively tagged UiValue"), "{error}");
+    }
+
+    #[test]
     fn delayed_component_callback_starts_with_a_fresh_operation_budget() {
         let module = r#"
             define_component(#{
                 metadata: #{ id: "components/counter", "export": "Counter", version: "0.1.1",
-                    runtime_api: #{ min_inclusive: 2, max_exclusive: 3 }, dependencies: [], capabilities: #{} },
+                    runtime_api: #{ min_inclusive: 3, max_exclusive: 4 }, dependencies: [], capabilities: #{} },
                 schema: #{ props: #{}, state: #{ fields: #{} }, events: #{}, slots: #{}, parts: ["root"] },
                 render: Fn("render_Counter")
             });
@@ -5078,7 +6591,7 @@ mod tests {
         let module = r#"
             define_component(#{
                 metadata: #{ id: "components/incarnation", "export": "Counter", version: "0.1.1",
-                    runtime_api: #{ min_inclusive: 2, max_exclusive: 3 }, dependencies: [], capabilities: #{} },
+                    runtime_api: #{ min_inclusive: 3, max_exclusive: 4 }, dependencies: [], capabilities: #{} },
                 schema: #{ props: #{ key: #{ schema: #{ type: "string" }, required: true, sensitive: false } },
                     state: #{ fields: #{ count: #{ schema: #{ type: "integer" }, "default": #{ type: "integer", value: 0 } } } },
                     events: #{}, slots: #{}, parts: ["root"] }, render: Fn("render_Counter")

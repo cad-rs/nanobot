@@ -322,9 +322,7 @@ fn typography_pixels(value: crate::Length, fallback: f64) -> f64 {
     match value {
         crate::Length::Pixels(value) => value,
         crate::Length::Rems(value) => value * 16.0,
-        crate::Length::Relative(_)
-        | crate::Length::ThemeSpacing(_)
-        | crate::Length::ThemeRadius(_) => fallback,
+        crate::Length::Relative(_) | crate::Length::Token(_) => fallback,
     }
 }
 
@@ -455,6 +453,7 @@ mod tests {
             annotations: Vec::new(),
             link_group: None,
             link_domain: None,
+            interaction: crate::ChartInteractionSpec::default(),
         };
         prepare_chart_data(
             spec,

@@ -827,6 +827,24 @@ impl AssetRegistry {
         Ok(ImageDecodeHandle(decode_id))
     }
 
+    /// The scope that owns a pending decode; `None` once it completed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AssetError::Borrowed`] during conflicting registry access.
+    pub(crate) fn image_decode_scope(
+        &self,
+        handle: ImageDecodeHandle,
+    ) -> Result<Option<AsyncScope>, AssetError> {
+        Ok(self
+            .inner
+            .try_borrow()
+            .map_err(|_| AssetError::Borrowed)?
+            .pending_decodes
+            .get(&handle.0)
+            .map(|pending| pending.scope.clone()))
+    }
+
     /// Cancel one pending decode. Completed or unknown handles return `false`.
     ///
     /// # Errors
@@ -969,10 +987,15 @@ impl AssetRegistry {
                 }
                 Err(message) => (pending.error, UiValue::String(message)),
             };
+            // Image decodes are requested by render; they count as started by
+            // the lifecycle.
             deliveries.push(AsyncDelivery {
                 callback,
                 payload,
                 scope: pending.scope,
+                origin: crate::InvocationOrigin::TaskCompletion {
+                    started_by: Box::new(crate::InvocationOrigin::Lifecycle),
+                },
             });
         }
         Ok(deliveries)
@@ -1188,17 +1211,17 @@ fn raster_image_format(format: ImageFormat) -> Option<image::ImageFormat> {
         ImageFormat::Gif => Some(image::ImageFormat::Gif),
         ImageFormat::Bmp => Some(image::ImageFormat::Bmp),
         ImageFormat::Tiff => Some(image::ImageFormat::Tiff),
-        ImageFormat::Svg => None,
-        ImageFormat::Ico | ImageFormat::Pnm => None,
+        ImageFormat::Svg | ImageFormat::Ico | ImageFormat::Pnm => None,
     }
 }
 
 pub(crate) fn svg_image(bytes: &[u8], color: Option<Rgba8>) -> Result<Arc<Image>, AssetError> {
-    // GPUI 0.2.2's ImageSource::Image SVG decoder publishes premultiplied RGBA
-    // bytes as a BGRA RenderImage. Rasterizing the complete document to PNG
-    // here preserves every SVG color/alpha operation and then uses GPUI's
-    // correct PNG RGBA-to-BGRA path. Remove this adapter as one unit when the
-    // pinned GPUI SVG decoder is fixed.
+    // The gpui-pre 0.3.9 family has a correct premultiplied-RGBA to BGRA SVG renderer.
+    // gpui-rhai intentionally keeps this complete-document adapter because it
+    // also owns external currentColor substitution, bounded variant caching,
+    // system-font fallback and off-foreground preparation. Encoding the
+    // resulting RGBA pixmap as PNG lets GPUI perform exactly one RGBA-to-BGRA
+    // conversion; do not add the old channel-swap workaround back here.
     let pixmap = svg_pixmap(bytes, color)?;
     let png = pixmap.encode_png().map_err(|_| AssetError::InvalidSvg)?;
     Ok(Arc::new(Image::from_bytes(ImageFormat::Png, png)))
@@ -1210,7 +1233,7 @@ fn svg_render_image(bytes: &[u8], color: Option<Rgba8>) -> Result<Arc<RenderImag
     let mut bgra = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
         .map_err(|_| AssetError::InvalidSvg)?
         .into_rgba8();
-    for pixel in bgra.chunks_exact_mut(4) {
+    for pixel in bgra.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
     }
     Ok(Arc::new(RenderImage::new(vec![image::Frame::new(bgra)])))
@@ -1537,6 +1560,48 @@ mod tests {
             registry.image_source(&OpaqueHandle::new("task", 1)),
             Err(AssetError::WrongHandleKind(_))
         ));
+    }
+
+    #[test]
+    fn cached_image_resolution_never_calls_the_provider() {
+        struct CountingProvider(Rc<std::cell::Cell<usize>>);
+        impl AssetProvider for CountingProvider {
+            fn load(&self, _: &str) -> Result<AssetData, String> {
+                self.0.set(self.0.get() + 1);
+                Ok(AssetData {
+                    mime_type: "image/svg+xml".to_owned(),
+                    bytes: br#"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>"#
+                        .to_vec(),
+                })
+            }
+        }
+        let calls = Rc::new(std::cell::Cell::new(0));
+        let registry = AssetRegistry::new();
+        registry
+            .register("app", CountingProvider(calls.clone()))
+            .unwrap();
+        let prepared = AssetId::parse("app/prepared").unwrap();
+        let pending = AssetId::parse("app/pending").unwrap();
+        assert!(matches!(
+            registry.cached_image(&pending),
+            Err(AssetError::NotPreloaded(_))
+        ));
+        assert_eq!(calls.get(), 0, "cache misses must not load a provider");
+
+        assert_eq!(registry.preload_images([prepared.clone()]).unwrap(), 1);
+        assert_eq!(calls.get(), 1, "only explicit Host preparation may load");
+        for _ in 0..3 {
+            let image = registry.cached_image(&prepared).unwrap();
+            assert!(matches!(
+                registry.image_source(image.opaque()).unwrap(),
+                ImageSource::Image(_)
+            ));
+            assert!(matches!(
+                registry.cached_image(&pending),
+                Err(AssetError::NotPreloaded(_))
+            ));
+        }
+        assert_eq!(calls.get(), 1, "resolving render sources stays cache-only");
     }
 
     #[test]

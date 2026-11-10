@@ -45,6 +45,12 @@ impl TryFrom<String> for CapabilityId {
     }
 }
 
+impl fmt::Display for CapabilityId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
 impl From<CapabilityId> for String {
     fn from(value: CapabilityId) -> Self {
         value.0
@@ -74,6 +80,72 @@ pub struct CapabilityDescriptor {
     pub methods: BTreeMap<String, CapabilityMethod>,
 }
 
+/// What a script invocation runs in response to.
+///
+/// The runtime sets it on each dispatch path; script code called from that
+/// callback (including component events it emits and the render it causes)
+/// shares it. Work that completes later carries the root that started it.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum InvocationOrigin {
+    /// A platform input event dispatched to the view (`click`, `pointer_down`,
+    /// `key_down`, ...), a Host key-binding action, or a window close.
+    UserInput { event: String },
+    /// An automation command (`AutomationCommand::Dispatch`, `Action`, ...).
+    Automation,
+    /// A timer that the root origin scheduled.
+    Timer { started_by: Box<InvocationOrigin> },
+    /// A task or asset load completing; `started_by` is the root origin.
+    TaskCompletion { started_by: Box<InvocationOrigin> },
+    /// A subscription delivering a value.
+    Subscription,
+    /// An effect's start or cleanup, or a motion timeline callback.
+    Effect,
+    /// Initialization, suspend, resume, reload or disposal.
+    #[default]
+    Lifecycle,
+}
+
+impl InvocationOrigin {
+    /// The origin with timers and task completions followed back to what
+    /// started them.
+    #[must_use]
+    pub fn root(&self) -> &Self {
+        match self {
+            Self::Timer { started_by } | Self::TaskCompletion { started_by } => started_by.root(),
+            other => other,
+        }
+    }
+
+    /// Whether the root origin is user input: the signal a Host gates
+    /// user-activated capabilities on.
+    #[must_use]
+    pub fn is_user_input(&self) -> bool {
+        matches!(self.root(), Self::UserInput { .. })
+    }
+}
+
+/// The context of one capability call.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InvocationContext {
+    pub origin: InvocationOrigin,
+    /// The view whose script made the call, when it runs in one.
+    pub view_id: Option<String>,
+    /// The component instance that made the call.
+    pub component: crate::ComponentInstancePath,
+}
+
+impl InvocationContext {
+    /// The context of a call the Host makes directly through the registry:
+    /// `Lifecycle`, no view, the root component.
+    fn host() -> Self {
+        Self {
+            origin: InvocationOrigin::default(),
+            view_id: None,
+            component: crate::ComponentInstancePath::root("App", "root"),
+        }
+    }
+}
+
 pub trait CapabilityHandler {
     /// Execute a schema-validated capability method.
     ///
@@ -82,6 +154,24 @@ pub trait CapabilityHandler {
     /// Returns a human-readable handler error. The registry validates the
     /// returned value against the declared output schema.
     fn call(&mut self, method: &str, input: UiValue) -> Result<UiValue, String>;
+
+    /// Execute a method with the context of the call: what it runs in
+    /// response to, the view and the component. Override it to gate a method
+    /// on user input (`context.origin.is_user_input()`); the default forwards
+    /// to [`Self::call`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::call`].
+    fn call_with(
+        &mut self,
+        context: &InvocationContext,
+        method: &str,
+        input: UiValue,
+    ) -> Result<UiValue, String> {
+        let _ = context;
+        self.call(method, input)
+    }
 }
 
 pub struct TaskWork {
@@ -117,6 +207,24 @@ pub trait AsyncCapabilityHandler {
     ///
     /// Returns a human-readable setup error before a task is spawned.
     fn start(&mut self, method: &str, input: UiValue) -> Result<TaskWork, String>;
+
+    /// Build the work with the context of the call that starts the task, as
+    /// [`CapabilityHandler::call_with`] receives it. Override it to gate work
+    /// on user input before it runs (`context.origin.is_user_input()`); the
+    /// default forwards to [`Self::start`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::start`].
+    fn start_with(
+        &mut self,
+        context: &InvocationContext,
+        method: &str,
+        input: UiValue,
+    ) -> Result<TaskWork, String> {
+        let _ = context;
+        self.start(method, input)
+    }
 }
 
 /// One continuous subscription producer.
@@ -176,6 +284,23 @@ pub trait SubscriptionCapabilityHandler {
     ///
     /// Returns a human-readable setup error before subscription startup.
     fn subscribe(&mut self, method: &str, input: UiValue) -> Result<SubscriptionWork, String>;
+
+    /// Build the producer with the context of the call that starts the
+    /// subscription: an effect start, with its view and component. The
+    /// default forwards to [`Self::subscribe`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::subscribe`].
+    fn subscribe_with(
+        &mut self,
+        context: &InvocationContext,
+        method: &str,
+        input: UiValue,
+    ) -> Result<SubscriptionWork, String> {
+        let _ = context;
+        self.subscribe(method, input)
+    }
 }
 
 struct CapabilityEntry {
@@ -328,6 +453,21 @@ impl CapabilityRegistry {
         method: &str,
         input: UiValue,
     ) -> Result<UiValue, CapabilityError> {
+        self.call_with(&InvocationContext::host(), id, method, input)
+    }
+
+    /// Invoke an activated method with the context of the call.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::call`].
+    pub fn call_with(
+        &mut self,
+        context: &InvocationContext,
+        id: &CapabilityId,
+        method: &str,
+        input: UiValue,
+    ) -> Result<UiValue, CapabilityError> {
         if !self.active.contains(id) {
             return Err(CapabilityError::NotDeclared(id.clone()));
         }
@@ -357,7 +497,7 @@ impl CapabilityRegistry {
             .as_mut()
             .ok_or(CapabilityError::UnsupportedMode("sync"))?;
         let output = handler
-            .call(method, input)
+            .call_with(context, method, input)
             .map_err(|message| CapabilityError::Handler {
                 id: id.clone(),
                 method: method.to_owned(),
@@ -384,13 +524,28 @@ impl CapabilityRegistry {
         method: &str,
         input: UiValue,
     ) -> Result<(TaskWork, ValueSchema), CapabilityError> {
+        self.start_task_with(&InvocationContext::host(), id, method, input)
+    }
+
+    /// Build one-shot work with the context of the call that starts it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::start_task`].
+    pub fn start_task_with(
+        &mut self,
+        context: &InvocationContext,
+        id: &CapabilityId,
+        method: &str,
+        input: UiValue,
+    ) -> Result<(TaskWork, ValueSchema), CapabilityError> {
         let (entry, schema) = self.entry_and_method(id, method, &input)?;
         let handler = entry
             .task
             .as_mut()
             .ok_or(CapabilityError::UnsupportedMode("task"))?;
         let work = handler
-            .start(method, input)
+            .start_with(context, method, input)
             .map_err(|message| CapabilityError::Handler {
                 id: id.clone(),
                 method: method.to_owned(),
@@ -410,19 +565,33 @@ impl CapabilityRegistry {
         method: &str,
         input: UiValue,
     ) -> Result<(SubscriptionWork, ValueSchema), CapabilityError> {
+        self.start_subscription_with(&InvocationContext::host(), id, method, input)
+    }
+
+    /// Build continuous work with the context of the call that starts it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::start_subscription`].
+    pub fn start_subscription_with(
+        &mut self,
+        context: &InvocationContext,
+        id: &CapabilityId,
+        method: &str,
+        input: UiValue,
+    ) -> Result<(SubscriptionWork, ValueSchema), CapabilityError> {
         let (entry, schema) = self.entry_and_method(id, method, &input)?;
         let handler = entry
             .subscription
             .as_mut()
             .ok_or(CapabilityError::UnsupportedMode("subscription"))?;
-        let work =
-            handler
-                .subscribe(method, input)
-                .map_err(|message| CapabilityError::Handler {
-                    id: id.clone(),
-                    method: method.to_owned(),
-                    message,
-                })?;
+        let work = handler
+            .subscribe_with(context, method, input)
+            .map_err(|message| CapabilityError::Handler {
+                id: id.clone(),
+                method: method.to_owned(),
+                message,
+            })?;
         Ok((work, schema.output))
     }
 
@@ -567,41 +736,41 @@ pub enum CapabilityError {
         #[source]
         source: semver::Error,
     },
-    #[error("capability `{0:?}` was registered with conflicting descriptors")]
+    #[error("capability `{0}` was registered with conflicting descriptors")]
     DescriptorMismatch(CapabilityId),
     #[error("capability handler mode `{0}` is already registered")]
     DuplicateMode(&'static str),
     #[error("capability does not implement `{0}` mode")]
     UnsupportedMode(&'static str),
-    #[error("capability `{0:?}` must declare at least one method")]
+    #[error("capability `{0}` must declare at least one method")]
     NoMethods(CapabilityId),
     #[error("capability method `{0}` must be a `snake_case` identifier")]
     InvalidMethod(String),
-    #[error("required capability `{0:?}` is not registered")]
+    #[error("required capability `{0}` is not registered")]
     Missing(CapabilityId),
-    #[error("capability `{id:?}` requires {required}, host provides {actual}")]
+    #[error("capability `{id}` requires {required}, host provides {actual}")]
     VersionMismatch {
         id: CapabilityId,
         required: VersionReq,
         actual: Version,
     },
-    #[error("capability `{0:?}` was not declared by the application manifest")]
+    #[error("capability `{0}` was not declared by the application manifest")]
     NotDeclared(CapabilityId),
-    #[error("capability `{id:?}` has no method `{method}`")]
+    #[error("capability `{id}` has no method `{method}`")]
     UnknownMethod { id: CapabilityId, method: String },
-    #[error("input for `{id:?}.{method}` is invalid: {source}")]
+    #[error("input for `{id}.{method}` is invalid: {source}")]
     InvalidInput {
         id: CapabilityId,
         method: String,
         source: SchemaValidationError,
     },
-    #[error("output from `{id:?}.{method}` is invalid: {source}")]
+    #[error("output from `{id}.{method}` is invalid: {source}")]
     InvalidOutput {
         id: CapabilityId,
         method: String,
         source: SchemaValidationError,
     },
-    #[error("capability `{id:?}.{method}` failed: {message}")]
+    #[error("capability `{id}.{method}` failed: {message}")]
     Handler {
         id: CapabilityId,
         method: String,
@@ -610,14 +779,14 @@ pub enum CapabilityError {
     #[error("application requires runtime API {required}, current API is {actual}")]
     RuntimeApiMismatch { required: u32, actual: u32 },
     #[error(
-        "component `{component}` requires capability `{capability:?}` missing from the app manifest"
+        "component `{component}` requires capability `{capability}` missing from the app manifest"
     )]
     ComponentCapabilityMissing {
         component: ModuleId,
         capability: CapabilityId,
     },
     #[error(
-        "component `{component}` requires capability `{capability:?}` at {component_required}, but the app declares {app_declared}"
+        "component `{component}` requires capability `{capability}` at {component_required}, but the app declares {app_declared}"
     )]
     ComponentCapabilityMismatch {
         component: ModuleId,
@@ -713,13 +882,15 @@ mod tests {
                 id: ModuleId::parse("components/remote_status").unwrap(),
                 export: "RemoteStatus".to_owned(),
                 version: Version::new(0, 1, 0),
-                runtime_api: RuntimeApiRange::new(2, 3),
+                runtime_api: RuntimeApiRange::new(3, 4),
                 dependencies: BTreeSet::new(),
                 capabilities: BTreeMap::from([(
                     "app.echo".to_owned(),
                     VersionReq::parse("^1.0").unwrap(),
                 )]),
                 assets: BTreeSet::new(),
+                tokens: std::collections::BTreeSet::new(),
+                environment: std::collections::BTreeSet::new(),
             },
             ComponentSchema::default(),
         )
@@ -762,6 +933,26 @@ mod tests {
     }
 
     #[test]
+    fn errors_name_the_capability_by_its_id() {
+        let mut registry = CapabilityRegistry::new();
+        registry.register(descriptor(), Echo).unwrap();
+        let id = CapabilityId::parse("app.echo").unwrap();
+        registry
+            .activate(&BTreeMap::from([(id.clone(), VersionReq::STAR)]))
+            .unwrap();
+        let error = registry.call(&id, "echo", UiValue::Integer(1)).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "input for `app.echo.echo` is invalid: $: expected string, got i64"
+        );
+        let error = registry.call(&id, "missing", UiValue::Null).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "capability `app.echo` has no method `missing`"
+        );
+    }
+
+    #[test]
     fn async_handler_builds_validated_worker_without_moving_rhai_callbacks() {
         let mut registry = CapabilityRegistry::new();
         registry.register_async(descriptor(), AsyncEcho).unwrap();
@@ -781,5 +972,96 @@ mod tests {
         let value = work.run(crate::TaskCancellation::default()).unwrap();
         output.validate_ui_value(&value).unwrap();
         assert_eq!(value, UiValue::String("async".to_owned()));
+    }
+
+    #[test]
+    fn task_and_subscription_starts_receive_the_invocation_context() {
+        type Seen = std::rc::Rc<std::cell::RefCell<Vec<InvocationOrigin>>>;
+        struct Gated(Seen);
+        impl AsyncCapabilityHandler for Gated {
+            fn start(&mut self, _: &str, _: UiValue) -> Result<TaskWork, String> {
+                Err("start_with is the entry point".to_owned())
+            }
+            fn start_with(
+                &mut self,
+                context: &InvocationContext,
+                _: &str,
+                input: UiValue,
+            ) -> Result<TaskWork, String> {
+                self.0.borrow_mut().push(context.origin.clone());
+                if !context.origin.is_user_input() {
+                    return Err("needs user input".to_owned());
+                }
+                Ok(TaskWork::new(move || Ok(input)))
+            }
+        }
+        impl SubscriptionCapabilityHandler for Gated {
+            fn subscribe(&mut self, _: &str, _: UiValue) -> Result<SubscriptionWork, String> {
+                Err("subscribe_with is the entry point".to_owned())
+            }
+            fn subscribe_with(
+                &mut self,
+                context: &InvocationContext,
+                _: &str,
+                _: UiValue,
+            ) -> Result<SubscriptionWork, String> {
+                self.0.borrow_mut().push(context.origin.clone());
+                Ok(SubscriptionWork::new(|_| {}))
+            }
+        }
+
+        let seen = Seen::default();
+        let id = CapabilityId::parse("app.echo").unwrap();
+        let mut registry = CapabilityRegistry::new();
+        registry
+            .register_async(descriptor(), Gated(seen.clone()))
+            .unwrap();
+        registry
+            .register_subscription(descriptor(), Gated(seen.clone()))
+            .unwrap();
+        registry
+            .activate(&BTreeMap::from([(id.clone(), VersionReq::STAR)]))
+            .unwrap();
+        let click = InvocationContext {
+            origin: InvocationOrigin::UserInput {
+                event: "click".to_owned(),
+            },
+            view_id: Some("main".to_owned()),
+            component: crate::ComponentInstancePath::root("App", "root"),
+        };
+        let input = || UiValue::String("value".to_owned());
+        assert!(
+            registry
+                .start_task_with(&click, &id, "echo", input())
+                .is_ok()
+        );
+        // Without a context the Host call is `Lifecycle`, not user input.
+        assert!(matches!(
+            registry.start_task(&id, "echo", input()),
+            Err(CapabilityError::Handler { message, .. }) if message == "needs user input"
+        ));
+        let automation = InvocationContext {
+            origin: InvocationOrigin::Automation,
+            ..click.clone()
+        };
+        assert!(
+            registry
+                .start_task_with(&automation, &id, "echo", input())
+                .is_err()
+        );
+        registry
+            .start_subscription_with(&automation, &id, "echo", input())
+            .unwrap();
+        registry.start_subscription(&id, "echo", input()).unwrap();
+        assert_eq!(
+            *seen.borrow(),
+            [
+                click.origin,
+                InvocationOrigin::Lifecycle,
+                InvocationOrigin::Automation,
+                InvocationOrigin::Automation,
+                InvocationOrigin::Lifecycle,
+            ]
+        );
     }
 }

@@ -43,7 +43,7 @@ impl StoreId {
 #[derive(Clone, Debug, Default)]
 pub struct StoreRegistry {
     stores: Rc<BTreeMap<StoreId, StoreState>>,
-    readers: Rc<BTreeMap<StoreField, BTreeSet<ComponentInstancePath>>>,
+    readers: Rc<BTreeMap<StoreField, BTreeSet<crate::read_dependency::ReadDependency>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -103,11 +103,25 @@ impl StoreRegistry {
     }
 
     pub fn reset_reader(&mut self, reader: &ComponentInstancePath) {
+        self.reset_contribution(&crate::read_dependency::ReadDependency::component(reader));
+    }
+    pub(crate) fn reset_contribution(&mut self, reader: &crate::read_dependency::ReadDependency) {
         let tracked = Rc::make_mut(&mut self.readers);
         for readers in tracked.values_mut() {
             readers.remove(reader);
         }
         tracked.retain(|_, readers| !readers.is_empty());
+    }
+
+    /// Remove stale reader edges inside one successfully reconciled subtree.
+    pub(crate) fn retain_contributions(
+        &mut self,
+        scope: &ComponentInstancePath,
+        active: &BTreeSet<crate::read_dependency::ReadContribution>,
+    ) {
+        crate::read_dependency::retain_readers(Rc::make_mut(&mut self.readers), |reader| {
+            reader.retained_in_contribution_scope(scope, active)
+        });
     }
 
     /// Remove stale reader edges inside one successfully reconciled subtree.
@@ -118,9 +132,7 @@ impl StoreRegistry {
     ) {
         let tracked = Rc::make_mut(&mut self.readers);
         for readers in tracked.values_mut() {
-            readers.retain(|reader| {
-                !reader.is_within(root) || reader == root || active.contains(reader)
-            });
+            readers.retain(|reader| reader.retained_in_owner_scope(root, active));
         }
         tracked.retain(|_, readers| !readers.is_empty());
     }
@@ -136,6 +148,19 @@ impl StoreRegistry {
         store: &StoreId,
         field: &str,
     ) -> Result<UiValue, StoreError> {
+        self.read_dependency(
+            Some(&crate::read_dependency::ReadDependency::component(reader)),
+            store,
+            field,
+        )
+    }
+    /// Read a field, subscribing `reader` when there is one.
+    pub(crate) fn read_dependency(
+        &mut self,
+        reader: Option<&crate::read_dependency::ReadDependency>,
+        store: &StoreId,
+        field: &str,
+    ) -> Result<UiValue, StoreError> {
         let value = self
             .stores
             .get(store)
@@ -147,14 +172,16 @@ impl StoreRegistry {
                 store: store.clone(),
                 field: field.to_owned(),
             })?;
-        Rc::make_mut(&mut self.readers)
-            .entry(StoreField {
-                store: store.clone(),
-                field: field.to_owned(),
-                path: None,
-            })
-            .or_default()
-            .insert(reader.clone());
+        if let Some(reader) = reader {
+            Rc::make_mut(&mut self.readers)
+                .entry(StoreField {
+                    store: store.clone(),
+                    field: field.to_owned(),
+                    path: None,
+                })
+                .or_default()
+                .insert(reader.clone());
+        }
         Ok(value)
     }
 
@@ -166,6 +193,21 @@ impl StoreRegistry {
     pub fn read_path_tracked(
         &mut self,
         reader: &ComponentInstancePath,
+        store: &StoreId,
+        field: &str,
+        path: &UiValuePath,
+    ) -> Result<UiValue, StoreError> {
+        self.read_path_dependency(
+            Some(&crate::read_dependency::ReadDependency::component(reader)),
+            store,
+            field,
+            path,
+        )
+    }
+    /// Read one nested path, subscribing `reader` to it when there is one.
+    pub(crate) fn read_path_dependency(
+        &mut self,
+        reader: Option<&crate::read_dependency::ReadDependency>,
         store: &StoreId,
         field: &str,
         path: &UiValuePath,
@@ -182,14 +224,16 @@ impl StoreRegistry {
             })?
             .get_path(path)?
             .clone();
-        Rc::make_mut(&mut self.readers)
-            .entry(StoreField {
-                store: store.clone(),
-                field: field.to_owned(),
-                path: Some(path.clone()),
-            })
-            .or_default()
-            .insert(reader.clone());
+        if let Some(reader) = reader {
+            Rc::make_mut(&mut self.readers)
+                .entry(StoreField {
+                    store: store.clone(),
+                    field: field.to_owned(),
+                    path: Some(path.clone()),
+                })
+                .or_default()
+                .insert(reader.clone());
+        }
         Ok(value)
     }
 
@@ -246,7 +290,7 @@ impl StoreRegistry {
                     .as_ref()
                     .is_none_or(|path| previous.get_path(path).ok() != value.get_path(path).ok())
             })
-            .flat_map(|(_, readers)| readers.iter().cloned())
+            .flat_map(|(_, readers)| readers.iter().map(|reader| reader.owner.clone()))
             .collect();
         let state = Rc::make_mut(&mut self.stores)
             .get_mut(store)

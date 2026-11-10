@@ -8,32 +8,35 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 use gpui::{
     AnyElement, App, AppContext, Bounds, ContentMask, Context, Element, ElementId, Entity,
     FocusHandle, FontFallbacks, FontWeight, GlobalElementId, InspectorElementId,
     InteractiveElement, IntoElement, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollWheelEvent, Styled,
-    Task, WeakEntity, Window, canvas, div, fill, point, px, rgba, size,
+    MouseMoveEvent, ParentElement, Pixels, Point, Render, ScrollWheelEvent, Styled, Task,
+    WeakEntity, Window, canvas, div, fill, point, px, rgba, size,
 };
-use gpui::AppContext as _;
 
 use super::{
     ChartAxisDirection, ChartAxisDomain, ChartAxisScale, ChartBrushMode, ChartCoordinateKind,
     ChartDataLimits, ChartDataSnapshot, ChartDataset, ChartFormatterRegistry, ChartGeoRegistry,
     ChartMark, ChartMarkGeometry, ChartMarkRole, ChartPoint, ChartPreparedData, ChartRect,
     ChartSeriesRegistry, ChartSpec, ChartTheme, ChartTransformRegistry, ChartViewport,
-    NativeChartData, PreparedChartScene, apply_chart_selection, chart_region_rect,
+    ChartWheelZoom, NativeChartData, PreparedChartScene, apply_chart_selection, chart_region_rect,
     layout_chart_scene_with_axis_windows, prepare_chart_data,
 };
 use crate::{
-    ComponentStateSchema, EffectPrimitiveDescriptor, EventSchema, ObjectField, PrimitiveDescriptor,
-    PrimitiveEventEmitter, PrimitiveHandler, PrimitiveId, PrimitiveInstance, PrimitiveInstanceId,
+    ComponentStateSchema, EffectPrimitiveDescriptor, EventSchema, ObjectField, PrimitiveContext,
+    PrimitiveDescriptor, PrimitiveHandler, PrimitiveId, PrimitiveInstance, PrimitiveInstanceId,
     PrimitivePlatform, PrimitiveProps, PrimitiveTheme, PrimitiveValue, UiValue, ValueSchema,
 };
 
 const WHEEL_COMMIT_DELAY: Duration = Duration::from_millis(80);
+/// Pointer travel, in logical pixels, before a press in the plot becomes a
+/// brush; the default `threshold` of the drag primitives.
+const BRUSH_THRESHOLD: f64 = 4.0;
 
 #[derive(Clone, Debug)]
 enum ChartDataInput {
@@ -74,6 +77,8 @@ struct ChartConfig {
     pan: ChartPoint,
     viewport: Option<ChartLinkedViewport>,
     viewport_revision: u64,
+    /// The `background` of `background_style`, the color the chart is drawn on.
+    background: Option<crate::Rgba8>,
     theme: PrimitiveTheme,
 }
 
@@ -90,7 +95,7 @@ impl ChartSourceCache {
     fn matches(&self, props: &PrimitiveProps) -> bool {
         props.get("spec") == Some(&self.spec_prop)
             && props.get("data") == Some(&self.data_prop)
-            && data_string_prop(props, "key_dimension") == self.key_dimension
+            && props.string("key_dimension") == self.key_dimension.as_deref()
     }
 }
 
@@ -366,7 +371,8 @@ impl ChartLinkRegistry {
 struct ChartEntity {
     focus: FocusHandle,
     config: ChartConfig,
-    events: PrimitiveEventEmitter,
+    events: PrimitiveContext,
+    interaction_key: String,
     transforms: ChartTransformRegistry,
     geo: ChartGeoRegistry,
     custom_series: ChartSeriesRegistry,
@@ -384,7 +390,6 @@ struct ChartEntity {
     zoom: f64,
     pan: ChartPoint,
     dragging_pan: bool,
-    pan_origin: Option<Point<Pixels>>,
     brush: Option<(ChartPoint, ChartPoint)>,
     job: u64,
     data_source_epoch: u64,
@@ -415,7 +420,8 @@ struct ChartEntity {
 impl ChartEntity {
     fn new(
         config: ChartConfig,
-        events: PrimitiveEventEmitter,
+        events: PrimitiveContext,
+        interaction_key: String,
         transforms: ChartTransformRegistry,
         geo: ChartGeoRegistry,
         custom_series: ChartSeriesRegistry,
@@ -436,6 +442,7 @@ impl ChartEntity {
             focus: cx.focus_handle(),
             config,
             events,
+            interaction_key,
             transforms,
             geo,
             custom_series,
@@ -453,7 +460,6 @@ impl ChartEntity {
             zoom,
             pan,
             dragging_pan: false,
-            pan_origin: None,
             brush: None,
             job: 0,
             data_source_epoch,
@@ -531,7 +537,6 @@ impl ChartEntity {
         self.wheel_commit_task = None;
         self.wheel_gesture = ChartWheelGesture::PhaseLess;
         self.dragging_pan = false;
-        self.pan_origin = None;
         self.brush = None;
         self.hovered = None;
         self.viewport_preview_dirty = false;
@@ -585,7 +590,7 @@ impl ChartEntity {
     fn update_config(
         &mut self,
         config: ChartConfig,
-        events: PrimitiveEventEmitter,
+        events: PrimitiveContext,
         linked_selected: BTreeSet<String>,
         linked_projection: Option<ChartLinkedProjection>,
         cx: &mut Context<Self>,
@@ -605,8 +610,7 @@ impl ChartEntity {
             .as_ref()
             .is_some_and(|proposal| config.viewport_revision >= proposal.revision);
         let programmatic_viewport_change = !had_pending_viewport && external_viewport_changed;
-        let theme_changed = primitive_chart_theme(&self.config.theme)
-            != primitive_chart_theme(&config.theme)
+        let theme_changed = self.config.chart_theme() != config.chart_theme()
             || self.config.theme.motion_preference() != config.theme.motion_preference()
             || self.config.theme.motion_quality() != config.theme.motion_quality();
         let acknowledge_viewport = acknowledges_pending || programmatic_viewport_change;
@@ -850,7 +854,7 @@ impl ChartEntity {
         let frame_key = self.current_frame_key();
         self.layout_job = self.layout_job.saturating_add(1);
         let job = self.layout_job;
-        let theme = primitive_chart_theme(&self.config.theme);
+        let theme = self.config.chart_theme();
         let geo = self.geo.clone();
         let viewport = ChartViewport {
             zoom: self.zoom,
@@ -1068,7 +1072,7 @@ impl ChartEntity {
                     self.pan = self.config.pan;
                     return;
                 };
-                let theme = primitive_chart_theme(&self.config.theme);
+                let theme = self.config.chart_theme();
                 let plot = self.bounds.and_then(|bounds| {
                     chart_region_rect(
                         &self.config.spec,
@@ -1102,7 +1106,7 @@ impl ChartEntity {
         let Some(scene) = &self.scene else {
             return;
         };
-        let theme = primitive_chart_theme(&self.config.theme);
+        let theme = self.config.chart_theme();
         let plot = self
             .bounds
             .and_then(|bounds| {
@@ -1196,7 +1200,7 @@ impl ChartEntity {
                     let Some(scene) = scene.as_ref() else {
                         return false;
                     };
-                    let theme = primitive_chart_theme(&self.config.theme);
+                    let theme = self.config.chart_theme();
                     let plot = self
                         .bounds
                         .and_then(|bounds| {
@@ -1233,7 +1237,7 @@ impl ChartEntity {
                     let Some(bounds) = self.bounds else {
                         return false;
                     };
-                    let theme = primitive_chart_theme(&self.config.theme);
+                    let theme = self.config.chart_theme();
                     let Some(plot) = chart_region_rect(
                         &self.config.spec,
                         f64::from(bounds.size.width),
@@ -1275,32 +1279,6 @@ impl ChartEntity {
     }
 
     fn mouse_move(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.dragging_pan {
-            if let Some(origin) = self.pan_origin {
-                let changed = self.pan_effective_viewport(ChartPoint {
-                    x: f64::from(event.position.x - origin.x),
-                    y: f64::from(event.position.y - origin.y),
-                });
-                if !changed {
-                    return;
-                }
-                self.viewport_input_generation = self.viewport_input_generation.saturating_add(1);
-                self.viewport_preview_dirty = true;
-                self.pan_origin = Some(event.position);
-                self.invalidate_frame();
-                self.rebuild_scene_with_motion(cx, false);
-            }
-            return;
-        }
-        if event.dragging()
-            && !matches!(self.config.spec.brush, ChartBrushMode::None)
-            && let Some(point) = self.local_point(event.position)
-            && let Some((start, _)) = self.brush
-        {
-            self.brush = Some((start, point));
-            cx.notify();
-            return;
-        }
         let hovered_mark = self.hit_mark_at(event.position);
         let hovered = hovered_mark.as_ref().map(|mark| mark.key.clone());
         if hovered != self.hovered {
@@ -1317,13 +1295,149 @@ impl ChartEntity {
         }
     }
 
+    fn begin_pan(&mut self, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        self.dragging_pan = true;
+        let entity = cx.weak_entity();
+        let update_entity = entity.clone();
+        let update =
+            move |gesture: crate::interaction::GestureUpdate, _: &mut Window, cx: &mut App| {
+                let result = update_entity.update(cx, |chart, cx| {
+                    if chart.activity != ChartActivity::Active {
+                        return false;
+                    }
+                    let (x, y) = gesture.step();
+                    if chart.pan_effective_viewport(ChartPoint { x, y }) {
+                        chart.viewport_input_generation =
+                            chart.viewport_input_generation.saturating_add(1);
+                        chart.viewport_preview_dirty = true;
+                        chart.invalidate_frame();
+                        chart.rebuild_scene_with_motion(cx, false);
+                    }
+                    true
+                });
+                if matches!(result, Ok(true)) {
+                    crate::interaction::InteractionFlow::Continue
+                } else {
+                    crate::interaction::InteractionFlow::Cancel
+                }
+            };
+        let finish_entity = entity.clone();
+        let finish =
+            move |_: crate::interaction::GestureUpdate, window: &mut Window, cx: &mut App| {
+                let _ = finish_entity.update(cx, |chart, cx| {
+                    chart.dragging_pan = false;
+                    if chart.activity == ChartActivity::Active {
+                        chart.emit_viewport_change(window, cx);
+                    }
+                    cx.notify();
+                });
+            };
+        let cancel = move |_: &mut Window, cx: &mut App| {
+            let _ = entity.update(cx, |chart, cx| {
+                chart.dragging_pan = false;
+                chart.viewport_preview_dirty = false;
+                chart.restore_committed_viewport();
+                chart.invalidate_frame();
+                chart.rebuild_scene_with_motion(cx, false);
+                cx.notify();
+            });
+        };
+        let owner = self
+            .events
+            .interaction_owner(&format!("{}:pan", self.interaction_key));
+        self.events.begin_interaction(
+            crate::interaction::NativeGesture::new(
+                owner,
+                position,
+                cx.entity_id(),
+                update,
+                finish,
+                cancel,
+            )
+            .with_button(MouseButton::Middle),
+            window,
+            cx,
+        );
+    }
+
+    fn begin_brush(
+        &mut self,
+        start: ChartPoint,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let entity = cx.weak_entity();
+        let update_entity = entity.clone();
+        let update =
+            move |gesture: crate::interaction::GestureUpdate, _: &mut Window, cx: &mut App| {
+                let result = update_entity.update(cx, |chart, cx| {
+                    if chart.activity != ChartActivity::Active {
+                        return false;
+                    }
+                    if gesture.moved()
+                        && let Some(end) = chart.local_point(gesture.current())
+                    {
+                        chart.brush = Some((start, end));
+                        cx.notify();
+                    }
+                    true
+                });
+                if matches!(result, Ok(true)) {
+                    crate::interaction::InteractionFlow::Continue
+                } else {
+                    crate::interaction::InteractionFlow::Cancel
+                }
+            };
+        let finish_entity = entity.clone();
+        let finish =
+            move |gesture: crate::interaction::GestureUpdate, window: &mut Window, cx: &mut App| {
+                let _ = finish_entity.update(cx, |chart, cx| {
+                    let brush = chart.brush.take();
+                    if chart.activity == ChartActivity::Active {
+                        if gesture.moved() {
+                            if let Some((start, end)) = brush {
+                                chart.emit_brush(start, end, window, cx);
+                            }
+                        } else if let Some(mark) = chart.hit_mark_at(gesture.start())
+                            && mark.role == ChartMarkRole::Data
+                        {
+                            // A release before the threshold is a click: it
+                            // selects as it does without a brush.
+                            chart.emit_select(&mark, window, cx);
+                        }
+                    }
+                    cx.notify();
+                });
+            };
+        let cancel = move |_: &mut Window, cx: &mut App| {
+            let _ = entity.update(cx, |chart, cx| {
+                chart.brush = None;
+                cx.notify();
+            });
+        };
+        let owner = self
+            .events
+            .interaction_owner(&format!("{}:brush", self.interaction_key));
+        self.events.begin_interaction(
+            crate::interaction::NativeGesture::new(
+                owner,
+                position,
+                cx.entity_id(),
+                update,
+                finish,
+                cancel,
+            )
+            .with_threshold(BRUSH_THRESHOLD),
+            window,
+            cx,
+        );
+    }
+
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.focus.focus(window, cx);
         match event.button {
-            MouseButton::Middle => {
-                self.dragging_pan = true;
-                self.pan_origin = Some(event.position);
-            }
+            MouseButton::Middle => self.begin_pan(event.position, window, cx),
             MouseButton::Left => {
                 if let Some(mark) = self.hit_mark_at(event.position)
                     && matches!(mark.role, ChartMarkRole::Legend | ChartMarkRole::Annotation)
@@ -1351,7 +1465,7 @@ impl ChartEntity {
                     } else {
                         point
                     };
-                    self.brush = Some((point, point));
+                    self.begin_brush(point, event.position, window, cx);
                 } else if let Some(mark) = self.hit_mark_at(event.position)
                     && mark.role == ChartMarkRole::Data
                 {
@@ -1363,21 +1477,20 @@ impl ChartEntity {
         cx.notify();
     }
 
-    fn mouse_up(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if event.button == MouseButton::Middle {
-            self.dragging_pan = false;
-            self.pan_origin = None;
-            self.emit_viewport_change(window, cx);
-        }
-        if event.button == MouseButton::Left
-            && let Some((start, end)) = self.brush.take()
-        {
-            self.emit_brush(start, end, window, cx);
-        }
-        cx.notify();
-    }
-
     fn wheel(&mut self, event: &ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let explicit_gesture_ending = matches!(event.touch_phase, gpui::TouchPhase::Ended)
+            && self.wheel_gesture == ChartWheelGesture::Explicit
+            && self.viewport_preview_dirty;
+        let wheel_zoom_enabled = match self.config.spec.interaction.wheel_zoom {
+            ChartWheelZoom::Off => false,
+            ChartWheelZoom::Modifier => {
+                event.modifiers.control || event.modifiers.platform || explicit_gesture_ending
+            }
+            ChartWheelZoom::Always => true,
+        };
+        if !wheel_zoom_enabled {
+            return;
+        }
         let delta = event.delta.pixel_delta(px(16.0));
         if matches!(event.touch_phase, gpui::TouchPhase::Ended) {
             self.wheel_gesture = ChartWheelGesture::PhaseLess;
@@ -1709,11 +1822,18 @@ impl ChartEntity {
 
 impl Render for ChartEntity {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.events.present_interaction(
+            self.events
+                .interaction_owner(&format!("{}:pan", self.interaction_key)),
+        );
+        self.events.present_interaction(
+            self.events
+                .interaction_owner(&format!("{}:brush", self.interaction_key)),
+        );
         let scene = self.displayed_scene(window);
         let hovered = self.hovered.clone();
         let focused = self.focused.clone();
-        let chart_theme = primitive_chart_theme(&self.config.theme);
-        let background = chart_theme.background;
+        let chart_theme = self.config.chart_theme();
         let crosshair = self.config.spec.tooltip.crosshair;
         let crosshair_color = chart_theme.crosshair;
         let canvas_scene = scene.clone();
@@ -1740,17 +1860,12 @@ impl Render for ChartEntity {
             .relative()
             .size_full()
             .overflow_hidden()
-            .bg(rgba(background.as_rgba_hex()))
             .track_focus(&self.focus)
             .tab_stop(true)
             .on_key_down(cx.listener(Self::key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
             .on_mouse_down(MouseButton::Middle, cx.listener(Self::mouse_down))
             .on_mouse_move(cx.listener(Self::mouse_move))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
-            .on_mouse_up(MouseButton::Middle, cx.listener(Self::mouse_up))
-            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
-            .on_mouse_up_out(MouseButton::Middle, cx.listener(Self::mouse_up))
             .on_scroll_wheel(cx.listener(Self::wheel))
             .child(chart_canvas);
         if let Some(scene) = &scene {
@@ -1795,7 +1910,7 @@ impl Render for ChartEntity {
                     .and_then(|key| scene.marks.iter().find(|mark| mark.key == key))
                 && let Some(position) = mark_center(mark)
             {
-                let chart_theme = primitive_chart_theme(&self.config.theme);
+                let chart_theme = self.config.chart_theme();
                 let tooltip_x = if chart_theme.direction == crate::TextDirection::RightToLeft {
                     position.x - 172.0
                 } else {
@@ -1847,7 +1962,7 @@ impl Render for ChartEntity {
             }
         }
         if let Some((start, end)) = self.brush {
-            let selection = primitive_chart_theme(&self.config.theme).selection;
+            let selection = self.config.chart_theme().selection;
             root = root.child(
                 div()
                     .absolute()
@@ -2081,6 +2196,33 @@ impl PrimitiveHandler for ChartPrimitiveHandler {
         })
     }
 
+    fn accessibility_actions(
+        &self,
+        _instance: &PrimitiveInstanceId,
+    ) -> Vec<gpui::AccessibleAction> {
+        vec![gpui::AccessibleAction::Focus]
+    }
+
+    fn perform_accessibility_action(
+        &mut self,
+        instance: &PrimitiveInstanceId,
+        action: gpui::AccessibleAction,
+        _data: Option<&gpui::accesskit::ActionData>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Result<(), String> {
+        if action != gpui::AccessibleAction::Focus {
+            return Err("unsupported chart accessibility action".to_owned());
+        }
+        let chart = self
+            .instances
+            .get(instance)
+            .ok_or_else(|| "chart accessibility target is stale".to_owned())?;
+        let focus = chart.read(cx).focus.clone();
+        focus.focus(window, cx);
+        Ok(())
+    }
+
     fn suspend(&mut self, instance: &PrimitiveInstanceId, cx: &mut App) {
         if let Some(entity) = self.instances.get(instance) {
             entity.update(cx, ChartEntity::suspend);
@@ -2102,7 +2244,7 @@ impl PrimitiveHandler for ChartPrimitiveHandler {
     fn render(
         &mut self,
         instance: &PrimitiveInstance,
-        events: &PrimitiveEventEmitter,
+        events: &PrimitiveContext,
         theme: &PrimitiveTheme,
         _: &mut Window,
         cx: &mut App,
@@ -2134,6 +2276,7 @@ impl PrimitiveHandler for ChartPrimitiveHandler {
                 ChartEntity::new(
                     config.clone(),
                     events.clone(),
+                    format!("{}:{}", id.key(), id.node()),
                     self.transforms.clone(),
                     self.geo.clone(),
                     self.custom_series.clone(),
@@ -2214,13 +2357,20 @@ fn chart_config_from_source(
         spec,
         data: source.data.clone(),
         selected: string_set_prop(props, "selected_keys"),
-        zoom: number_prop(props, "zoom").unwrap_or(1.0),
+        zoom: props.number("zoom").unwrap_or(1.0),
         pan: ChartPoint {
-            x: number_prop(props, "pan_x").unwrap_or(0.0),
-            y: number_prop(props, "pan_y").unwrap_or(0.0),
+            x: props.number("pan_x").unwrap_or(0.0),
+            y: props.number("pan_y").unwrap_or(0.0),
         },
         viewport: viewport_prop(props)?,
-        viewport_revision: integer_prop(props, "viewport_revision").unwrap_or(0),
+        viewport_revision: props
+            .integer("viewport_revision")
+            .and_then(|value| u64::try_from(value).ok())
+            .unwrap_or(0),
+        background: props
+            .style("background_style")
+            .and_then(|style| style.base.background.as_ref())
+            .and_then(|color| theme.resolve_color(color)),
         theme: theme.clone(),
     })
 }
@@ -2236,7 +2386,7 @@ fn parse_chart_source(props: &PrimitiveProps) -> Result<ChartSourceCache, String
         }
         _ => return Err("chart spec must be durable data".to_owned()),
     };
-    let key_dimension = data_string_prop(props, "key_dimension");
+    let key_dimension = props.string("key_dimension").map(ToOwned::to_owned);
     let data_prop = props
         .get("data")
         .cloned()
@@ -2632,28 +2782,6 @@ fn linked_viewport_value(viewport: &ChartLinkedViewport) -> UiValue {
     }
 }
 
-fn data_string_prop(props: &PrimitiveProps, name: &str) -> Option<String> {
-    match props.get(name) {
-        Some(PrimitiveValue::Data(UiValue::String(value))) => Some(value.clone()),
-        _ => None,
-    }
-}
-
-fn number_prop(props: &PrimitiveProps, name: &str) -> Option<f64> {
-    match props.get(name) {
-        Some(PrimitiveValue::Data(UiValue::Float(value))) => Some(*value),
-        Some(PrimitiveValue::Data(UiValue::Integer(value))) => value.to_string().parse().ok(),
-        _ => None,
-    }
-}
-
-fn integer_prop(props: &PrimitiveProps, name: &str) -> Option<u64> {
-    match props.get(name) {
-        Some(PrimitiveValue::Data(UiValue::Integer(value))) => u64::try_from(*value).ok(),
-        _ => None,
-    }
-}
-
 fn string_set_prop(props: &PrimitiveProps, name: &str) -> BTreeSet<String> {
     match props.get(name) {
         Some(PrimitiveValue::Data(UiValue::Array(values))) => values
@@ -2667,7 +2795,15 @@ fn string_set_prop(props: &PrimitiveProps, name: &str) -> BTreeSet<String> {
     }
 }
 
-fn primitive_chart_theme(theme: &PrimitiveTheme) -> ChartTheme {
+impl ChartConfig {
+    fn chart_theme(&self) -> ChartTheme {
+        primitive_chart_theme(&self.theme, self.background)
+    }
+}
+
+/// `background` is the color under the chart, from `background_style`; without
+/// one, marks are edged in `surface`, the window canvas.
+fn primitive_chart_theme(theme: &PrimitiveTheme, background: Option<crate::Rgba8>) -> ChartTheme {
     let fallback = ChartTheme::default();
     let palette = (1..=8)
         .map(|index| {
@@ -2677,7 +2813,9 @@ fn primitive_chart_theme(theme: &PrimitiveTheme) -> ChartTheme {
         })
         .collect::<Vec<_>>();
     ChartTheme {
-        background: theme.color("surface").unwrap_or(fallback.background),
+        background: background
+            .or_else(|| theme.color("surface"))
+            .unwrap_or(fallback.background),
         text: theme.color("text_primary").unwrap_or(fallback.text),
         muted_text: theme.color("text_muted").unwrap_or(fallback.muted_text),
         axis: theme.color("charts.axis").unwrap_or(fallback.axis),
@@ -3119,9 +3257,7 @@ fn typography_length_pixels(value: crate::Length, fallback: f64) -> f64 {
     match value {
         crate::Length::Pixels(value) => value,
         crate::Length::Rems(value) => value * 16.0,
-        crate::Length::Relative(_)
-        | crate::Length::ThemeSpacing(_)
-        | crate::Length::ThemeRadius(_) => fallback,
+        crate::Length::Relative(_) | crate::Length::Token(_) => fallback,
     }
 }
 
@@ -3143,9 +3279,8 @@ fn apply_chart_typography(
         element = element.font_family(family.clone());
     }
     if !typography.fallbacks.is_empty() {
-        element
-            .text_style()
-            .font_fallbacks = Some(FontFallbacks::from_fonts(typography.fallbacks.clone()));
+        element.text_style().font_fallbacks =
+            Some(FontFallbacks::from_fonts(typography.fallbacks.clone()));
     }
     element
 }
@@ -3188,7 +3323,9 @@ pub fn chart_primitive_descriptor() -> PrimitiveDescriptor {
         props: BTreeMap::from([
             (
                 "spec".to_owned(),
-                ObjectField::required(ValueSchema::UiValue),
+                ObjectField::required(ValueSchema::UiValue).with_doc(
+                    "Typed chart description: series and their `encode`, regions, axes, legend, `brush`, annotations and links.",
+                ),
             ),
             (
                 "data".to_owned(),
@@ -3200,68 +3337,112 @@ pub fn chart_primitive_descriptor() -> PrimitiveDescriptor {
                         },
                         ValueSchema::ChartData,
                     ],
-                }),
+                })
+                .with_doc(
+                    "Up to 10,000 inline row objects, or a `NativeChartData` handle from `ctx.get_native_chart_data` for large data.",
+                ),
             ),
             (
                 "key_dimension".to_owned(),
-                ObjectField::optional(ValueSchema::optional(ValueSchema::string())),
+                ObjectField::optional(ValueSchema::optional(ValueSchema::string())).with_doc(
+                    "Inline-row field whose value keys each datum across replacement, selection, focus and motion.",
+                ),
             ),
             (
                 "selected_keys".to_owned(),
                 ObjectField::optional(string_array.clone())
-                    .with_default(UiValue::Array(Vec::new())),
+                    .with_default(UiValue::Array(Vec::new()))
+                    .with_doc(
+                        "Datum keys drawn as selected; controlled, so update it from `select` or `brush_change` payloads.",
+                    ),
             ),
             (
                 "hidden_series".to_owned(),
-                ObjectField::optional(string_array).with_default(UiValue::Array(Vec::new())),
+                ObjectField::optional(string_array)
+                    .with_default(UiValue::Array(Vec::new()))
+                    .with_doc("Series keys to hide; controlled, so update it from `legend_change` payloads."),
             ),
             (
                 "zoom".to_owned(),
                 ObjectField::optional(ValueSchema::bounded_number(Some(0.5), Some(20.0)))
-                    .with_default(UiValue::Float(1.0)),
+                    .with_default(UiValue::Float(1.0))
+                    .with_doc(
+                        "Scalar camera zoom where 1 shows the whole domain; shorthand for `viewport` when one camera is enough.",
+                    ),
             ),
             (
                 "pan_x".to_owned(),
-                ObjectField::optional(ValueSchema::number()).with_default(UiValue::Float(0.0)),
+                ObjectField::optional(ValueSchema::number())
+                    .with_default(UiValue::Float(0.0))
+                    .with_doc("Scalar camera offset along x in logical plot pixels; goes with `zoom`."),
             ),
             (
                 "pan_y".to_owned(),
-                ObjectField::optional(ValueSchema::number()).with_default(UiValue::Float(0.0)),
+                ObjectField::optional(ValueSchema::number())
+                    .with_default(UiValue::Float(0.0))
+                    .with_doc("Scalar camera offset along y in logical plot pixels; goes with `zoom`."),
             ),
             (
                 "viewport".to_owned(),
-                ObjectField::optional(ValueSchema::UiValue).with_default(UiValue::Null),
+                ObjectField::optional(ValueSchema::UiValue)
+                    .with_default(UiValue::Null)
+                    .with_doc(
+                        "Controlled typed viewport, a cartesian axis window or a geo camera, or `()`; store `zoom_change`'s `viewport`.",
+                    ),
             ),
             (
                 "viewport_revision".to_owned(),
                 ObjectField::optional(ValueSchema::bounded_integer(Some(0), None))
-                    .with_default(UiValue::Integer(0)),
+                    .with_default(UiValue::Integer(0))
+                    .with_doc(
+                        "Revision of the last `zoom_change` you answered; write its `viewport_revision` back, also when rejecting it.",
+                    ),
+            ),
+            (
+                "background_style".to_owned(),
+                ObjectField::optional(ValueSchema::Style).with_doc(
+                    "Style whose `background` is the color under the chart, usually the element's own style; pie and donut slices, map regions and point annotations are edged in it (`surface` without one). The chart paints no fill.",
+                ),
             ),
             (
                 "on_select".to_owned(),
-                ObjectField::optional(ValueSchema::optional(ValueSchema::Callback)),
+                ObjectField::optional(ValueSchema::optional(ValueSchema::Callback)).with_doc(
+                    "Called with the datum reference, name and value when a data mark is clicked or activated by Enter or Space; with `spec.brush` set, the click counts on release, since a press that moves more than 4 pixels starts a brush instead.",
+                ),
             ),
             (
                 "on_zoom_change".to_owned(),
-                ObjectField::optional(ValueSchema::optional(ValueSchema::Callback)),
+                ObjectField::optional(ValueSchema::optional(ValueSchema::Callback)).with_doc(
+                    "Called with the proposed camera, typed `viewport` and `viewport_revision` when a wheel zoom or pan commits.",
+                ),
             ),
             (
                 "on_brush_change".to_owned(),
-                ObjectField::optional(ValueSchema::optional(ValueSchema::Callback)),
+                ObjectField::optional(ValueSchema::optional(ValueSchema::Callback)).with_doc(
+                    "Called with the brushed datum keys, references and rectangle when a brush drag ends; a press in the plot becomes a brush once the pointer moves more than 4 pixels.",
+                ),
             ),
             (
                 "on_legend_change".to_owned(),
-                ObjectField::optional(ValueSchema::optional(ValueSchema::Callback)),
+                ObjectField::optional(ValueSchema::optional(ValueSchema::Callback)).with_doc(
+                    "Called with `#{ series_key, visible }` when a legend entry is clicked; `visible` is the requested new state.",
+                ),
             ),
             (
                 "on_annotation_activate".to_owned(),
-                ObjectField::optional(ValueSchema::optional(ValueSchema::Callback)),
+                ObjectField::optional(ValueSchema::optional(ValueSchema::Callback)).with_doc(
+                    "Called with the annotation's `key` and `label` when it is clicked or activated by Enter or Space.",
+                ),
             ),
         ]),
         events: BTreeMap::from([
             (
                 "select".to_owned(),
                 EventSchema {
+                    doc: Some(
+                        "Emitted when a data mark is clicked or activated by Enter or Space; the payload identifies the datum and its value. With `spec.brush` set, a click is a press released before the pointer moves more than 4 pixels."
+                            .to_owned(),
+                    ),
                     payload: ValueSchema::Object {
                         fields: BTreeMap::from([
                             (
@@ -3300,6 +3481,10 @@ pub fn chart_primitive_descriptor() -> PrimitiveDescriptor {
             (
                 "zoom_change".to_owned(),
                 EventSchema {
+                    doc: Some(
+                        "Emitted when a wheel zoom or a middle-button pan commits; the payload is the proposed camera and its new revision."
+                            .to_owned(),
+                    ),
                     payload: ValueSchema::Object {
                         fields: BTreeMap::from([
                             (
@@ -3330,6 +3515,10 @@ pub fn chart_primitive_descriptor() -> PrimitiveDescriptor {
             (
                 "brush_change".to_owned(),
                 EventSchema {
+                    doc: Some(
+                        "Emitted when a brush drag ends; the payload lists the enclosed data and the rectangle in chart-local pixels."
+                            .to_owned(),
+                    ),
                     payload: ValueSchema::Object {
                         fields: BTreeMap::from([
                             (
@@ -3368,6 +3557,10 @@ pub fn chart_primitive_descriptor() -> PrimitiveDescriptor {
             (
                 "legend_change".to_owned(),
                 EventSchema {
+                    doc: Some(
+                        "Emitted when a legend entry is clicked; the payload names the series and its requested visibility."
+                            .to_owned(),
+                    ),
                     payload: ValueSchema::Object {
                         fields: BTreeMap::from([
                             (
@@ -3386,6 +3579,10 @@ pub fn chart_primitive_descriptor() -> PrimitiveDescriptor {
             (
                 "annotation_activate".to_owned(),
                 EventSchema {
+                    doc: Some(
+                        "Emitted when an annotation is clicked or activated by Enter or Space; the payload is its `key` and `label`."
+                            .to_owned(),
+                    ),
                     payload: ValueSchema::Object {
                         fields: BTreeMap::from([
                             (
@@ -3409,6 +3606,8 @@ pub fn chart_primitive_descriptor() -> PrimitiveDescriptor {
                 PrimitivePlatform::MacOs,
                 PrimitivePlatform::Linux,
                 PrimitivePlatform::Windows,
+                // workbench-rs: charts draw through GPUI, which runs in the browser too.
+                PrimitivePlatform::Web,
             ]
             .into_iter()
             .collect(),
@@ -3481,5 +3680,112 @@ mod tests {
             PrimitiveValue::Data(linked_viewport_value(&geo)),
         );
         assert_eq!(viewport_prop(&props).unwrap(), Some(geo));
+    }
+
+    struct Colors(BTreeMap<String, crate::Rgba8>);
+
+    impl crate::ColorResolver for Colors {
+        fn resolve_token(&self, token: &str) -> Option<crate::Rgba8> {
+            self.0.get(token).copied()
+        }
+
+        fn color_snapshot(&self) -> BTreeMap<String, crate::Rgba8> {
+            self.0.clone()
+        }
+    }
+
+    fn map(entries: &[(&str, UiValue)]) -> UiValue {
+        UiValue::Map(
+            entries
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), value.clone()))
+                .collect(),
+        )
+    }
+
+    /// Edge colors of the pie's slices.
+    fn slice_edges(config: &ChartConfig) -> Vec<crate::Rgba8> {
+        let prepared = prepare_chart_data(
+            config.spec.clone(),
+            &config.data.snapshot(),
+            &ChartTransformRegistry::new(),
+            &ChartSeriesRegistry::new(),
+            &ChartFormatterRegistry::new(),
+        )
+        .unwrap();
+        super::super::layout_chart_scene(
+            &prepared,
+            320.0,
+            200.0,
+            &config.chart_theme(),
+            &ChartGeoRegistry::new(),
+        )
+        .unwrap()
+        .marks
+        .iter()
+        .filter(|mark| mark.role == ChartMarkRole::Data)
+        .filter_map(|mark| mark.stroke.map(|(color, _)| color))
+        .collect()
+    }
+
+    #[test]
+    fn marks_are_edged_in_the_color_under_the_chart() {
+        let surface = crate::Rgba8::from_rgb_hex(0x0015_1412);
+        let raised = crate::Rgba8::from_rgb_hex(0x001d_1c19);
+        let theme = PrimitiveTheme::capture(&Colors(BTreeMap::from([
+            ("surface".to_owned(), surface),
+            ("surface_raised".to_owned(), raised),
+        ])));
+        let spec = map(&[
+            (
+                "regions",
+                UiValue::Array(vec![map(&[
+                    ("key", UiValue::String("main".to_owned())),
+                    ("kind", UiValue::String("polar".to_owned())),
+                ])]),
+            ),
+            (
+                "series",
+                UiValue::Array(vec![map(&[
+                    ("key", UiValue::String("s".to_owned())),
+                    ("kind", UiValue::String("pie".to_owned())),
+                    (
+                        "encode",
+                        map(&[
+                            ("name", UiValue::String("id".to_owned())),
+                            ("value", UiValue::String("v".to_owned())),
+                        ]),
+                    ),
+                ])]),
+            ),
+        ]);
+        let rows = ["a", "b"]
+            .into_iter()
+            .map(|id| {
+                map(&[
+                    ("id", UiValue::String(id.to_owned())),
+                    ("v", UiValue::Integer(1)),
+                ])
+            })
+            .collect();
+        let props = PrimitiveProps::new()
+            .with("spec", PrimitiveValue::Data(spec))
+            .with("data", PrimitiveValue::Data(UiValue::Array(rows)));
+
+        // Without a background the chart cannot know its layer: `surface`.
+        let (config, _) = parse_config(&props, &theme, None).unwrap();
+        assert_eq!(config.background, None);
+        assert_eq!(slice_edges(&config), vec![surface, surface]);
+
+        let on_raised = props.with(
+            "background_style",
+            PrimitiveValue::Style(Box::new(
+                crate::Style::default()
+                    .background(crate::ColorValue::token("surface_raised").unwrap()),
+            )),
+        );
+        let (config, _) = parse_config(&on_raised, &theme, None).unwrap();
+        assert_eq!(config.background, Some(raised));
+        assert_eq!(slice_edges(&config), vec![raised, raised]);
     }
 }
