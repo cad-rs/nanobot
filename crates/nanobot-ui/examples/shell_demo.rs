@@ -17,10 +17,19 @@
 //! - "法兰初稿（流式）" streams a long answer over and over: the end stays in
 //!   view until you scroll up, and "回到底部" takes you back.
 //!
+//! The activity bar and the composer:
+//! - the first session is stopped on a tool call: answer it with a button, or
+//!   type what to do instead and press Enter;
+//! - in the streaming session, Enter queues a message and Ctrl+Enter sends it
+//!   into the turn; the queue unfolds above the composer;
+//! - Shift+Tab (or a click on the mode under the composer) turns the
+//!   permission dial; Shift+Enter breaks a line.
+//!
 //! The layout is saved in `shell_demo/settings.json` under the user's config
 //! directory; delete it to start over.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -32,7 +41,7 @@ use nanobot_gpu::{
     ViewportSlot,
 };
 use nanobot_ui::{
-    BranchMarker, Conversation, Entry, HarnessShell, PanelArea, PanelDef, PlanPhase, PlanStep,
+    ApprovalDecision, BranchMarker, Conversation, Entry, HarnessShell, PanelArea, PanelDef, PlanPhase, PlanStep,
     Project, ProjectId, SessionId, SessionStatus, SessionStore, SessionView, StepStatus,
     ToolCall, ToolKind, ToolStatus, WorkspaceView,
 };
@@ -283,6 +292,13 @@ impl WorkspaceView for Demo {
     fn progress(&self) -> Option<(u32, u32)> {
         None
     }
+    fn model_label(&self) -> Option<String> {
+        Some("demo-model".to_string())
+    }
+    fn context_usage(&self) -> Option<f32> {
+        // The streaming session is the one running out of room.
+        Some(if self.status == SessionStatus::Running { 0.83 } else { 0.42 })
+    }
 }
 
 impl SessionView for Demo {
@@ -326,7 +342,7 @@ fn store(streaming: Rc<RefCell<Conversation>>) -> SessionStore<Demo> {
                 id: ProjectId::new("bracket"),
                 name: "支架".to_string(),
                 sessions: vec![
-                    Demo::new("s1", "支架开孔方案", SessionStatus::Idle),
+                    Demo::new("s1", "支架开孔方案", SessionStatus::AwaitingUser),
                     Demo::new("s2", "倒角待确认", SessionStatus::AwaitingUser),
                     Demo {
                         conversation: streaming,
@@ -378,12 +394,57 @@ fn main() {
         };
         cx.open_window(options, |window, cx| {
             cx.new(|cx| {
+                let store = store(streaming.clone());
+                // Each session's conversation, to play the callbacks out on.
+                let conversations: Rc<HashMap<String, Rc<RefCell<Conversation>>>> = Rc::new(
+                    store
+                        .projects()
+                        .iter()
+                        .flat_map(|project| &project.sessions)
+                        .map(|s| (s.id.as_str().to_string(), s.conversation.clone()))
+                        .collect(),
+                );
                 let mut shell = HarnessShell::with_composer(
-                    store(streaming.clone()),
+                    store,
                     nanobot_ui::Locale::default(),
                     window,
                     cx,
                 );
+                // What a product would forward to its agent, played out on the
+                // made-up conversations so the result shows.
+                let talks = conversations.clone();
+                shell.set_on_message_sent(move |id, text, delivery| {
+                    log::info!("message to {id} ({delivery:?}): {text}");
+                    if let Some(talk) = talks.get(id.as_str()) {
+                        let mut talk = talk.borrow_mut();
+                        let seq = talk.last_seq() + 1;
+                        talk.entries.push(Entry::user(seq, text));
+                    }
+                });
+                let talks = conversations.clone();
+                shell.set_on_approval(move |id, seq, decision| {
+                    log::info!("approval of {id}#{seq}: {decision:?}");
+                    let Some(talk) = talks.get(id.as_str()) else {
+                        return;
+                    };
+                    let mut talk = talk.borrow_mut();
+                    let answered = talk.entries.iter_mut().find(|entry| entry.seq == seq);
+                    if let Some(nanobot_ui::EntryKind::Tool(call)) = answered.map(|e| &mut e.kind) {
+                        call.status = match &decision {
+                            ApprovalDecision::Reject { .. } => ToolStatus::Rejected,
+                            _ => ToolStatus::Done,
+                        };
+                    }
+                    if let ApprovalDecision::Reject {
+                        feedback: Some(feedback),
+                    } = decision
+                    {
+                        let seq = talk.last_seq() + 1;
+                        talk.entries.push(Entry::user(seq, feedback));
+                    }
+                });
+                shell.set_on_stop(|id| log::info!("stop {id}"));
+                shell.set_on_permission_mode(|mode| log::info!("permission mode: {mode:?}"));
                 // The running session's answer arrives a little every tick,
                 // ends, rests, and starts over.
                 let (answer, sent) = (long_answer(), std::cell::Cell::new(0usize));

@@ -29,7 +29,7 @@ use gpui::{
     MouseButton, MouseDownEvent, Render, Subscription, Window,
 };
 use gpui_component::{
-    input::{Input, InputEvent, InputState},
+    input::{Input, InputEvent, InputState, TextareaState},
     ActiveTheme as _, StyledExt as _,
 };
 use nanobot_boot::account::Account;
@@ -37,10 +37,11 @@ use nanobot_boot::Settings;
 use nanobot_gpu::{ViewportProjection, ViewportSlot};
 
 use crate::model::{
-    plan_progress, PlanDecision, PlanPhase, PlanStep, ProjectId,
-    SessionId, SessionStatus, SessionStore, SessionView, StepStatus, WorkspaceView,
+    plan_progress, PlanDecision, ProjectId,
+    SessionId, SessionStatus, SessionStore, SessionView, WorkspaceView,
 };
 use crate::panels::{PanelArea, PanelDef, PanelHost};
+use crate::composer::{ApprovalDecision, Delivery, MessageQueue, PermissionMode};
 use crate::i18n::Locale;
 use crate::icons::{self, sized, Icon};
 use crate::layout::{Divider, Fold, Layout, LayoutState, Stacked};
@@ -72,6 +73,10 @@ actions!(
         ToggleSidebar,
         /// Shows or hides the right dock.
         ToggleDock,
+        /// Turns the permission dial one step.
+        CyclePermissionMode,
+        /// Stops the turn in progress.
+        StopTurn,
     ]
 );
 
@@ -84,6 +89,8 @@ pub fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("ctrl-alt-j", ToggleSidebar, Some(KEY_CONTEXT)),
         KeyBinding::new("ctrl-alt-b", ToggleDock, Some(KEY_CONTEXT)),
+        KeyBinding::new("shift-tab", CyclePermissionMode, Some(KEY_CONTEXT)),
+        KeyBinding::new("escape", StopTurn, Some(KEY_CONTEXT)),
     ]);
 }
 
@@ -92,7 +99,14 @@ pub fn init(cx: &mut App) {
 type SessionCallback = Rc<RefCell<dyn Fn(&SessionId)>>;
 
 /// The composer's submit callback.
-type MessageCallback = Rc<RefCell<dyn Fn(&SessionId, &str)>>;
+type MessageCallback = Rc<RefCell<dyn Fn(&SessionId, &str, Delivery)>>;
+
+/// The answer to a tool call waiting for approval: the session, the call's
+/// event sequence and the decision.
+type ApprovalCallback = Rc<RefCell<dyn Fn(&SessionId, u64, ApprovalDecision)>>;
+
+/// Told when the user turns the permission dial.
+type PermissionModeCallback = Rc<RefCell<dyn Fn(PermissionMode)>>;
 
 /// A contingent-plan decision callback.
 type PlanDecisionCallback = Rc<RefCell<dyn Fn(&SessionId, PlanDecision)>>;
@@ -114,11 +128,28 @@ pub struct HarnessShell<S: SessionView> {
     on_session_activated: Option<SessionCallback>,
     /// The message composer. `None` in headless mode, where no window exists to
     /// host the input entity.
-    composer: Option<Entity<InputState>>,
+    pub(crate) composer: Option<Entity<TextareaState>>,
+    /// Whether the composer holds anything to send: what its button shows.
+    pub(crate) composer_has_text: bool,
     /// Callback invoked when the user submits the composer.
-    on_message_sent: Option<MessageCallback>,
+    pub(crate) on_message_sent: Option<MessageCallback>,
+    /// Callback invoked when the user stops the turn in progress.
+    pub(crate) on_stop: Option<SessionCallback>,
+    /// Callback invoked when the user answers a tool call waiting for approval.
+    pub(crate) on_approval: Option<ApprovalCallback>,
+    /// Callback invoked when the user turns the permission dial.
+    pub(crate) on_permission_mode: Option<PermissionModeCallback>,
+    /// How much the agent may do unasked.
+    pub(crate) permission_mode: PermissionMode,
+    /// Messages held until a session's turn ends, per session.
+    pub(crate) queues: HashMap<SessionId, MessageQueue>,
+    /// What is unfolded in the activity bar.
+    pub(crate) plan_open: bool,
+    pub(crate) queue_open: bool,
+    /// "Always allow" was pressed and is asking how far it should reach.
+    pub(crate) always_scope_open: bool,
     /// Callback invoked when the user decides a contingent plan.
-    on_plan_decision: Option<PlanDecisionCallback>,
+    pub(crate) on_plan_decision: Option<PlanDecisionCallback>,
     /// Undo/redo and container save/load/import: the app layer forwards them to
     /// its engine dispatch table.
     on_undo: Option<SessionCallback>,
@@ -140,7 +171,7 @@ pub struct HarnessShell<S: SessionView> {
     /// The user settings store, when the app layer shared it. Presence is
     /// what registers the framework's settings panel and makes theme choices
     /// persist; without it the theme still switches, in memory only.
-    settings: Option<Arc<Mutex<Settings>>>,
+    pub(crate) settings: Option<Arc<Mutex<Settings>>>,
     /// The theme the shell renders in. Tracked so a toggle knows its
     /// starting point even without a settings store.
     theme: ThemeKind,
@@ -199,6 +230,15 @@ impl<S: SessionView> HarnessShell<S> {
             product_name: "harness".to_string(),
             on_session_activated: None,
             composer: None,
+            composer_has_text: false,
+            on_stop: None,
+            on_approval: None,
+            on_permission_mode: None,
+            permission_mode: PermissionMode::default(),
+            queues: HashMap::new(),
+            plan_open: false,
+            queue_open: true,
+            always_scope_open: false,
             on_message_sent: None,
             on_plan_decision: None,
             sidebar_projection: None,
@@ -256,28 +296,33 @@ impl<S: SessionView> HarnessShell<S> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        // Several lines, growing with what is typed. Enter submits and
+        // Shift+Enter breaks the line.
         let composer = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(crate::i18n::t(locale, "composer.placeholder"))
+            TextareaState::new(window, cx)
+                .auto_grow(1, 8)
+                .submit_on_enter(true)
+                .placeholder(crate::i18n::t(locale, "composer.placeholder"))
         });
         let subscription = cx.subscribe_in(
             &composer,
             window,
-            |shell: &mut Self, input, event: &InputEvent, window, cx| {
-                if !matches!(event, InputEvent::PressEnter { .. }) {
-                    return;
+            |shell: &mut Self, input, event: &InputEvent, window, cx| match event {
+                // With the secondary modifier (Ctrl, or Cmd on macOS) the
+                // message goes into the running turn instead of the queue.
+                InputEvent::PressEnter {
+                    secondary,
+                    shift: false,
+                } => shell.submit_composer(*secondary, window, cx),
+                // The button changes with whether there is anything to send.
+                InputEvent::Change => {
+                    let has_text = !input.read(cx).value().trim().is_empty();
+                    if shell.composer_has_text != has_text {
+                        shell.composer_has_text = has_text;
+                        cx.notify();
+                    }
                 }
-                let text = input.read(cx).value().to_string();
-                if text.trim().is_empty() {
-                    return;
-                }
-                let Some(session_id) = shell.workspace.as_ref().map(|ws| ws.session_id().clone())
-                else {
-                    return;
-                };
-                if let Some(sender) = shell.on_message_sent.clone() {
-                    (sender.borrow())(&session_id, &text);
-                    input.update(cx, |state, cx| state.set_value("", window, cx));
-                }
+                _ => {}
             },
         );
 
@@ -306,9 +351,36 @@ impl<S: SessionView> HarnessShell<S> {
 
     pub fn set_on_message_sent<F>(&mut self, callback: F)
     where
-        F: Fn(&SessionId, &str) + 'static,
+        F: Fn(&SessionId, &str, Delivery) + 'static,
     {
         self.on_message_sent = Some(Rc::new(RefCell::new(callback)));
+    }
+
+    /// What stopping the turn in progress does (the composer's button while
+    /// the agent works, or Escape).
+    pub fn set_on_stop<F>(&mut self, callback: F)
+    where
+        F: Fn(&SessionId) + 'static,
+    {
+        self.on_stop = Some(Rc::new(RefCell::new(callback)));
+    }
+
+    /// What answering a tool call that waits for approval does: the session,
+    /// the call's event sequence and the user's decision.
+    pub fn set_on_approval<F>(&mut self, callback: F)
+    where
+        F: Fn(&SessionId, u64, ApprovalDecision) + 'static,
+    {
+        self.on_approval = Some(Rc::new(RefCell::new(callback)));
+    }
+
+    /// What turning the permission dial does. The shell shows and remembers
+    /// the mode; what each mode lets the agent do is the product's policy.
+    pub fn set_on_permission_mode<F>(&mut self, callback: F)
+    where
+        F: Fn(PermissionMode) + 'static,
+    {
+        self.on_permission_mode = Some(Rc::new(RefCell::new(callback)));
     }
 
     pub fn set_on_plan_decision<F>(&mut self, callback: F)
@@ -387,6 +459,9 @@ impl<S: SessionView> HarnessShell<S> {
             }
             if let Ok(store) = store.lock() {
                 self.layout = LayoutState::new(Layout::load(&store));
+                self.permission_mode = PermissionMode::from_code(
+                    &store.get_str(crate::activity::PERMISSION_MODE_KEY, ""),
+                );
             }
             const SETTINGS_PANEL_ID: &str = "harness.settings";
             if !self
@@ -753,6 +828,26 @@ impl<S: SessionView> HarnessShell<S> {
         true
     }
 
+    /// Rebuilds the workspace on screen from its session in the store: for a
+    /// product whose workspace is a snapshot, after
+    /// [`update_session_content`](Self::update_session_content). (A workspace
+    /// that shares its session's state needs no refresh.) False with no
+    /// session on screen.
+    pub fn refresh_workspace(&mut self) -> bool {
+        let Some(id) = self.active_session_id().cloned() else {
+            return false;
+        };
+        let Some(session) = self.store.borrow().session(&id).cloned() else {
+            return false;
+        };
+        let viewport = self.viewport_of(&id);
+        let workspace = session.build_workspace(viewport);
+        self.transcript.reconcile(workspace.conversation());
+        self.stream.set_entries(self.transcript.entries());
+        self.workspace = Some(workspace);
+        true
+    }
+
     /// Switches the presentation to `id`: the entire workspace is rebuilt from
     /// that session. Returns false if `id` is not a session of the open project,
     /// or is already active.
@@ -839,14 +934,6 @@ fn badge_mark(badge: SessionBadge, locale: Locale, p: Palette) -> Option<(&'stat
     }
 }
 
-fn step_color(status: StepStatus, p: Palette) -> Hsla {
-    match status {
-        StepStatus::Pending => p.muted,
-        StepStatus::InProgress => p.info,
-        StepStatus::Done => p.success,
-    }
-}
-
 /// A tinted pill (session status, tool state, check result).
 pub(crate) fn badge(text: &str, color: Hsla) -> impl IntoElement {
     div()
@@ -859,35 +946,6 @@ pub(crate) fn badge(text: &str, color: Hsla) -> impl IntoElement {
         .child(text.to_string())
 }
 
-/// A titled panel frame: small caption row plus a padded body.
-fn panel(caption: &str, p: Palette, body: impl IntoElement) -> impl IntoElement {
-    div()
-        .size_full()
-        .flex()
-        .flex_col()
-        .overflow_hidden()
-        .child(
-            div()
-                .flex_none()
-                .px_3()
-                .py_1()
-                .text_xs()
-                .text_color(p.muted)
-                .border_b_1()
-                .border_color(p.border)
-                .child(caption.to_string()),
-        )
-        .child(
-            div()
-                .flex_1()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .p_2()
-                .overflow_hidden()
-                .child(body),
-        )
-}
 
 // ---- rendering ----
 
@@ -1574,184 +1632,17 @@ impl<S: SessionView> HarnessShell<S> {
             .into_any_element()
     }
 
-    /// The session workspace: plan state over the conversation stream.
+    /// The session workspace, top to bottom: the conversation, the activity
+    /// bar, the composer.
     fn ai_workspace(&self, ws: &S::Workspace, cx: &mut Context<Self>) -> impl IntoElement {
-        let p = palette(cx);
-        let plan = plan_rows(&ws.plan(), p, self.locale);
         div()
             .flex_1()
-            .h_full()
+            .min_h_0()
             .flex()
             .flex_col()
-            .border_l_1()
-            .border_color(p.border)
-            .child(div().flex_none().child(panel(self.tr("shell.plan_state"), p, plan)))
-            .when_some(ws.progress(), |panel, (done, total)| {
-                let pct = if total > 0 { done as f32 / total as f32 } else { 0.0 };
-                panel.child(
-                    div()
-                        .flex_none()
-                        .px_2()
-                        .py_1()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(p.muted)
-                                .child(self.trf("shell.compute_progress", &[("done", &done.to_string()), ("total", &total.to_string())])),
-                        )
-                        .child(
-                            div()
-                                .w_full()
-                                .h(px(4.))
-                                .rounded(px(2.))
-                                .bg(p.border)
-                                .child(
-                                    div()
-                                        .w(px(pct * 200.0))
-                                        .h(px(4.))
-                                        .rounded(px(2.))
-                                        .bg(p.info),
-                                ),
-                        ),
-                )
-            })
-            .when(ws.plan_phase().awaits_decision(), |panel| {
-                if ws.plan_phase() == PlanPhase::Clarify {
-                    panel.child(self.clarify_bar(ws, p))
-                } else {
-                    panel.child(self.plan_decision_bar(ws, p))
-                }
-            })
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .flex()
-                    .flex_col()
-                    .border_t_1()
-                    .border_color(p.border)
-                    .child(self.render_stream(cx)),
-            )
-            .when_some(self.composer.clone(), |panel, composer| {
-                panel.child(
-                    div()
-                        .flex_none()
-                        .p_2()
-                        .border_t_1()
-                        .border_color(p.border)
-                        .child(Input::new(&composer).w_full()),
-                )
-            })
-    }
-
-    /// The Clarify bar: the agent needs more information before proposing.
-    fn clarify_bar(&self, ws: &S::Workspace, p: Palette) -> impl IntoElement {
-        let mut bar = div()
-            .flex_none()
-            .p_2()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .border_t_1()
-            .border_color(p.border)
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(p.warning)
-                    .child(self.tr("shell.clarify_prompt")),
-            );
-
-        for (i, question) in ws.clarify_questions().iter().enumerate() {
-            bar = bar.child(div().text_sm().text_color(p.fg).child(format!(
-                "{}. {}",
-                i + 1,
-                question
-            )));
-        }
-
-        bar
-    }
-
-    /// The approval bar: the plan failed verification and waits on the user.
-    fn plan_decision_bar(&self, ws: &S::Workspace, p: Palette) -> impl IntoElement {
-        let mut bar = div()
-            .flex_none()
-            .p_2()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
-            .border_t_1()
-            .border_color(p.border)
-            .child(
-                div()
-                    .flex_1()
-                    .text_xs()
-                    .text_color(p.warning)
-                    .child(self.trf(
-                        "shell.plan_rejected",
-                        &[("index", ws.plan_phase().label(self.locale))],
-                    )),
-            );
-
-        for (label, decision) in [
-            (self.tr("shell.accept"), PlanDecision::Accept),
-            (self.tr("shell.reject"), PlanDecision::Reject),
-            (self.tr("shell.modify"), PlanDecision::Modify),
-        ] {
-            let callback = self.on_plan_decision.clone();
-            let session_id = ws.session_id().clone();
-            bar = bar.child(
-                div()
-                    .id(format!("harness-plan-decision-{label}"))
-                    .px_2()
-                    .py_1()
-                    .rounded(px(4.0))
-                    .border_1()
-                    .border_color(p.border)
-                    .cursor_pointer()
-                    .text_xs()
-                    .child(label)
-                    .on_click(move |_, _, _| {
-                        if let Some(callback) = callback.clone() {
-                            (callback.borrow())(&session_id, decision);
-                        }
-                    }),
-            );
-        }
-
-        // Settlement items the product reports (per-feature accept/reject).
-        let settlement = ws.settlement_items();
-        if !settlement.is_empty() {
-            bar = bar.child(
-                div()
-                    .flex_none()
-                    .text_xs()
-                    .text_color(p.muted)
-                    .child(self.tr("shell.itemized")),
-            );
-            for (name, accepted) in settlement {
-                let color = if accepted { p.success } else { p.danger };
-                bar = bar.child(
-                    div()
-                        .id(format!("harness-settlement-{name}"))
-                        .px_2()
-                        .py_1()
-                        .rounded(px(4.0))
-                        .border_1()
-                        .border_color(color)
-                        .cursor_pointer()
-                        .text_xs()
-                        .text_color(color)
-                        .child(format!("{} {}", if accepted { "✓" } else { "✗" }, name))
-                        .on_click(move |_, _, _| {}),
-                );
-            }
-        }
-        bar
+            .child(self.render_stream(cx))
+            .child(self.activity_bar(ws, cx))
+            .child(self.composer_area(ws, cx))
     }
 
     /// The open project has no sessions yet: the session list is empty and there
@@ -2205,36 +2096,6 @@ fn settings_panel<S: SessionView>(
 }
 
 
-fn plan_rows(plan: &[PlanStep], p: Palette, locale: Locale) -> impl IntoElement {
-    let mut rows = div().flex().flex_col().gap_1();
-    for step in plan {
-        let color = step_color(step.status, p);
-        rows = rows.child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .child(
-                    div()
-                        .w(px(8.))
-                        .h(px(8.))
-                        .flex_none()
-                        .rounded(px(4.))
-                        .bg(color),
-                )
-                .child(div().flex_1().text_sm().child(step.text.clone()))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(p.muted)
-                        .child(step.status.label(locale)),
-                ),
-        );
-    }
-    rows
-}
-
 impl<S: SessionView> Render for HarnessShell<S> {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
@@ -2249,6 +2110,8 @@ impl<S: SessionView> Render for HarnessShell<S> {
         if !self.transcript.reconcile(conversation).is_empty() {
             self.stream.set_entries(self.transcript.entries());
         }
+        // A session that has gone idle gets the next message it was holding.
+        self.drain_queues();
         let window_width = f32::from(window.viewport_size().width);
         self.layout.observe(window_width);
         let regions = self.layout.regions(window_width, self.has_right_dock());
@@ -2352,6 +2215,18 @@ impl<S: SessionView> Render for HarnessShell<S> {
             .on_action(cx.listener(|this: &mut Self, _: &ToggleDock, window, cx| {
                 this.toggle_dock(f32::from(window.viewport_size().width));
                 cx.notify();
+            }))
+            .on_action(cx.listener(|this: &mut Self, _: &CyclePermissionMode, _window, cx| {
+                this.cycle_permission_mode();
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this: &mut Self, _: &StopTurn, _window, cx| {
+                // Escape with nothing running is for whatever else wants it.
+                if this.stop_turn() {
+                    cx.notify();
+                } else {
+                    cx.propagate();
+                }
             }))
             // A divider drag is followed here, at the root, so it keeps going
             // wherever the pointer is.

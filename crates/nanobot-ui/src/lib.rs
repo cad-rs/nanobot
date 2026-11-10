@@ -22,6 +22,8 @@
 //! read derives from, and [`shell::HarnessShell::set_settings`] registers the
 //! settings panel that persists the choice through `ui.theme`.
 
+pub mod activity;
+pub mod composer;
 pub mod i18n;
 pub mod icons;
 pub mod layout;
@@ -46,8 +48,15 @@ pub use transcript::{
     ToolStatus, Transcript, TurnPhase,
 };
 pub use layout::{Divider, Fold, Layout, LayoutState, Regions, Stacked};
-pub use shell::{init, HarnessShell, ToggleDock, ToggleSidebar, KEY_CONTEXT};
+pub use shell::{
+    init, CyclePermissionMode, HarnessShell, StopTurn, ToggleDock, ToggleSidebar, KEY_CONTEXT,
+};
 pub use stream::{Row, RowKey, RowKind, StreamState};
+pub use activity::{Submitted, PERMISSION_MODE_KEY};
+pub use composer::{
+    Approval, ApprovalDecision, ApprovalScope, ContextLevel, Delivery, MessageQueue, PermissionMode,
+    Queued, Submit,
+};
 pub use i18n::{t, t_replace, Locale};
 pub use icons::{Assets, Icon};
 pub use theme::{
@@ -878,6 +887,224 @@ mod tests {
                 assert_eq!(shell.stream().is_expanded(keys[1]), round == 0);
             });
         }
+    }
+
+    // ---- the composer, the queue and approvals ----
+
+    type Sent = Rc<RefCell<Vec<(String, String, Delivery)>>>;
+
+    /// A shell on `sessions` that records every message the product is sent.
+    fn recording_shell(sessions: Vec<TestSession>) -> (HarnessShell<TestSession>, Sent) {
+        let sent: Sent = Rc::new(RefCell::new(Vec::new()));
+        let mut shell = HarnessShell::new(one_project(sessions));
+        let log = sent.clone();
+        shell.set_on_message_sent(move |id, text, delivery| {
+            log.borrow_mut()
+                .push((id.as_str().to_string(), text.to_string(), delivery));
+        });
+        (shell, sent)
+    }
+
+    fn texts(sent: &Sent) -> Vec<(String, Delivery)> {
+        sent.borrow()
+            .iter()
+            .map(|(_, text, delivery)| (text.clone(), *delivery))
+            .collect()
+    }
+
+    #[test]
+    fn a_message_to_an_idle_session_is_sent() {
+        let (mut shell, sent) = recording_shell(vec![TestSession::new("s1")]);
+        assert_eq!(shell.submit_message("  cut holes \n", false), Some(Submitted::Sent(Delivery::Send)));
+        assert_eq!(texts(&sent), [("cut holes".to_string(), Delivery::Send)], "trimmed");
+        assert_eq!(shell.submit_message("   ", false), None, "nothing to send");
+        assert_eq!(sent.borrow().len(), 1);
+    }
+
+    #[test]
+    fn while_the_agent_works_a_message_queues_and_goes_out_when_it_is_done() {
+        let live = Rc::new(RefCell::new(Conversation::default()));
+        let running = |status| TestSession {
+            status,
+            live: Some(live.clone()),
+            ..TestSession::new("s1")
+        };
+        let (mut shell, sent) = recording_shell(vec![running(SessionStatus::Running)]);
+        assert_eq!(shell.submit_message("then chamfer", false), Some(Submitted::Queued));
+        assert_eq!(shell.submit_message("and fillet", false), Some(Submitted::Queued));
+        assert!(sent.borrow().is_empty(), "held, not sent");
+        assert_eq!(shell.queued_messages().len(), 2);
+
+        shell.drain_queues();
+        assert!(sent.borrow().is_empty(), "the turn is still running");
+
+        // Sent at once instead: it goes into the running turn.
+        assert_eq!(
+            shell.submit_message("stop, wrong face", true),
+            Some(Submitted::Sent(Delivery::Steer))
+        );
+        assert_eq!(texts(&sent), [("stop, wrong face".to_string(), Delivery::Steer)]);
+
+        // The turn ends: one queued message per turn, in order.
+        let s1 = SessionId::new("s1");
+        shell.update_session_content(&s1, running(SessionStatus::Idle));
+        shell.refresh_workspace();
+        shell.drain_queues();
+        shell.drain_queues();
+        assert_eq!(texts(&sent)[1], ("then chamfer".to_string(), Delivery::Send));
+        assert_eq!(sent.borrow().len(), 2, "the second waits for the next turn");
+
+        shell.update_session_content(&s1, running(SessionStatus::Running));
+        shell.refresh_workspace();
+        shell.drain_queues();
+        shell.update_session_content(&s1, running(SessionStatus::Idle));
+        shell.refresh_workspace();
+        shell.drain_queues();
+        assert_eq!(texts(&sent)[2], ("and fillet".to_string(), Delivery::Send));
+        assert!(shell.queued_messages().is_empty());
+    }
+
+    #[test]
+    fn a_queued_message_can_be_taken_back_or_sent_now() {
+        let (mut shell, sent) = recording_shell(vec![with_status("s1", SessionStatus::Running)]);
+        shell.submit_message("first", false);
+        shell.submit_message("second", false);
+        let ids: Vec<u64> = shell.queued_messages().iter().map(|m| m.id).collect();
+
+        assert_eq!(shell.take_queued(ids[0]).as_deref(), Some("first"), "to edit or drop");
+        assert!(shell.send_queued_now(ids[1]));
+        assert_eq!(texts(&sent), [("second".to_string(), Delivery::Steer)]);
+        assert!(shell.queued_messages().is_empty());
+        assert!(!shell.send_queued_now(ids[1]), "it is gone");
+    }
+
+    /// A session stopped on a tool call that waits for approval.
+    fn waiting_session() -> TestSession {
+        TestSession {
+            status: SessionStatus::AwaitingUser,
+            conversation: Conversation::from_entries(vec![
+                Entry::user(1, "move the holes"),
+                Entry::tool(
+                    2,
+                    ToolCall::new(ToolKind::Edit, "move_pattern(1.5)", ToolStatus::AwaitingApproval),
+                ),
+            ]),
+            ..TestSession::new("s1")
+        }
+    }
+
+    type Decisions = Rc<RefCell<Vec<(u64, ApprovalDecision)>>>;
+
+    fn approving_shell() -> (HarnessShell<TestSession>, Sent, Decisions) {
+        let (mut shell, sent) = recording_shell(vec![waiting_session()]);
+        let decisions: Decisions = Rc::new(RefCell::new(Vec::new()));
+        let log = decisions.clone();
+        shell.set_on_approval(move |_, seq, decision| log.borrow_mut().push((seq, decision)));
+        (shell, sent, decisions)
+    }
+
+    #[test]
+    fn an_approval_is_answered_with_one_of_three_decisions() {
+        let (mut shell, _sent, decisions) = approving_shell();
+        let approval = shell.pending_approval().expect("the edit is waiting");
+        assert_eq!((approval.seq, approval.title.as_str()), (2, "move_pattern(1.5)"));
+        assert_eq!(shell.turn_phase(), TurnPhase::AwaitingApproval);
+
+        assert!(shell.decide_approval(ApprovalDecision::AllowOnce));
+        assert!(shell.decide_approval(ApprovalDecision::AllowAlways(ApprovalScope::Session)));
+        assert!(shell.decide_approval(ApprovalDecision::Reject { feedback: None }));
+        assert_eq!(
+            *decisions.borrow(),
+            [
+                (2, ApprovalDecision::AllowOnce),
+                (2, ApprovalDecision::AllowAlways(ApprovalScope::Session)),
+                (2, ApprovalDecision::Reject { feedback: None }),
+            ]
+        );
+
+        let (mut idle, _) = recording_shell(vec![TestSession::new("s1")]);
+        assert!(!idle.decide_approval(ApprovalDecision::AllowOnce), "nothing is waiting");
+    }
+
+    #[test]
+    fn typing_while_an_approval_waits_refuses_it_with_what_was_typed() {
+        let (mut shell, sent, decisions) = approving_shell();
+        assert_eq!(
+            shell.submit_message("no, move them 3 mm instead", false),
+            Some(Submitted::Refused)
+        );
+        assert!(sent.borrow().is_empty(), "it is an answer, not a new message");
+        assert_eq!(
+            *decisions.borrow(),
+            [(
+                2,
+                ApprovalDecision::Reject {
+                    feedback: Some("no, move them 3 mm instead".to_string())
+                }
+            )]
+        );
+        assert!(shell.queued_messages().is_empty(), "and nothing was queued");
+    }
+
+    #[test]
+    fn a_queued_message_never_approves_a_waiting_call() {
+        // Queued while the turn ran; the turn then stopped on an approval.
+        let (mut shell, sent) = recording_shell(vec![with_status("s1", SessionStatus::Running)]);
+        let decisions: Decisions = Rc::new(RefCell::new(Vec::new()));
+        let log = decisions.clone();
+        shell.set_on_approval(move |_, seq, decision| log.borrow_mut().push((seq, decision)));
+        shell.submit_message("then chamfer", false);
+
+        let s1 = SessionId::new("s1");
+        shell.update_session_content(&s1, waiting_session());
+        shell.refresh_workspace();
+        shell.drain_queues();
+        assert!(sent.borrow().is_empty(), "the queue holds while the user is asked");
+        assert!(decisions.borrow().is_empty(), "and decides nothing");
+        assert_eq!(shell.queued_messages().len(), 1);
+    }
+
+    #[test]
+    fn stopping_asks_the_product_only_while_a_turn_is_in_progress() {
+        let stopped = Rc::new(RefCell::new(0));
+        let count = stopped.clone();
+        let mut shell = HarnessShell::new(one_project(vec![with_status(
+            "s1",
+            SessionStatus::Running,
+        )]));
+        shell.set_on_stop(move |_| *count.borrow_mut() += 1);
+        assert!(shell.stop_turn());
+        assert_eq!(*stopped.borrow(), 1);
+
+        let mut idle = HarnessShell::new(one_project(vec![TestSession::new("s1")]));
+        let count = stopped.clone();
+        idle.set_on_stop(move |_| *count.borrow_mut() += 1);
+        assert!(!idle.stop_turn(), "nothing to stop");
+        assert_eq!(*stopped.borrow(), 1);
+    }
+
+    #[test]
+    fn the_permission_dial_is_remembered_and_reported() {
+        use std::sync::{Arc, Mutex};
+
+        let settings = Arc::new(Mutex::new(nanobot_boot::Settings::in_memory()));
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let log = seen.clone();
+        let mut shell = HarnessShell::new(two_project_store());
+        shell.set_settings(Some(Arc::clone(&settings)));
+        shell.set_on_permission_mode(move |mode| log.borrow_mut().push(mode));
+        assert_eq!(shell.permission_mode(), PermissionMode::Ask, "asking is the default");
+
+        shell.cycle_permission_mode();
+        shell.cycle_permission_mode();
+        assert_eq!(shell.permission_mode(), PermissionMode::PlanOnly);
+        assert_eq!(*seen.borrow(), [PermissionMode::AcceptLowRisk, PermissionMode::PlanOnly]);
+        shell.set_permission_mode(PermissionMode::PlanOnly);
+        assert_eq!(seen.borrow().len(), 2, "no change, nothing to report");
+
+        let mut next = HarnessShell::new(two_project_store());
+        next.set_settings(Some(settings));
+        assert_eq!(next.permission_mode(), PermissionMode::PlanOnly, "restored at launch");
     }
 
     // ---- panel host ----

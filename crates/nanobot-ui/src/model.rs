@@ -226,6 +226,14 @@ pub trait WorkspaceView: Clone + 'static {
     fn settlement_items(&self) -> Vec<(String, bool)> {
         Vec::new()
     }
+    /// The model the session runs on, as the line under the composer names it.
+    fn model_label(&self) -> Option<String> {
+        None
+    }
+    /// The share of the context window in use, 0 to 1, when the product knows.
+    fn context_usage(&self) -> Option<f32> {
+        None
+    }
     /// Where the turn stands. A product whose agent reports its own phase
     /// overrides this; the default reads it off the plan phase and the status,
     /// which cannot tell a pending approval from a pending question.
