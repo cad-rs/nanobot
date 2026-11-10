@@ -83,6 +83,8 @@ actions!(
         StopTurn,
         /// Opens the command palette.
         OpenPalette,
+        /// Opens the settings dialog.
+        OpenSettings,
         /// Starts a new session.
         NewSession,
         /// Goes to the next session in the sidebar.
@@ -139,6 +141,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("shift-tab", CyclePermissionMode, Some(KEY_CONTEXT)),
         KeyBinding::new("escape", StopTurn, Some(KEY_CONTEXT)),
         KeyBinding::new("ctrl-k", OpenPalette, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-,", OpenSettings, Some(KEY_CONTEXT)),
         KeyBinding::new("ctrl-n", NewSession, Some(KEY_CONTEXT)),
         KeyBinding::new("ctrl-tab", NextSession, Some(KEY_CONTEXT)),
         KeyBinding::new("ctrl-shift-tab", PreviousSession, Some(KEY_CONTEXT)),
@@ -268,6 +271,8 @@ pub struct HarnessShell<S: SessionView> {
     pub(crate) on_anchor: Option<RenameCallback>,
     pub(crate) on_delete: Option<ArchiveCallback>,
     pub(crate) session_menu: Option<crate::session_menu::SessionMenu>,
+    /// Whether the settings dialog is open.
+    pub(crate) settings_open: bool,
     /// Callback invoked when the user decides a contingent plan.
     pub(crate) on_plan_decision: Option<PlanDecisionCallback>,
     /// Undo/redo and container save/load/import: the app layer forwards them to
@@ -290,9 +295,9 @@ pub struct HarnessShell<S: SessionView> {
     selected_block: Option<u64>,
     /// Product panels and script-plugin panels.
     panel_host: PanelHost<S>,
-    /// The user settings store, when the app layer shared it. Presence is
-    /// what registers the framework's settings panel and makes theme choices
-    /// persist; without it the theme still switches, in memory only.
+    /// The user settings store, when the app layer shared it. With it, what
+    /// the settings dialog changes persists; without it the changes still
+    /// apply, in memory only.
     pub(crate) settings: Option<Arc<Mutex<Settings>>>,
     /// The theme the shell renders in. Tracked so a toggle knows its
     /// starting point even without a settings store.
@@ -313,7 +318,7 @@ pub struct HarnessShell<S: SessionView> {
     /// The UI locale every string in this shell renders in: a user setting
     /// (`ui.locale`), defaulted from the harness profile.
     pub(crate) locale: Locale,
-    /// The settings panel's font-family input, created on first show.
+    /// The settings dialog's font-family input, created on first show.
     font_input: Rc<RefCell<Option<Entity<InputState>>>>,
     _font_input_sub: Rc<RefCell<Option<Subscription>>>,
     /// How the window is divided: the saved preference and what the window's
@@ -385,6 +390,7 @@ impl<S: SessionView> HarnessShell<S> {
             on_anchor: None,
             on_delete: None,
             session_menu: None,
+            settings_open: false,
             on_message_sent: None,
             on_plan_decision: None,
             sidebar_projection: None,
@@ -419,8 +425,7 @@ impl<S: SessionView> HarnessShell<S> {
         let open = shell.store.borrow().open_project_id().clone();
         shell.expanded_projects.insert(open);
         // Framework chrome: the diagnostics panel is always there (it reads
-        // nothing but shell state), the settings panel joins when the app
-        // layer shares a store.
+        // nothing but shell state).
         shell.panel_host.register(PanelDef::product(
             "harness.diagnostics",
             shell.tr("shell.diagnostics"),
@@ -684,11 +689,9 @@ impl<S: SessionView> HarnessShell<S> {
         self.on_import = Some(Rc::new(RefCell::new(callback)));
     }
 
-    /// Shares the harness's user settings with the shell. Presence registers
-    /// the framework's settings panel (bottom dock: theme choice, settings
-    /// file path) and makes theme choices persist through `ui.theme`; the
-    /// sidebar's gear button becomes a theme quick-toggle either way.
-    /// Registering twice adds nothing.
+    /// Shares the harness's user settings with the shell: the layout, the
+    /// language, the permission dial and the motion switch are read from it,
+    /// and what the settings dialog changes is written back to it.
     pub fn set_settings(&mut self, settings: Option<Arc<Mutex<Settings>>>) {
         if let Some(store) = &settings {
             self.theme =
@@ -710,21 +713,6 @@ impl<S: SessionView> HarnessShell<S> {
                     .get(crate::motion::REDUCE_MOTION_KEY)
                     .and_then(|value| value.as_bool())
                     .unwrap_or(false);
-            }
-            const SETTINGS_PANEL_ID: &str = "harness.settings";
-            if !self
-                .panel_host
-                .panels()
-                .iter()
-                .any(|panel| panel.id == SETTINGS_PANEL_ID)
-            {
-                self.panel_host.register(PanelDef::product(
-                    SETTINGS_PANEL_ID,
-                    self.tr("shell.settings"),
-                    PanelArea::Bottom,
-                    0,
-                    Rc::new(settings_panel),
-                ));
             }
         }
         self.settings = settings;
@@ -751,7 +739,7 @@ impl<S: SessionView> HarnessShell<S> {
     }
 
     /// The UI locale. Switch it with [`HarnessShell::set_locale`] (the
-    /// settings panel does, through `ui.locale`).
+    /// settings dialog does, through `ui.locale`).
     pub fn locale(&self) -> Locale {
         self.locale
     }
@@ -761,7 +749,7 @@ impl<S: SessionView> HarnessShell<S> {
         self.locale = locale;
     }
 
-    /// The settings panel's font input handle (the panel creates it on
+    /// The settings dialog's font input handle (the dialog creates it on
     /// first show).
     pub fn font_input(&self) -> Rc<RefCell<Option<Entity<InputState>>>> {
         self.font_input.clone()
@@ -771,7 +759,7 @@ impl<S: SessionView> HarnessShell<S> {
         self._font_input_sub.clone()
     }
 
-    /// Writes one font setting and re-themes the window. The settings panel
+    /// Writes one font setting and re-themes the window. The settings dialog
     /// is the only caller today; the app layer applies the stored fonts at
     /// launch through [`crate::theme::apply_font`].
     fn set_font_setting(
@@ -1595,11 +1583,9 @@ impl<S: SessionView> HarnessShell<S> {
                     .p_1()
                     .rounded(px(4.))
                     .cursor_pointer()
-                    .on_click(cx.listener(move |shell, _event, window, cx| {
-                        // The gear is the theme quick-toggle; the settings
-                        // panel (bottom dock) is the explicit surface.
-                        let next = shell.theme().toggled();
-                        shell.switch_theme(next, window, cx);
+                    .on_click(cx.listener(move |shell, _event, _window, cx| {
+                        shell.open_settings();
+                        cx.notify();
                     }))
                     .child(
                         sized(Icon::Settings, 16., p.muted),
@@ -1989,12 +1975,10 @@ fn diagnostics_panel<S: SessionView>(
         .into_any_element()
 }
 
-/// The framework's settings panel body, registered by
-/// [`HarnessShell::set_settings`]: the theme choice plus the settings file
-/// path. The dock region supplies the captioned chrome around it.
-fn settings_panel<S: SessionView>(
+/// What the settings dialog holds: theme, motion, language, font, and where
+/// the settings file is.
+pub(crate) fn settings_body<S: SessionView>(
     shell: &HarnessShell<S>,
-    _workspace: &S::Workspace,
     window: &mut Window,
     cx: &mut Context<HarnessShell<S>>,
 ) -> AnyElement {
@@ -2109,15 +2093,14 @@ fn settings_panel<S: SessionView>(
     div()
         .flex()
         .flex_col()
-        .gap_1()
-        .px_1()
+        .gap_3()
         .child(
             div()
                 .flex()
                 .flex_row()
                 .items_center()
                 .gap_2()
-                .child(div().text_xs().text_color(p.muted).child(shell.tr("settings.theme")))
+                .child(div().w(px(96.)).flex_none().text_sm().text_color(p.muted).child(shell.tr("settings.theme")))
                 .child(theme_button(ThemeKind::Dark, shell.tr("settings.theme_dark"), cx))
                 .child(theme_button(ThemeKind::Light, shell.tr("settings.theme_light"), cx)),
         )
@@ -2127,7 +2110,7 @@ fn settings_panel<S: SessionView>(
                 .flex_row()
                 .items_center()
                 .gap_2()
-                .child(div().text_xs().text_color(p.muted).child(shell.tr("settings.motion")))
+                .child(div().w(px(96.)).flex_none().text_sm().text_color(p.muted).child(shell.tr("settings.motion")))
                 .child(motion_button(false, shell.tr("settings.motion_full"), cx))
                 .child(motion_button(true, shell.tr("settings.motion_reduced"), cx)),
         )
@@ -2137,7 +2120,7 @@ fn settings_panel<S: SessionView>(
                 .flex_row()
                 .items_center()
                 .gap_2()
-                .child(div().text_xs().text_color(p.muted).child(shell.tr("settings.locale")))
+                .child(div().w(px(96.)).flex_none().text_sm().text_color(p.muted).child(shell.tr("settings.locale")))
                 .child(locale_button(
                     Locale::ZhCn,
                     crate::i18n::t(Locale::ZhCn, "settings.locale.zh"),
@@ -2155,7 +2138,7 @@ fn settings_panel<S: SessionView>(
                 .flex_row()
                 .items_center()
                 .gap_2()
-                .child(div().text_xs().text_color(p.muted).child(shell.tr("settings.font")))
+                .child(div().w(px(96.)).flex_none().text_sm().text_color(p.muted).child(shell.tr("settings.font")))
                 .child(size_button(14.0, shell.tr("settings.font.small"), cx))
                 .child(size_button(16.0, shell.tr("settings.font.normal"), cx))
                 .child(size_button(18.0, shell.tr("settings.font.large"), cx)),
@@ -2166,7 +2149,7 @@ fn settings_panel<S: SessionView>(
                 .flex_row()
                 .items_center()
                 .gap_2()
-                .child(div().text_xs().text_color(p.muted).child(shell.tr("settings.font.family")))
+                .child(div().w(px(96.)).flex_none().text_sm().text_color(p.muted).child(shell.tr("settings.font.family")))
                 .child(
                     div()
                         .w(px(180.))
@@ -2325,7 +2308,11 @@ impl<S: SessionView> Render for HarnessShell<S> {
                 cx.notify();
             }))
             .on_action(cx.listener(|this: &mut Self, _: &StopTurn, _window, cx| {
-                // An open menu takes Escape first.
+                // An open menu or dialog takes Escape first.
+                if this.close_settings() {
+                    cx.notify();
+                    return;
+                }
                 if this.close_session_menu() {
                     cx.notify();
                     return;
@@ -2339,6 +2326,10 @@ impl<S: SessionView> Render for HarnessShell<S> {
             }))
             .on_action(cx.listener(|this: &mut Self, _: &OpenPalette, window, cx| {
                 this.open_palette(window, cx);
+            }))
+            .on_action(cx.listener(|this: &mut Self, _: &OpenSettings, _window, cx| {
+                this.open_settings();
+                cx.notify();
             }))
             .on_action(cx.listener(|this: &mut Self, _: &NewSession, window, cx| {
                 this.run_command_in(crate::palette::id::NEW_SESSION, window, cx);
@@ -2432,6 +2423,7 @@ impl<S: SessionView> Render for HarnessShell<S> {
             .child(body)
             .child(bottom)
             .children(self.session_menu_overlay(window, cx))
+            .children(self.settings_overlay(window, cx))
             .children(self.palette_overlay(cx))
     }
 }
