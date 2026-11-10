@@ -24,6 +24,7 @@ use gpui::{
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::StyledExt as _;
 
+use crate::i18n::Locale;
 use crate::icons::{icon, Icon};
 use crate::shell::{palette, HarnessShell, Palette};
 
@@ -98,20 +99,24 @@ pub struct SidebarInput<'a, S: SessionView> {
     /// The session on screen.
     pub active: Option<&'a SessionId>,
     pub now_ms: u64,
+    /// The language ages are written in.
+    pub locale: Locale,
 }
 
 /// How long ago `then_ms` was, as briefly as it reads: "now", "5m", "3h",
 /// "2d", "6w".
-pub fn age_label(now_ms: u64, then_ms: u64) -> String {
+pub fn age_label(locale: Locale, now_ms: u64, then_ms: u64) -> String {
     let minutes = now_ms.saturating_sub(then_ms) / 60_000;
-    match minutes {
-        0 => "now".to_string(),
-        1..=59 => format!("{minutes}m"),
-        60..=1439 => format!("{}h", minutes / 60),
-        1440..=20_159 => format!("{}d", minutes / 1440),
-        _ => format!("{}w", minutes / 10_080),
-    }
+    let (key, count) = match minutes {
+        0 => return crate::i18n::t(locale, "age.now").to_string(),
+        1..=59 => ("age.minutes", minutes),
+        60..=1439 => ("age.hours", minutes / 60),
+        1440..=20_159 => ("age.days", minutes / 1440),
+        _ => ("age.weeks", minutes / 10_080),
+    };
+    crate::i18n::t_replace(locale, key, &[("count", &count.to_string())])
 }
+
 
 /// Where a badge puts a session in its project: wanting the user, running,
 /// everything else.
@@ -183,7 +188,7 @@ pub fn rows<S: SessionView>(input: &SidebarInput<'_, S>) -> Vec<SidebarRow> {
             badge: badge_of(session),
             age: session
                 .last_active_ms()
-                .map(|then| age_label(input.now_ms, then)),
+                .map(|then| age_label(input.locale, input.now_ms, then)),
             forked: session.branch_marker().is_some(),
             plan: plan_progress(&session.plan()),
             active: input.active == Some(session.id()),
@@ -295,6 +300,7 @@ impl<S: SessionView> HarnessShell<S> {
             unread: &self.unread.borrow(),
             active: self.active_session_id(),
             now_ms: nanobot_boot::account::now_ms(),
+            locale: self.locale,
         })
     }
 
@@ -601,6 +607,7 @@ impl<S: SessionView> HarnessShell<S> {
         // Where the keyboard is: an outline, so it reads apart from the
         // session on screen (a fill).
         let outline = if selected { p.accent } else { gpui::transparent_black() };
+        let still = self.still(cx);
         match row {
             SidebarRow::Project {
                 id,
@@ -718,6 +725,19 @@ impl<S: SessionView> HarnessShell<S> {
                     .filter(|renaming| &renaming.id == id)
                     .map(|renaming| renaming.input.clone());
                 let dot = badge_color(*badge, p);
+                // What the session is doing, in a box of one size: running
+                // turns, waiting breathes, the rest is a plain dot.
+                let plain_dot = |color: Hsla| div().size(px(8.)).rounded(px(4.)).bg(color);
+                let status_mark = match (*badge, dot) {
+                    (SessionBadge::Running, Some(color)) => {
+                        Some(crate::motion::spinner(("session-spin", ix), 10., color, still))
+                    }
+                    (SessionBadge::AwaitingUser, Some(color)) => {
+                        Some(crate::motion::pulse(("session-wait", ix), plain_dot(color), still))
+                    }
+                    (_, Some(color)) => Some(plain_dot(color).into_any_element()),
+                    (_, None) => None,
+                };
                 let group = gpui::SharedString::from(format!("harness-session-{ix}"));
                 let archive = self.on_archive.is_some().then(|| {
                     let session = id.clone();
@@ -769,11 +789,12 @@ impl<S: SessionView> HarnessShell<S> {
                             .gap_2()
                             .child(
                                 div()
-                                    .w(px(8.))
-                                    .h(px(8.))
+                                    .size(px(10.))
                                     .flex_none()
-                                    .rounded(px(4.))
-                                    .when_some(dot, |d, color| d.bg(color)),
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .children(status_mark),
                             )
                             .child(match renaming {
                                 Some(input) => div()
@@ -989,6 +1010,7 @@ mod tests {
                 unread: &self.unread,
                 active: self.active.as_ref(),
                 now_ms: NOW,
+                locale: Locale::En,
             })
         }
     }
@@ -1253,15 +1275,17 @@ mod tests {
     #[test]
     fn ages_read_briefly() {
         const MIN: u64 = 60_000;
-        assert_eq!(age_label(NOW, NOW), "now");
-        assert_eq!(age_label(NOW, NOW - 59_000), "now");
-        assert_eq!(age_label(NOW, NOW - 5 * MIN), "5m");
-        assert_eq!(age_label(NOW, NOW - 59 * MIN), "59m");
-        assert_eq!(age_label(NOW, NOW - HOUR), "1h");
-        assert_eq!(age_label(NOW, NOW - 23 * HOUR), "23h");
-        assert_eq!(age_label(NOW, NOW - 24 * HOUR), "1d");
-        assert_eq!(age_label(NOW, NOW - 13 * 24 * HOUR), "13d");
-        assert_eq!(age_label(NOW, NOW - 14 * 24 * HOUR), "2w");
-        assert_eq!(age_label(NOW, NOW + HOUR), "now", "a clock that ran back");
+        assert_eq!(age_label(Locale::En, NOW, NOW), "now");
+        assert_eq!(age_label(Locale::En, NOW, NOW - 59_000), "now");
+        assert_eq!(age_label(Locale::En, NOW, NOW - 5 * MIN), "5m");
+        assert_eq!(age_label(Locale::En, NOW, NOW - 59 * MIN), "59m");
+        assert_eq!(age_label(Locale::En, NOW, NOW - HOUR), "1h");
+        assert_eq!(age_label(Locale::En, NOW, NOW - 23 * HOUR), "23h");
+        assert_eq!(age_label(Locale::En, NOW, NOW - 24 * HOUR), "1d");
+        assert_eq!(age_label(Locale::En, NOW, NOW - 13 * 24 * HOUR), "13d");
+        assert_eq!(age_label(Locale::En, NOW, NOW - 14 * 24 * HOUR), "2w");
+        assert_eq!(age_label(Locale::En, NOW, NOW + HOUR), "now", "a clock that ran back");
+        assert_eq!(age_label(Locale::ZhCn, NOW, NOW), "刚刚");
+        assert_eq!(age_label(Locale::ZhCn, NOW, NOW - 3 * HOUR), "3 小时");
     }
 }

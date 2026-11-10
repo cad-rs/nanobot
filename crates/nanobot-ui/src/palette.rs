@@ -44,6 +44,7 @@ pub mod id {
     pub const STOP_TURN: &str = "shell.stop_turn";
     pub const JUMP_TO_END: &str = "shell.jump_to_end";
     pub const TOGGLE_THEME: &str = "shell.toggle_theme";
+    pub const TOGGLE_MOTION: &str = "shell.toggle_motion";
     /// Prefix of "switch to this session"; the session's id follows.
     pub const SWITCH_SESSION: &str = "shell.switch_session:";
 }
@@ -78,6 +79,14 @@ impl<S: SessionView> HarnessShell<S> {
             Command::new(id::PREVIOUS_SESSION, self.tr("command.previous_session"))
                 .with_keys("Ctrl+Shift+Tab"),
             Command::new(id::TOGGLE_THEME, self.tr("command.toggle_theme")),
+            Command::new(
+                id::TOGGLE_MOTION,
+                self.tr(if self.reduce_motion() {
+                    "command.restore_motion"
+                } else {
+                    "command.reduce_motion"
+                }),
+            ),
         ];
         if self.on_new_session.is_some() {
             commands.insert(
@@ -129,6 +138,7 @@ impl<S: SessionView> HarnessShell<S> {
             id::JUMP_TO_END => self.stream().follow(),
             id::STOP_TURN => return self.stop_turn(),
             id::TOGGLE_THEME => self.wants_theme_toggle = true,
+            id::TOGGLE_MOTION => self.set_reduce_motion(!self.reduce_motion()),
             id::NEW_SESSION => match self.on_new_session.clone() {
                 Some(callback) => callback(),
                 None => return false,

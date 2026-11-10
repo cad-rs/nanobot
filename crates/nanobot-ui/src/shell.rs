@@ -219,6 +219,8 @@ pub struct HarnessShell<S: SessionView> {
     pub(crate) on_permission_mode: Option<PermissionModeCallback>,
     /// How much the agent may do unasked.
     pub(crate) permission_mode: PermissionMode,
+    /// The shell's own "reduce motion" switch (`ui.reduce_motion`).
+    pub(crate) reduce_motion: bool,
     /// Messages held until a session's turn ends, per session.
     pub(crate) queues: HashMap<SessionId, MessageQueue>,
     /// What is unfolded in the activity bar.
@@ -339,6 +341,7 @@ impl<S: SessionView> HarnessShell<S> {
             on_approval: None,
             on_permission_mode: None,
             permission_mode: PermissionMode::default(),
+            reduce_motion: false,
             queues: HashMap::new(),
             plan_open: false,
             queue_open: true,
@@ -682,6 +685,10 @@ impl<S: SessionView> HarnessShell<S> {
                 self.permission_mode = PermissionMode::from_code(
                     &store.get_str(crate::activity::PERMISSION_MODE_KEY, ""),
                 );
+                self.reduce_motion = store
+                    .get(crate::motion::REDUCE_MOTION_KEY)
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false);
             }
             const SETTINGS_PANEL_ID: &str = "harness.settings";
             if !self
@@ -1325,6 +1332,20 @@ impl<S: SessionView> HarnessShell<S> {
                     .truncate()
                     .child(title),
             )
+            // What the turn is doing right now, then the session's status.
+            .children(workspace.and_then(|_| {
+                let phase = self.turn_phase();
+                let color = match crate::motion::Mark::of_turn(phase) {
+                    crate::motion::Mark::Pulse => p.warning,
+                    _ => p.info,
+                };
+                crate::motion::mark(
+                    crate::motion::Mark::of_turn(phase),
+                    "harness-turn-mark",
+                    color,
+                    self.still(cx),
+                )
+            }))
             .when_some(status, |d, status| {
                 d.child(badge(status.label(self.locale), session_color(status, p)))
             })
@@ -1724,7 +1745,7 @@ impl<S: SessionView> HarnessShell<S> {
                     self.panel_host.product_element(panel, self, window, cx)
                 }
                 crate::panels::PanelSource::Script(script) => {
-                    self.panel_host.script_element(&panel.id, script, window, cx)
+                    self.panel_host.script_element(&panel.id, script, self.locale, window, cx)
                 }
             };
             let p = palette(cx);
@@ -1974,6 +1995,20 @@ fn settings_panel<S: SessionView>(
             )
         };
 
+    let motion_button = |reduce: bool, label: &'static str, cx: &mut Context<HarnessShell<S>>| {
+        let color = if shell.reduce_motion() == reduce { p.accent } else { p.muted };
+        crate::widgets::button(
+            if reduce { "harness-motion-reduced" } else { "harness-motion-full" },
+            label,
+            color,
+            cx,
+            cx.listener(move |shell, _event, _window, cx| {
+                shell.set_reduce_motion(reduce);
+                cx.notify();
+            }),
+        )
+    };
+
     let locale_button = |locale: Locale,
                          label: &'static str,
                          cx: &mut Context<HarnessShell<S>>| {
@@ -2064,6 +2099,16 @@ fn settings_panel<S: SessionView>(
                 .child(div().text_xs().text_color(p.muted).child(shell.tr("settings.theme")))
                 .child(theme_button(ThemeKind::Dark, shell.tr("settings.theme_dark"), cx))
                 .child(theme_button(ThemeKind::Light, shell.tr("settings.theme_light"), cx)),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(div().text_xs().text_color(p.muted).child(shell.tr("settings.motion")))
+                .child(motion_button(false, shell.tr("settings.motion_full"), cx))
+                .child(motion_button(true, shell.tr("settings.motion_reduced"), cx)),
         )
         .child(
             div()

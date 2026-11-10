@@ -77,6 +77,8 @@ icons! {
     ChevronRight => "chevron-right",
     ChevronDown => "chevron-down",
     ArrowDown => "arrow-down",
+    // motion
+    Spinner => "spinner",
     // the conversation
     Thinking => "thinking",
     Plan => "plan",

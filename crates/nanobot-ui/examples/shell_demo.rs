@@ -526,24 +526,41 @@ fn main() {
                 shell.set_on_rename(|id, title| log::info!("rename {id} to {title}"));
                 shell.set_on_archive(|id| log::info!("archive {id}"));
                 shell.set_on_permission_mode(|mode| log::info!("permission mode: {mode:?}"));
-                // The running session's answer arrives a little every tick,
-                // ends, rests, and starts over.
-                let (answer, sent) = (long_answer(), std::cell::Cell::new(0usize));
+                // The running session thinks, runs a tool, then its answer
+                // arrives a little every tick, ends, rests, and starts over.
+                const THINK: usize = 50; // ticks: two seconds
+                const TOOL: usize = 100;
+                let (answer, tick) = (long_answer(), std::cell::Cell::new(0usize));
                 let stream = streaming.clone();
                 nanobot_ui::poll_periodically(
                     cx,
                     std::time::Duration::from_millis(40),
                     move |_, cx| {
                         let total = answer.chars().count();
-                        let now = sent.get() + 12;
-                        sent.set(if now > total + 12 * 150 { 0 } else { now });
-                        let text: String = answer.chars().take(now.min(total)).collect();
+                        let at = tick.get() + 1;
+                        let written = at.saturating_sub(TOOL) * 12;
+                        tick.set(if written > total + 12 * 150 { 0 } else { at });
                         let mut entries = vec![Entry::user(1, "给法兰布置螺栓孔，逐个说明。")];
-                        if now >= total {
-                            entries.push(Entry::assistant(2, text));
-                            entries.push(Entry::turn_end(3, "用时 15 秒"));
+                        let thought = "先看法兰的外径和螺栓圆直径。";
+                        if at < THINK {
+                            entries.push(Entry::thinking(2, thought, None));
                         } else {
-                            entries.push(Entry::assistant_streaming(2, text));
+                            entries.push(Entry::thinking(2, thought, Some(2_000)));
+                            let status =
+                                if at < TOOL { ToolStatus::Running } else { ToolStatus::Done };
+                            entries.push(Entry::tool(
+                                3,
+                                ToolCall::new(ToolKind::Read, "read_feature(Flange1)", status),
+                            ));
+                        }
+                        if at >= TOOL {
+                            let text: String = answer.chars().take(written.min(total)).collect();
+                            if written >= total {
+                                entries.push(Entry::assistant(4, text));
+                                entries.push(Entry::turn_end(5, "用时 15 秒"));
+                            } else {
+                                entries.push(Entry::assistant_streaming(4, text));
+                            }
                         }
                         stream.borrow_mut().entries = entries;
                         cx.notify();

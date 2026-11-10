@@ -27,6 +27,7 @@ use gpui_component::ActiveTheme as _;
 use crate::i18n::Locale;
 use crate::icons::{icon, Icon};
 use crate::model::{PlanStep, SessionView, StepStatus};
+use crate::motion::{self, Mark};
 use crate::shell::{badge, palette, HarnessShell, Palette};
 use crate::transcript::{Entry, EntryKind, ToolCall, ToolKind, ToolStatus};
 
@@ -511,6 +512,8 @@ impl<S: SessionView> HarnessShell<S> {
         });
         let mono = cx.theme().mono_font_family.clone();
         let rewindable = self.on_rewind.is_some();
+        let still = self.still(cx);
+        let is_last = ix + 1 == self.stream.rows().len();
 
         let body = match row.kind {
             RowKind::User { text } => div()
@@ -536,7 +539,7 @@ impl<S: SessionView> HarnessShell<S> {
                 .when(self.rewinding == Some(key.seq), |d| d.border_color(p.info))
                 .child(text)
                 .into_any_element(),
-            RowKind::Markdown { text, .. } => {
+            RowKind::Markdown { text, streaming } => {
                 let state = match self.stream.cells.get(&key) {
                     Some(state) => state.clone(),
                     None => {
@@ -551,9 +554,19 @@ impl<S: SessionView> HarnessShell<S> {
                     .px_3()
                     .text_sm()
                     .child(TextView::new(&state).selectable(true))
+                    // The answer is still being written.
+                    .when(streaming, |d| {
+                        d.flex().flex_col().gap_1().child(motion::dots(
+                            ("answer-dots", ix),
+                            p.muted,
+                            still,
+                        ))
+                    })
                     .into_any_element()
             }
             RowKind::Thinking { text, duration_ms } => {
+                let thinking_now =
+                    duration_ms.is_none() && is_last && self.turn_phase().is_busy();
                 let label = match duration_ms {
                     Some(ms) => format!("{} · {}", self.tr("entry.thinking"), duration_label(ms)),
                     None => self.tr("entry.thinking").to_string(),
@@ -575,7 +588,13 @@ impl<S: SessionView> HarnessShell<S> {
                             .on_mouse_down(MouseButton::Left, toggle)
                             .child(icon(Icon::chevron(open), p.muted))
                             .child(icon(Icon::Thinking, p.muted))
-                            .child(label),
+                            // Still thinking: the label stands in for the
+                            // thought to come.
+                            .child(if thinking_now {
+                                motion::shimmer(("thinking-label", ix), div().child(label), still)
+                            } else {
+                                div().child(label).into_any_element()
+                            }),
                     )
                     .when(open, |d| {
                         d.child(
@@ -622,6 +641,12 @@ impl<S: SessionView> HarnessShell<S> {
                             })
                             .child(icon(lead, p.muted))
                             .child(div().flex_1().min_w_0().truncate().child(summary))
+                            .children(motion::mark(
+                                Mark::of_tool(status),
+                                ("tools-mark", ix),
+                                tool_color(status, p),
+                                still,
+                            ))
                             .when(status != ToolStatus::Done, |d| {
                                 d.child(
                                     div()
@@ -729,6 +754,12 @@ impl<S: SessionView> HarnessShell<S> {
                                     .font_family(mono.clone())
                                     .child(call.title.clone()),
                             )
+                            .children(motion::mark(
+                                Mark::of_tool(call.status),
+                                ("card-mark", ix),
+                                color,
+                                still,
+                            ))
                             .child(badge(call.status.label(self.locale), color)),
                     )
                     .when_some(call.input.clone().filter(|_| open), |d, input| {

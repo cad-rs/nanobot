@@ -167,6 +167,15 @@ const MESSAGES: &[Msg] = &[
     ("command.next_session", "下一个会话", "Next session"),
     ("command.previous_session", "上一个会话", "Previous session"),
     ("command.toggle_theme", "切换明暗主题", "Toggle light and dark theme"),
+    ("command.reduce_motion", "减少动效", "Reduce motion"),
+    ("command.restore_motion", "恢复动效", "Restore motion"),
+    ("age.now", "刚刚", "now"),
+    ("age.minutes", "{count} 分钟", "{count}m"),
+    ("age.hours", "{count} 小时", "{count}h"),
+    ("age.days", "{count} 天", "{count}d"),
+    ("age.weeks", "{count} 周", "{count}w"),
+    ("panel.script_load_failed", "脚本面板加载失败：{error}", "The script panel failed to load: {error}"),
+    ("panel.script_view_failed", "脚本视图错误：{error}", "Script view error: {error}"),
     ("command.new_session", "新建会话", "New session"),
     ("command.stop_turn", "停止当前回合", "Stop the turn"),
     ("command.switch_session", "切换到会话：{title}", "Go to session: {title}"),
@@ -231,6 +240,9 @@ const MESSAGES: &[Msg] = &[
     ("settings.locale.en", "英文", "English"),
     ("settings.theme_dark", "深色", "Dark"),
     ("settings.theme_light", "浅色", "Light"),
+    ("settings.motion", "动效", "Motion"),
+    ("settings.motion_full", "完整", "Full"),
+    ("settings.motion_reduced", "减少", "Reduced"),
     (
         "settings.memory_mode",
         "内存模式（未连接设置存储）",
@@ -301,5 +313,36 @@ mod tests {
         assert_eq!(out, "会话 · 3（12 个）");
         let out = t_replace(Locale::En, "shell.sessions", &[("count", "3"), ("total", "12")]);
         assert_eq!(out, "Sessions · 3 (12)");
+    }
+
+    /// Every key the shell asks for exists: a missing one would show its own
+    /// name on screen, and only on the screen that uses it.
+    #[test]
+    fn every_key_the_sources_ask_for_is_in_the_table() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let known: std::collections::HashSet<&str> = MESSAGES.iter().map(|(k, _, _)| *k).collect();
+        let mut asked = 0;
+        for file in std::fs::read_dir(dir).unwrap() {
+            let path = file.unwrap().path();
+            let source = std::fs::read_to_string(&path).unwrap();
+            // The table itself and the tests around it name keys that are
+            // not asked for.
+            if path.file_name().is_some_and(|name| name == "i18n.rs") {
+                continue;
+            }
+            for call in ["tr(\"", "trf(\"", "t(locale, \"", "t(self.locale, \"", "t_replace(locale, \""] {
+                for (at, _) in source.match_indices(call) {
+                    let rest = &source[at + call.len()..];
+                    let key = &rest[..rest.find('"').unwrap()];
+                    // A key is dotted lowercase; anything else is not one.
+                    if !key.contains('.') || key.contains(' ') {
+                        continue;
+                    }
+                    asked += 1;
+                    assert!(known.contains(key), "{key} is used in {} but not translated", path.display());
+                }
+            }
+        }
+        assert!(asked > 50, "the scan found the calls ({asked})");
     }
 }

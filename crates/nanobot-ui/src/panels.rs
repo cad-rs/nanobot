@@ -14,6 +14,7 @@ use std::rc::Rc;
 
 use gpui::{AnyElement, App, Context, IntoElement, ParentElement as _, Styled as _, Window};
 
+use crate::i18n::Locale;
 use crate::model::SessionView;
 use crate::shell::HarnessShell;
 
@@ -198,9 +199,13 @@ impl ScriptRuntime {
     }
 
     /// The panel's element, or an error placeholder. Empty while not mounted.
-    pub fn element(&self, id: &str) -> AnyElement {
+    pub fn element(&self, id: &str, locale: Locale, cx: &App) -> AnyElement {
+        let danger = gpui_component::ActiveTheme::theme(cx).danger;
         if let Some(error) = self.errors.get(id) {
-            return error_box(format!("脚本面板加载失败：{error}"));
+            return error_box(
+                crate::i18n::t_replace(locale, "panel.script_load_failed", &[("error", error)]),
+                danger,
+            );
         }
         let Some(handle) = self.views.get(id) else {
             return gpui::div().into_any_element();
@@ -210,12 +215,15 @@ impl ScriptRuntime {
                 Some(host) => host.container(item),
                 None => item,
             },
-            Err(e) => error_box(format!("脚本视图错误：{e}")),
+            Err(e) => error_box(
+                crate::i18n::t_replace(locale, "panel.script_view_failed", &[("error", &e.to_string())]),
+                danger,
+            ),
         }
     }
 }
 
-fn error_box(message: String) -> AnyElement {
+fn error_box(message: String, color: gpui::Hsla) -> AnyElement {
     gpui::div()
         .flex()
         .flex_col()
@@ -224,7 +232,7 @@ fn error_box(message: String) -> AnyElement {
         .size_full()
         .p_2()
         .text_xs()
-        .text_color(gpui::red())
+        .text_color(color)
         .child(message)
         .into_any_element()
 }
@@ -356,11 +364,12 @@ impl<S: SessionView> PanelHost<S> {
         &self,
         id: &str,
         script: &Path,
+        locale: Locale,
         window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
         self.scripts.borrow_mut().mount(id, script, window, cx);
-        self.scripts.borrow().element(id)
+        self.scripts.borrow().element(id, locale, cx)
     }
 
     /// Renders a product panel.

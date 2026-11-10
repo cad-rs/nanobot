@@ -29,6 +29,7 @@ pub mod i18n;
 pub mod icons;
 pub mod layout;
 pub mod model;
+pub mod motion;
 pub mod palette;
 pub mod panels;
 pub mod poll;
@@ -66,6 +67,7 @@ pub use commands::{Candidate, Command, RewindMode, Selection, Trigger};
 pub use i18n::{t, t_replace, Locale};
 pub use palette::Completion;
 pub use icons::{Assets, Icon};
+pub use motion::{Mark, REDUCE_MOTION_KEY};
 pub use theme::{
     apply, apply_font, apply_from_settings, set_theme, ThemeKind, FONT_FAMILY_KEY,
     FONT_MONO_FAMILY_KEY, FONT_SIZE_KEY, LOCALE_KEY, THEME_KEY,
@@ -1914,5 +1916,67 @@ mod tests {
             !shell.plugins().unwrap().iter().find(|e| e.id == "acme.chart").unwrap().enabled,
             "the user's disable survives a snapshot refresh"
         );
+    }
+
+    // ---- motion ----
+
+    #[test]
+    fn reducing_motion_is_remembered() {
+        let mut shell = HarnessShell::new(two_project_store());
+        assert!(!shell.reduce_motion(), "motion is on until someone turns it down");
+
+        let settings = std::sync::Arc::new(std::sync::Mutex::new(nanobot_boot::Settings::in_memory()));
+        shell.set_settings(Some(settings.clone()));
+        let reduce = |shell: &HarnessShell<TestSession>| {
+            shell
+                .commands()
+                .iter()
+                .find(|command| command.id == crate::palette::id::TOGGLE_MOTION)
+                .map(|command| command.title.clone())
+                .unwrap()
+        };
+        let before = reduce(&shell);
+        assert!(shell.run_command(crate::palette::id::TOGGLE_MOTION, 1400.));
+        assert!(shell.reduce_motion());
+        assert_ne!(reduce(&shell), before, "the command now offers the way back");
+        assert_eq!(
+            settings.lock().unwrap().get(crate::REDUCE_MOTION_KEY),
+            Some(&serde_json::json!(true))
+        );
+
+        // A shell that starts on those settings starts still.
+        let mut next = HarnessShell::new(two_project_store());
+        next.set_settings(Some(settings));
+        assert!(next.reduce_motion());
+    }
+
+    #[gpui::test]
+    fn every_mark_draws_moving_and_still(cx: &mut gpui::TestAppContext) {
+        let (shell, live, cx) = streaming_shell(cx);
+        *live.borrow_mut() = Conversation::from_entries(vec![
+            Entry::user(1, "cut four holes"),
+            Entry::tool(2, ToolCall::new(ToolKind::Read, "bracket.step", ToolStatus::Running)),
+            Entry::tool(
+                3,
+                ToolCall::new(ToolKind::Execute, "cargo test", ToolStatus::AwaitingApproval)
+                    .with_output("…"),
+            ),
+            Entry::tool(
+                4,
+                ToolCall::new(ToolKind::Execute, "cargo build", ToolStatus::Running)
+                    .with_output("Compiling"),
+            ),
+            Entry::assistant_streaming(5, "Cutting the first"),
+            Entry::thinking(6, "where does the fourth go", None),
+        ]);
+        redraw(&shell, cx);
+        // Time passes: the marks take their next frames.
+        cx.executor().advance_clock(std::time::Duration::from_millis(500));
+        redraw(&shell, cx);
+
+        shell.update(cx, |shell, _| shell.set_reduce_motion(true));
+        redraw(&shell, cx);
+        cx.executor().advance_clock(std::time::Duration::from_millis(500));
+        redraw(&shell, cx);
     }
 }

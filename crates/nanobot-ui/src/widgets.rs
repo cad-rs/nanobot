@@ -11,7 +11,7 @@
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, App, ClickEvent, ElementId, Hsla, SharedString, Window, div, hsla,
+    AnyElement, App, ClickEvent, ElementId, Hsla, SharedString, Window, div,
     prelude::*, px,
 };
 use gpui_component::Sizable as _;
@@ -95,7 +95,8 @@ type PickHandler = Rc<dyn Fn(&HashedRef, &mut App) + 'static>;
 /// needs search or keyboard navigation, this is where `Select` comes in.
 ///
 /// `on_pick` decides what a choice means — the caller owns the panel — and whether
-/// to re-render. It is shared across the rows, so each row gets the same answer for
+/// to re-render. Colours come from the theme, so the picker reads in light and
+/// dark alike. `on_pick` is shared across the rows, so each row gets the same answer for
 /// the item it names.
 #[must_use]
 pub fn picker(
@@ -103,19 +104,22 @@ pub fn picker(
     chosen: Option<&HashedRef>,
     items: &[(String, String)],
     on_pick: PickHandler,
+    cx: &App,
 ) -> AnyElement {
+    let theme = gpui_component::ActiveTheme::theme(cx);
+    let (muted, chosen_color) = (theme.muted_foreground, theme.info);
     let mut column = div().flex().flex_col().gap_0p5().child(
         div()
             .text_xs()
-            .text_color(hsla(0.6, 0.1, 0.5, 1.0))
+            .text_color(muted)
             .child(label),
     );
     for item in items.iter().take(6).cloned() {
         let selected = chosen == Some(&item);
         let color = if selected {
-            hsla(0.6, 0.8, 0.6, 1.0)
+            chosen_color
         } else {
-            hsla(0.6, 0.1, 0.55, 1.0)
+            muted
         };
         let caption = format!("{} {}", item.0, short_hash(&item.1));
         let on_pick = Rc::clone(&on_pick);
