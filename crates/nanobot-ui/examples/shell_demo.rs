@@ -359,7 +359,9 @@ fn main() {
     let settings = Arc::new(Mutex::new(settings));
     let streaming = Rc::new(RefCell::new(Conversation::default()));
 
-    gpui_platform::application().run(move |cx: &mut App| {
+    // The shell's icons are served by its own asset source.
+    let app = gpui_platform::application().with_assets(nanobot_ui::Assets::new());
+    app.run(move |cx: &mut App| {
         gpui_component::init(cx);
         nanobot_ui::init(cx);
         let bounds = Bounds::centered(

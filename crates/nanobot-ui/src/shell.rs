@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 
 use gpui::{
     actions, FocusHandle, KeyBinding, MouseMoveEvent, MouseUpEvent,
-    div, img, prelude::*, px, AnyElement, App, Context, Div, Entity, Hsla, Stateful,
+    div, prelude::*, px, AnyElement, App, Context, Div, Entity, Hsla, Stateful,
     IntoElement,
     MouseButton, MouseDownEvent, Render, Subscription, Window,
 };
@@ -42,6 +42,7 @@ use crate::model::{
 };
 use crate::panels::{PanelArea, PanelDef, PanelHost};
 use crate::i18n::Locale;
+use crate::icons::{self, sized, Icon};
 use crate::layout::{Divider, Fold, Layout, LayoutState, Stacked};
 use crate::stream::StreamState;
 use crate::theme::ThemeKind;
@@ -1029,7 +1030,7 @@ impl<S: SessionView> HarnessShell<S> {
             .border_b_1()
             .border_color(p.border)
             .when(fold != Fold::Stacked, |d| {
-                d.child(toolbar_button("harness-toggle-sidebar", "sidebar").on_mouse_down(
+                d.child(toolbar_button("harness-toggle-sidebar", Icon::Sidebar, p.muted).on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this: &mut Self, _ev: &MouseDownEvent, window, cx| {
                         this.toggle_sidebar(f32::from(window.viewport_size().width));
@@ -1132,7 +1133,7 @@ impl<S: SessionView> HarnessShell<S> {
                     .child(self.file_ops_buttons(cx)),
             )
             .when(has_dock && fold != Fold::Stacked, |d| {
-                d.child(toolbar_button("harness-toggle-dock", "dock").on_mouse_down(
+                d.child(toolbar_button("harness-toggle-dock", Icon::Dock, p.muted).on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this: &mut Self, _ev: &MouseDownEvent, window, cx| {
                         this.toggle_dock(f32::from(window.viewport_size().width));
@@ -1164,9 +1165,7 @@ impl<S: SessionView> HarnessShell<S> {
             .items_center()
             .gap_1()
             .child(
-                img(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/undo.svg"))
-                    .w(px(14.))
-                    .h(px(14.)),
+                icons::icon(Icon::Undo, p.fg),
             )
             .child(self.tr("shell.undo"))
             .on_click(move |_, _, _| {
@@ -1191,9 +1190,7 @@ impl<S: SessionView> HarnessShell<S> {
             .items_center()
             .gap_1()
             .child(
-                img(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/redo.svg"))
-                    .w(px(14.))
-                    .h(px(14.)),
+                icons::icon(Icon::Redo, p.fg),
             )
             .child(self.tr("shell.redo"))
             .on_click(move |_, _, _| {
@@ -1217,7 +1214,7 @@ impl<S: SessionView> HarnessShell<S> {
             .on_save
             .clone()
             .unwrap_or_else(|| Rc::new(RefCell::new(|_: &SessionId| {})));
-        let save_btn = header_button("harness-save", self.tr("shell.save"), p.border)
+        let save_btn = header_button("harness-save", Icon::Save, self.tr("shell.save"), p.fg, p.border)
             .on_click(move |_, _, _| {
                 save_cb.borrow()(&sid_save);
             });
@@ -1227,7 +1224,7 @@ impl<S: SessionView> HarnessShell<S> {
             .on_load
             .clone()
             .unwrap_or_else(|| Rc::new(RefCell::new(|_: &SessionId| {})));
-        let load_btn = header_button("harness-load", self.tr("shell.load"), p.border)
+        let load_btn = header_button("harness-load", Icon::Load, self.tr("shell.load"), p.fg, p.border)
             .on_click(move |_, _, _| {
                 load_cb.borrow()(&sid_load);
             });
@@ -1237,7 +1234,7 @@ impl<S: SessionView> HarnessShell<S> {
             .on_import
             .clone()
             .unwrap_or_else(|| Rc::new(RefCell::new(|_: &SessionId| {})));
-        let import_btn = header_button("harness-import", self.tr("shell.import"), p.border)
+        let import_btn = header_button("harness-import", Icon::Import, self.tr("shell.import"), p.fg, p.border)
             .on_click(move |_, _, _| {
                 import_cb.borrow()(&sid_import);
             });
@@ -1421,19 +1418,6 @@ impl<S: SessionView> HarnessShell<S> {
             .child(div().flex_1())
             .child(
                 div()
-                    .id("harness-mobile-toggle")
-                    .p_1()
-                    .rounded(px(4.))
-                    .cursor_pointer()
-                    .on_click(move |_, _, _| {})
-                    .child(
-                        img(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/mobile.svg"))
-                            .w(px(16.))
-                            .h(px(16.)),
-                    ),
-            )
-            .child(
-                div()
                     .id("harness-settings")
                     .p_1()
                     .rounded(px(4.))
@@ -1445,9 +1429,7 @@ impl<S: SessionView> HarnessShell<S> {
                         shell.switch_theme(next, window, cx);
                     }))
                     .child(
-                        img(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/settings.svg"))
-                            .w(px(16.))
-                            .h(px(16.)),
+                        sized(Icon::Settings, 16., p.muted),
                     ),
             )
     }
@@ -1553,7 +1535,7 @@ impl<S: SessionView> HarnessShell<S> {
                     .items_center()
                     .gap_2()
                     .when_some(branch, |d, _marker| {
-                        d.child(div().text_xs().text_color(p.info).child("↧".to_string()))
+                        d.child(icons::icon(Icon::Branch, p.info))
                     })
                     .child(
                         div()
@@ -1854,7 +1836,13 @@ impl<S: SessionView> HarnessShell<S> {
 }
 
 /// A header icon button (save / load / import).
-fn header_button(id: &'static str, label: &'static str, border: Hsla) -> Stateful<Div> {
+fn header_button(
+    id: &'static str,
+    icon: Icon,
+    label: &'static str,
+    color: Hsla,
+    border: Hsla,
+) -> Stateful<Div> {
     div()
         .id(id)
         .text_sm()
@@ -1867,24 +1855,10 @@ fn header_button(id: &'static str, label: &'static str, border: Hsla) -> Statefu
         .flex_row()
         .items_center()
         .gap_1()
-        .child(img(assets::icon(id)).w(px(14.)).h(px(14.)))
+        .child(icons::icon(icon, color))
         .child(label)
 }
 
-/// Asset paths, kept in one place so the header buttons stay declarative.
-mod assets {
-    pub fn icon(id: &str) -> String {
-        let name = match id {
-            "harness-save" => "save",
-            "harness-load" => "load",
-            "harness-import" => "import",
-            "sidebar" => "sidebar",
-            "dock" => "dock",
-            _ => "settings",
-        };
-        format!("{}/assets/{name}.svg", env!("CARGO_MANIFEST_DIR"))
-    }
-}
 
 /// The avatar letter the account chip shows: the display name's first
 /// character (`U` for the empty name, matching the placeholder the chip
@@ -2423,13 +2397,13 @@ impl<S: SessionView> Render for HarnessShell<S> {
 }
 
 /// A toolbar button that is only an icon.
-fn toolbar_button(id: &'static str, icon: &'static str) -> Stateful<Div> {
+fn toolbar_button(id: &'static str, icon: Icon, color: Hsla) -> Stateful<Div> {
     div()
         .id(id)
         .p_1()
         .rounded(px(4.))
         .cursor_pointer()
-        .child(img(assets::icon(icon)).w(px(16.)).h(px(16.)))
+        .child(sized(icon, 16., color))
 }
 
 /// A toolbar button that is only a word.

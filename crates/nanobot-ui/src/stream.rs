@@ -25,6 +25,7 @@ use gpui_component::text::{TextView, TextViewState};
 use gpui_component::ActiveTheme as _;
 
 use crate::i18n::Locale;
+use crate::icons::{icon, Icon};
 use crate::model::{PlanStep, SessionView, StepStatus};
 use crate::shell::{badge, palette, HarnessShell, Palette};
 use crate::transcript::{Entry, EntryKind, ToolCall, ToolKind, ToolStatus};
@@ -323,11 +324,12 @@ impl StreamState {
     }
 }
 
-/// What a run of one-line tool calls amounts to: its title alone for one, the
+/// What a run of one-line tool calls amounts to: its title for one (the row
+/// leads with the kind's icon), the
 /// count per kind for more ("read ×3 · search ×2"), in the order met.
 pub fn tools_summary(calls: &[(u64, ToolCall)], locale: Locale) -> String {
     if let [(_, call)] = calls {
-        return format!("{} {}", kind_label(call.kind, locale), call.title);
+        return call.title.clone();
     }
     let mut counts: Vec<(ToolKind, usize)> = Vec::new();
     for (_, call) in calls {
@@ -422,15 +424,6 @@ fn step_color(status: StepStatus, p: Palette) -> Hsla {
     }
 }
 
-/// The "▸ / ▾" a foldable row leads with.
-fn chevron(open: bool) -> &'static str {
-    if open {
-        "▾"
-    } else {
-        "▸"
-    }
-}
-
 impl<S: SessionView> HarnessShell<S> {
     /// The conversation stream: the list, and the way back to its end once the
     /// user has scrolled away from it.
@@ -475,6 +468,11 @@ impl<S: SessionView> HarnessShell<S> {
                         .text_xs()
                         .text_color(p.muted)
                         .cursor_pointer()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .child(icon(Icon::ArrowDown, p.muted))
                         .child(self.tr("stream.jump_to_end"))
                         .on_mouse_down(
                             MouseButton::Left,
@@ -530,10 +528,10 @@ impl<S: SessionView> HarnessShell<S> {
                     .into_any_element()
             }
             RowKind::Thinking { text, duration_ms } => {
-                let mut label = format!("{} {}", chevron(open), self.tr("entry.thinking"));
-                if let Some(ms) = duration_ms {
-                    label = format!("{label} · {}", duration_label(ms));
-                }
+                let label = match duration_ms {
+                    Some(ms) => format!("{} · {}", self.tr("entry.thinking"), duration_label(ms)),
+                    None => self.tr("entry.thinking").to_string(),
+                };
                 div()
                     .px_3()
                     .flex()
@@ -541,10 +539,16 @@ impl<S: SessionView> HarnessShell<S> {
                     .gap_1()
                     .child(
                         div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_1()
                             .text_xs()
                             .text_color(p.muted)
                             .cursor_pointer()
                             .on_mouse_down(MouseButton::Left, toggle)
+                            .child(icon(Icon::chevron(open), p.muted))
+                            .child(icon(Icon::Thinking, p.muted))
                             .child(label),
                     )
                     .when(open, |d| {
@@ -568,7 +572,11 @@ impl<S: SessionView> HarnessShell<S> {
                 let status = tools_status(&calls);
                 let summary = tools_summary(&calls, self.locale);
                 let foldable = calls.len() > 1 || calls.iter().any(|(_, c)| c.output.is_some());
-                let lead = if foldable { chevron(open) } else { "·" };
+                // A run leads with its fold mark; a single call with its kind.
+                let lead = match calls.as_slice() {
+                    [(_, call)] if !foldable => Icon::tool(call.kind),
+                    _ => Icon::chevron(open),
+                };
                 let locale = self.locale;
                 div()
                     .px_3()
@@ -586,7 +594,7 @@ impl<S: SessionView> HarnessShell<S> {
                             .when(foldable, |d| {
                                 d.cursor_pointer().on_mouse_down(MouseButton::Left, toggle)
                             })
-                            .child(lead)
+                            .child(icon(lead, p.muted))
                             .child(div().flex_1().min_w_0().truncate().child(summary))
                             .when(status != ToolStatus::Done, |d| {
                                 d.child(
@@ -615,9 +623,10 @@ impl<S: SessionView> HarnessShell<S> {
                                             div()
                                                 .flex()
                                                 .flex_row()
-                                                .gap_2()
+                                                .flex_row()
+                                                .items_center()
                                                 .text_color(p.muted)
-                                                .child(kind_label(call.kind, locale))
+                                                .child(icon(Icon::tool(call.kind), p.muted))
                                                 .child(
                                                     div()
                                                         .flex_1()
@@ -684,8 +693,8 @@ impl<S: SessionView> HarnessShell<S> {
                             .when(has_more, |d| {
                                 d.cursor_pointer().on_mouse_down(MouseButton::Left, toggle)
                             })
-                            .when(has_more, |d| d.child(chevron(open)))
-                            .child(div().text_color(p.muted).child(kind_label(call.kind, self.locale)))
+                            .when(has_more, |d| d.child(icon(Icon::chevron(open), p.muted)))
+                            .child(icon(Icon::tool(call.kind), p.muted))
                             .child(
                                 div()
                                     .flex_1()
@@ -746,6 +755,11 @@ impl<S: SessionView> HarnessShell<S> {
                     div()
                         .text_xs()
                         .text_color(p.muted)
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(icon(Icon::Plan, p.muted))
                         .child(self.tr("entry.plan")),
                 )
                 .children(steps.into_iter().map(|step| {
@@ -770,10 +784,10 @@ impl<S: SessionView> HarnessShell<S> {
                 passed,
                 details,
             } => {
-                let (mark, color) = if passed {
-                    (self.tr("check.passed"), p.success)
+                let (check_icon, color) = if passed {
+                    (Icon::CheckPass, p.success)
                 } else {
-                    (self.tr("check.failed"), p.danger)
+                    (Icon::CheckFail, p.danger)
                 };
                 let foldable = details.is_some();
                 div()
@@ -783,15 +797,16 @@ impl<S: SessionView> HarnessShell<S> {
                     .gap_1()
                     .child(
                         div()
-                            .flex()
+                            .flex_row()
+                            .items_center()
                             .flex_row()
                             .gap_2()
                             .text_xs()
                             .when(foldable, |d| {
                                 d.cursor_pointer().on_mouse_down(MouseButton::Left, toggle)
                             })
-                            .when(foldable, |d| d.child(div().text_color(p.muted).child(chevron(open))))
-                            .child(div().text_color(color).child(mark))
+                            .when(foldable, |d| d.child(icon(Icon::chevron(open), p.muted)))
+                            .child(icon(check_icon, color))
                             .child(div().flex_1().child(name)),
                     )
                     .when_some(details.filter(|_| open), |d, details| {
@@ -812,6 +827,11 @@ impl<S: SessionView> HarnessShell<S> {
                 .px_3()
                 .text_xs()
                 .text_color(p.muted)
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(icon(Icon::TurnEnd, p.muted))
                 .child(summary)
                 .into_any_element(),
             RowKind::Error { title, message } => div()
@@ -825,7 +845,17 @@ impl<S: SessionView> HarnessShell<S> {
                 .flex()
                 .flex_col()
                 .gap_1()
-                .child(div().text_sm().text_color(p.danger).child(title))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .text_sm()
+                        .text_color(p.danger)
+                        .child(icon(Icon::Error, p.danger))
+                        .child(title),
+                )
                 .child(div().text_xs().child(message))
                 .into_any_element(),
         };
@@ -847,8 +877,13 @@ impl<S: SessionView> HarnessShell<S> {
                             .px_2()
                             .rounded(px(3.))
                             .bg(p.info.opacity(0.16))
-                            .text_color(p.info)
                             .text_xs()
+                            .text_xs()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_1()
+                            .child(icon(Icon::Anchor, p.info))
                             .child(anchor),
                     ),
                 )
@@ -1061,7 +1096,7 @@ mod tests {
         let call = |kind, title: &str, status| (0, ToolCall::new(kind, title, status));
         let done = ToolStatus::Done;
         let one = [call(ToolKind::Read, "Body1.TopFace", done)];
-        assert_eq!(tools_summary(&one, Locale::En), "Read Body1.TopFace");
+        assert_eq!(tools_summary(&one, Locale::En), "Body1.TopFace");
         let run = [
             call(ToolKind::Read, "a", done),
             call(ToolKind::Search, "b", done),

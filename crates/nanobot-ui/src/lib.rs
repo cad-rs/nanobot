@@ -23,6 +23,7 @@
 //! settings panel that persists the choice through `ui.theme`.
 
 pub mod i18n;
+pub mod icons;
 pub mod layout;
 pub mod model;
 pub mod panels;
@@ -48,6 +49,7 @@ pub use layout::{Divider, Fold, Layout, LayoutState, Regions, Stacked};
 pub use shell::{init, HarnessShell, ToggleDock, ToggleSidebar, KEY_CONTEXT};
 pub use stream::{Row, RowKey, RowKind, StreamState};
 pub use i18n::{t, t_replace, Locale};
+pub use icons::{Assets, Icon};
 pub use theme::{
     apply, apply_font, apply_from_settings, set_theme, ThemeKind, FONT_FAMILY_KEY,
     FONT_MONO_FAMILY_KEY, FONT_SIZE_KEY, LOCALE_KEY, THEME_KEY,
