@@ -17,10 +17,10 @@
 //! [`shell::HarnessShell::panel_host`] and its renderer through
 //! [`nanobot_gpu::ViewportSlot`]. Nothing in this crate knows a domain word.
 //!
-//! The shell's chrome (dark/light theme, the settings panel) is framework
+//! The shell's chrome (dark/light theme, the settings dialog) is framework
 //! surface: [`theme`] switches the gpui-component global theme every palette
 //! read derives from, and [`shell::HarnessShell::set_settings`] registers the
-//! settings panel that persists the choice through `ui.theme`.
+//! settings dialog that persists the choice through `ui.theme`.
 
 pub mod activity;
 pub mod composer;
@@ -34,6 +34,7 @@ pub mod palette;
 pub mod panels;
 pub mod poll;
 pub mod session_menu;
+pub mod settings_dialog;
 pub mod shell;
 pub mod sidebar;
 pub mod stream;
@@ -1741,45 +1742,28 @@ mod tests {
     }
 
     #[test]
-    fn sharing_settings_registers_the_framework_settings_panel_once() {
+    fn sharing_settings_adds_no_panel_and_adopts_what_is_stored() {
         use std::sync::{Arc, Mutex};
 
         let mut shell = HarnessShell::new(two_project_store());
-        let before: Vec<String> = shell
-            .panel_host()
-            .panels_in(PanelArea::Bottom)
-            .iter()
-            .map(|panel| panel.id.clone())
-            .collect();
-        assert_eq!(
-            before,
-            vec!["harness.diagnostics".to_string()],
-            "the diagnostics panel is framework chrome, always present"
-        );
+        let bottom = |shell: &mut HarnessShell<TestSession>| -> Vec<String> {
+            shell
+                .panel_host()
+                .panels_in(PanelArea::Bottom)
+                .iter()
+                .map(|panel| panel.id.clone())
+                .collect()
+        };
+        assert_eq!(bottom(&mut shell), ["harness.diagnostics"]);
 
+        // Settings live in their dialog, not in the dock.
         let settings = Arc::new(Mutex::new(nanobot_boot::Settings::in_memory()));
-        shell.set_settings(Some(Arc::clone(&settings)));
-        let bottom: Vec<String> = shell
-            .panel_host()
-            .panels_in(PanelArea::Bottom)
-            .iter()
-            .map(|panel| panel.id.clone())
-            .collect();
-        assert_eq!(
-            bottom,
-            vec![
-                "harness.settings".to_string(),
-                "harness.diagnostics".to_string()
-            ],
-            "settings (order 0) lands before diagnostics (order 1)"
-        );
+        shell.set_settings(Some(settings));
+        assert_eq!(bottom(&mut shell), ["harness.diagnostics"]);
         assert!(shell.settings().is_some());
 
-        // Sharing again must not duplicate the panel.
-        shell.set_settings(Some(settings));
-        assert_eq!(shell.panel_host().panels_in(PanelArea::Bottom).len(), 2);
-
-        // A stored theme name becomes the shell's tracked theme; the panel
+        // A stored theme name becomes the shell's tracked theme; the dialog
+        // highlights it on the next frame.
         // highlights it on the next frame.
         let mut named = nanobot_boot::Settings::in_memory();
         named
@@ -2164,5 +2148,38 @@ mod tests {
         cx.simulate_keystrokes("ctrl-l");
         cx.simulate_input("add a rib");
         assert_eq!(composed(&shell, cx), "add a rib", "typing still reaches the session");
+    }
+
+    // ---- the settings dialog ----
+
+    #[test]
+    fn the_settings_dialog_opens_from_the_palette_and_closes() {
+        let mut shell = HarnessShell::new(two_project_store());
+        assert!(!shell.settings_is_open());
+        assert!(shell.commands().iter().any(|c| c.id == crate::palette::id::OPEN_SETTINGS));
+        assert!(shell.run_command(crate::palette::id::OPEN_SETTINGS, 1400.));
+        assert!(shell.settings_is_open());
+        assert!(shell.close_settings());
+        assert!(!shell.close_settings(), "it was closed already");
+
+        // One thing at a time is over the window.
+        shell.set_on_archive(|_| {});
+        shell.open_session_menu(SessionId::new("s2"), "session s2", (10., 10.));
+        shell.open_settings();
+        assert!(!shell.session_menu_is_open());
+    }
+
+    #[gpui::test]
+    fn the_settings_dialog_is_drawn_and_escape_closes_it(cx: &mut gpui::TestAppContext) {
+        let (shell, cx) = typing_shell(cx);
+        let settings = std::sync::Arc::new(std::sync::Mutex::new(nanobot_boot::Settings::in_memory()));
+        shell.update(cx, |shell, _| shell.set_settings(Some(settings)));
+        redraw(&shell, cx);
+        cx.simulate_keystrokes("ctrl-,");
+        redraw(&shell, cx);
+        assert!(shell.read_with(cx, |shell, _| shell.settings_is_open()));
+        cx.simulate_keystrokes("escape");
+        redraw(&shell, cx);
+        assert!(!shell.read_with(cx, |shell, _| shell.settings_is_open()));
     }
 }

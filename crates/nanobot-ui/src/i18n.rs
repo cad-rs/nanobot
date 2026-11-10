@@ -173,6 +173,7 @@ const MESSAGES: &[Msg] = &[
     ("command.next_session", "下一个会话", "Next session"),
     ("command.previous_session", "上一个会话", "Previous session"),
     ("command.toggle_theme", "切换明暗主题", "Toggle light and dark theme"),
+    ("command.open_settings", "打开设置", "Open settings"),
     ("command.reduce_motion", "减少动效", "Reduce motion"),
     ("command.toggle_tools", "展开或折叠全部工具输出", "Unfold or fold all tool output"),
     ("command.restore_motion", "恢复动效", "Restore motion"),
@@ -231,7 +232,7 @@ const MESSAGES: &[Msg] = &[
     ("diagnostics.settings_unconnected", "未连接", "not connected"),
     ("diagnostics.account", "账号", "Account"),
     ("diagnostics.guest", "访客", "Guest"),
-    // -- settings panel --
+    // -- settings dialog --
     ("settings.theme", "主题", "Theme"),
     ("settings.font", "字体", "Font"),
     ("settings.font.small", "小", "Small"),
