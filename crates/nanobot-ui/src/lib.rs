@@ -29,15 +29,20 @@ pub mod panels;
 pub mod poll;
 pub mod shell;
 pub mod theme;
+pub mod transcript;
 pub mod widgets;
 
 pub use model::{
-    plan_progress, resolve_sidebar_groups, Block, BlockKind, BranchMarker, Conversation,
+    is_archived, plan_progress, resolve_sidebar_groups, BranchMarker,
     PlanDecision, PlanPhase, PlanStep, Project, ProjectId, SessionId, SessionStatus, SessionStore,
-    SessionView, SidebarGroup, SidebarProjection, StepStatus, ToolState, WorkspaceView,
+    SessionView, SidebarGroup, SidebarProjection, StepStatus, WorkspaceView,
 };
 pub use panels::{Entitlements, PanelArea, PanelDef, PanelHost, PanelSource, ScriptRuntime};
 pub use poll::poll_periodically;
+pub use transcript::{
+    Change, ComposerAction, Conversation, Entry, EntryKind, SessionBadge, ToolCall, ToolKind,
+    ToolStatus, Transcript, TurnPhase,
+};
 pub use layout::{Divider, Fold, Layout, LayoutState, Regions, Stacked};
 pub use shell::{init, HarnessShell, ToggleDock, ToggleSidebar, KEY_CONTEXT};
 pub use i18n::{t, t_replace, Locale};
@@ -68,6 +73,7 @@ mod tests {
         clarify_questions: Vec<String>,
         parent_session: Option<SessionId>,
         parent_seq: Option<u32>,
+        archived: bool,
     }
 
     impl TestSession {
@@ -75,13 +81,14 @@ mod tests {
             Self {
                 id: SessionId::new(id),
                 title: format!("session {id}"),
-                status: SessionStatus::Active,
+                status: SessionStatus::Idle,
                 conversation: Conversation::default(),
                 plan: Vec::new(),
                 plan_phase: PlanPhase::None,
                 clarify_questions: Vec::new(),
                 parent_session: None,
                 parent_seq: None,
+                archived: false,
             }
         }
     }
@@ -187,6 +194,9 @@ mod tests {
         }
         fn clarify_questions(&self) -> Vec<String> {
             self.clarify_questions.clone()
+        }
+        fn archived(&self) -> bool {
+            self.archived
         }
         fn branch_marker(&self) -> Option<BranchMarker> {
             match (&self.parent_session, self.parent_seq) {
@@ -325,7 +335,7 @@ mod tests {
             vec![SessionId::new("s1"), SessionId::new("s2")],
             "entry order is the index's"
         );
-        assert_eq!(sessions[1].status, SessionStatus::AwaitingReview);
+        assert_eq!(sessions[1].status, SessionStatus::AwaitingUser);
         assert_eq!(
             store.open_project().session_index,
             Some(SessionId::new("s2")),
@@ -491,21 +501,169 @@ mod tests {
         assert!(PlanPhase::Clarify.awaits_decision());
         assert!(!PlanPhase::Proposed.awaits_decision());
         assert_eq!(
-            SessionStatus::AwaitingReview.label(crate::i18n::Locale::ZhCn),
-            "等待审查"
+            SessionStatus::AwaitingUser.label(crate::i18n::Locale::ZhCn),
+            "等待确认"
         );
         assert_eq!(
-            SessionStatus::AwaitingReview.label(crate::i18n::Locale::En),
-            "Awaiting review"
+            SessionStatus::AwaitingUser.label(crate::i18n::Locale::En),
+            "Needs you"
         );
+    }
 
-        let mut conversation = Conversation::default();
-        conversation.blocks.push(Block::new(BlockKind::User, 1, "hi"));
-        conversation.blocks.push(Block::new(BlockKind::Assistant, 2, "hello"));
-        assert!(conversation.anchors_are_monotonic());
-        assert_eq!(conversation.last_seq(), 2);
-        conversation.blocks[1].event_seq = 1;
-        assert!(!conversation.anchors_are_monotonic(), "anchors must strictly increase");
+
+    // ---- status, badges and the transcript ----
+
+    fn with_status(id: &str, status: SessionStatus) -> TestSession {
+        TestSession {
+            status,
+            ..TestSession::new(id)
+        }
+    }
+
+    fn one_project(sessions: Vec<TestSession>) -> SessionStore<TestSession> {
+        SessionStore::new(
+            vec![project("p1", sessions, Some("s1"))],
+            ProjectId::new("p1"),
+        )
+    }
+
+    #[test]
+    fn a_turn_that_ends_out_of_sight_leaves_the_session_unread() {
+        let mut shell = HarnessShell::new(one_project(vec![
+            TestSession::new("s1"),
+            with_status("s2", SessionStatus::Running),
+        ]));
+        let s2 = SessionId::new("s2");
+        let badge = |shell: &HarnessShell<TestSession>| {
+            let session = shell.store().session(&SessionId::new("s2")).cloned().unwrap();
+            shell.badge_of(&session)
+        };
+        assert_eq!(badge(&shell), SessionBadge::Running);
+
+        // Still running: an update is not an ending.
+        shell.update_session_content(&s2, with_status("s2", SessionStatus::Running));
+        assert_eq!(badge(&shell), SessionBadge::Running);
+
+        // It finishes while s1 is on screen.
+        shell.update_session_content(&s2, TestSession::new("s2"));
+        assert_eq!(badge(&shell), SessionBadge::Unread);
+        assert_eq!(shell.attention_count(), 0, "finished is not waiting for the user");
+
+        // Looking at it clears the mark, and it stays cleared.
+        shell.switch_session(&s2);
+        assert_eq!(badge(&shell), SessionBadge::None);
+        shell.switch_session(&SessionId::new("s1"));
+        assert_eq!(badge(&shell), SessionBadge::None);
+    }
+
+    #[test]
+    fn a_turn_that_ends_on_screen_is_not_unread() {
+        let shell = HarnessShell::new(one_project(vec![with_status(
+            "s1",
+            SessionStatus::Running,
+        )]));
+        let s1 = SessionId::new("s1");
+        shell.update_session_content(&s1, TestSession::new("s1"));
+        let session = shell.store().session(&s1).cloned().unwrap();
+        assert_eq!(shell.badge_of(&session), SessionBadge::None, "the user watched it end");
+    }
+
+    #[test]
+    fn a_turn_that_ends_in_an_error_or_a_question_says_so_instead() {
+        let shell = HarnessShell::new(one_project(vec![
+            TestSession::new("s1"),
+            with_status("s2", SessionStatus::Running),
+            with_status("s3", SessionStatus::Running),
+        ]));
+        shell.update_session_content(
+            &SessionId::new("s2"),
+            with_status("s2", SessionStatus::Error),
+        );
+        shell.update_session_content(
+            &SessionId::new("s3"),
+            with_status("s3", SessionStatus::AwaitingUser),
+        );
+        let badge = |id: &str| {
+            let session = shell.store().session(&SessionId::new(id)).cloned().unwrap();
+            shell.badge_of(&session)
+        };
+        assert_eq!(badge("s2"), SessionBadge::Error);
+        assert_eq!(badge("s3"), SessionBadge::AwaitingUser);
+        assert_eq!(shell.attention_count(), 2, "both want the user");
+    }
+
+    #[test]
+    fn archived_sessions_are_kept_but_not_listed_or_counted() {
+        let store = one_project(vec![
+            TestSession::new("s1"),
+            TestSession {
+                archived: true,
+                ..with_status("s2", SessionStatus::AwaitingUser)
+            },
+            with_status("s3", SessionStatus::AwaitingUser),
+        ]);
+        let groups = resolve_sidebar_groups(&store, None);
+        let listed: Vec<&str> = groups[0].1.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(listed, ["s1", "s3"]);
+        assert!(store.session(&SessionId::new("s2")).is_some(), "still in the project");
+
+        let shell = HarnessShell::new(store);
+        assert_eq!(shell.attention_count(), 1, "only s3: s2 is put away");
+
+        assert!(is_archived(nanobot_boot::container::SessionStatus::Archived));
+        assert!(!is_archived(nanobot_boot::container::SessionStatus::Active));
+        assert_eq!(
+            SessionStatus::from(nanobot_boot::container::SessionStatus::Archived),
+            SessionStatus::Idle,
+            "archived is a flag, not a status"
+        );
+    }
+
+    #[test]
+    fn the_turn_phase_defaults_from_the_plan_and_the_status() {
+        let phase = |status, plan_phase| {
+            let session = TestSession {
+                status,
+                plan_phase,
+                ..TestSession::new("s1")
+            };
+            HarnessShell::new(one_project(vec![session])).turn_phase()
+        };
+        assert_eq!(phase(SessionStatus::Idle, PlanPhase::None), TurnPhase::Idle);
+        assert_eq!(phase(SessionStatus::Running, PlanPhase::Executing), TurnPhase::Generating);
+        assert_eq!(phase(SessionStatus::Error, PlanPhase::None), TurnPhase::Error);
+        assert_eq!(
+            phase(SessionStatus::AwaitingUser, PlanPhase::Executing),
+            TurnPhase::AwaitingApproval
+        );
+        // The plan's own waits are more specific than the status.
+        assert_eq!(
+            phase(SessionStatus::AwaitingUser, PlanPhase::Clarify),
+            TurnPhase::AwaitingClarification
+        );
+        assert_eq!(
+            phase(SessionStatus::Running, PlanPhase::Contingent),
+            TurnPhase::AwaitingDecision
+        );
+    }
+
+    #[test]
+    fn switching_sessions_puts_that_sessions_conversation_on_screen() {
+        let talk = |id: &str, seqs: std::ops::RangeInclusive<u64>| TestSession {
+            conversation: Conversation::from_entries(
+                seqs.map(|seq| Entry::user(seq, format!("{id} {seq}"))).collect(),
+            ),
+            ..TestSession::new(id)
+        };
+        let mut shell = HarnessShell::new(one_project(vec![talk("s1", 1..=3), talk("s2", 10..=11)]));
+        let seqs = |shell: &HarnessShell<TestSession>| -> Vec<u64> {
+            shell.transcript().entries().iter().map(|entry| entry.seq).collect()
+        };
+        assert_eq!(seqs(&shell), [1, 2, 3], "the open session is on screen from the start");
+        shell.switch_session(&SessionId::new("s2"));
+        assert_eq!(seqs(&shell), [10, 11]);
+        shell.switch_session(&SessionId::new("s1"));
+        assert_eq!(seqs(&shell), [1, 2, 3]);
     }
 
     // ---- panel host ----
@@ -526,7 +684,7 @@ mod tests {
     #[test]
     fn the_badge_counts_other_sessions_waiting_for_the_user() {
         let waiting = |id: &str| TestSession {
-            status: SessionStatus::AwaitingReview,
+            status: SessionStatus::AwaitingUser,
             ..TestSession::new(id)
         };
         let store = SessionStore::new(

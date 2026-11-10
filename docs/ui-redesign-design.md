@@ -354,6 +354,18 @@
 
 `PanelHost`、`ViewportSlot`、`SidebarProjection` 的接口本次不动。
 
+### 实施记录（阶段 2 落地后）
+
+上表是开工前的设想，落地时有三处取舍与它不同：
+
+- **增量事件由壳对比得出，而不是由产品推送。** 产品仍然整份交出对话（`conversation()` 返回 `Conversation { entries }`）——它本来就是事件日志的投影，重新投影是产品最省事的路径。壳持有屏上的 `Transcript`，每次拿到新投影就按事件序号对比，归约成条目下标级的变更：`Updated(i)`、`Removed(range)`、`Appended { at, count }`。序号从头一致的部分里内容不同的算更新；从第一个不一致的下标起，旧的移除、新的追加。
+- **"完成未读"归壳，不归产品。** 产品的 `SessionStatus` 只有四态：空闲、运行中、等待用户、出错。"用户有没有看过"只有壳知道：一个会话在不在屏上时从运行中变为空闲，壳记它为未读，切过去即清除。侧栏徽标 `SessionBadge` 由两者合成五态。归档是独立的布尔属性（`SessionView::archived`），归档的会话不列出、不计入待处理。
+- **回合状态有默认推导。** `WorkspaceView::turn_phase()` 有默认实现，从计划阶段和状态推出六态；它分不清"等待批准"和"等待回答"，agent 自己报告阶段的产品应当覆盖它。发送按钮的三态（发送 / 排队 / 停止）已由 `TurnPhase::composer_action` 给出，阶段 4 接到界面上。
+
+对下游的破坏性改动：`Block` / `BlockKind` / `ToolState` 删除，换成 `Entry` / `EntryKind` / `ToolCall`（`ToolKind` + `ToolStatus`）；`Conversation.blocks` 改为 `entries`，`event_seq` 改为 `seq`，`selection_ref` 改为 `anchor`；`SessionStatus` 的变体改为 `Idle / Running / AwaitingUser / Error`，容器的 `Archived` 用 `is_archived()` 读成属性。
+
+外观在这一阶段没有变：每种条目仍画成"类型标签 + 序号 + 纯文本"，markdown 不渲染、思考不折叠、工具调用不分卡片与行内。这些是阶段 3 的内容；助手消息按块切分（验收第 2 项的结论）也在阶段 3 做，它是视图层的事，模型里一条助手消息仍是一个条目。
+
 ## 12. 实施顺序
 
 开工前先做四项最小验收，任何一项不通过都会改变后面的方案：

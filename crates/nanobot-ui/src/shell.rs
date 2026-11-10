@@ -18,7 +18,7 @@
 //! ```
 
 use std::cell::{Ref, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -37,13 +37,14 @@ use nanobot_boot::Settings;
 use nanobot_gpu::{ViewportProjection, ViewportSlot};
 
 use crate::model::{
-    plan_progress, Block, BlockKind, PlanDecision, PlanPhase, PlanStep, ProjectId,
-    SessionId, SessionStatus, SessionStore, SessionView, StepStatus, ToolState, WorkspaceView,
+    plan_progress, PlanDecision, PlanPhase, PlanStep, ProjectId,
+    SessionId, SessionStatus, SessionStore, SessionView, StepStatus, WorkspaceView,
 };
 use crate::panels::{PanelArea, PanelDef, PanelHost};
 use crate::i18n::Locale;
 use crate::layout::{Divider, Fold, Layout, LayoutState, Stacked};
 use crate::theme::ThemeKind;
+use crate::transcript::{EntryKind, SessionBadge, ToolStatus, Transcript, TurnPhase};
 
 
 
@@ -168,6 +169,11 @@ pub struct HarnessShell<S: SessionView> {
     /// Where the keyboard rests when nothing else holds the focus, so the
     /// shell's key bindings work before anything was clicked.
     focus_anchor: Option<FocusHandle>,
+    /// The active session's conversation as it is on screen, kept so a new
+    /// projection reduces to changes at entry indices.
+    transcript: Transcript,
+    /// Sessions that finished a turn while another was on screen.
+    unread: RefCell<HashSet<SessionId>>,
 }
 
 /// One script plugin as the plugins panel shows it.
@@ -214,6 +220,8 @@ impl<S: SessionView> HarnessShell<S> {
             layout: LayoutState::default(),
             dragging: None,
             focus_anchor: None,
+            transcript: Transcript::default(),
+            unread: RefCell::new(HashSet::new()),
         };
         // Framework chrome: the diagnostics panel is always there (it reads
         // nothing but shell state), the settings panel joins when the app
@@ -624,7 +632,38 @@ impl<S: SessionView> HarnessShell<S> {
     /// Updates a session's content from data loaded out of the session's event
     /// log. Called by the app layer when a session is activated.
     pub fn update_session_content(&self, id: &SessionId, session: S) -> bool {
+        // A turn that ends while the user is looking elsewhere leaves a mark
+        // in the sidebar until they come and see it.
+        let was_running = self
+            .store
+            .borrow()
+            .session(id)
+            .is_some_and(|old| old.status() == SessionStatus::Running);
+        let finished = was_running && session.status() == SessionStatus::Idle;
+        if finished && self.active_session_id() != Some(id) {
+            self.unread.borrow_mut().insert(id.clone());
+        }
         self.store.borrow_mut().update_session_content(id, session)
+    }
+
+    /// The mark `session` carries in the sidebar.
+    pub fn badge_of(&self, session: &S) -> SessionBadge {
+        SessionBadge::of(
+            session.status(),
+            self.unread.borrow().contains(session.id()),
+        )
+    }
+
+    /// Where the turn of the session on screen stands (`Idle` with none).
+    pub fn turn_phase(&self) -> TurnPhase {
+        self.workspace
+            .as_ref()
+            .map_or(TurnPhase::Idle, |ws| ws.turn_phase())
+    }
+
+    /// The conversation on screen.
+    pub fn transcript(&self) -> &Transcript {
+        &self.transcript
     }
 
     /// Hands a freshly baked scene to the active session's renderer.
@@ -688,7 +727,11 @@ impl<S: SessionView> HarnessShell<S> {
         };
         self.store.borrow_mut().set_session_index(id);
         let viewport = self.viewport_of(id);
-        self.workspace = Some(session.build_workspace(viewport));
+        let workspace = session.build_workspace(viewport);
+        self.transcript.reconcile(workspace.conversation());
+        self.workspace = Some(workspace);
+        // On screen now: it is no longer news.
+        self.unread.borrow_mut().remove(id);
         if let Some(ref callback) = self.on_session_activated {
             callback.borrow()(id);
         }
@@ -754,10 +797,30 @@ fn palette(cx: &App) -> Palette {
 
 fn session_color(status: SessionStatus, p: Palette) -> Hsla {
     match status {
-        SessionStatus::Active => p.success,
+        SessionStatus::Idle => p.muted,
         SessionStatus::Running => p.info,
-        SessionStatus::AwaitingReview => p.warning,
-        SessionStatus::Archived => p.muted,
+        SessionStatus::AwaitingUser => p.warning,
+        SessionStatus::Error => p.danger,
+    }
+}
+
+/// The mark a session row carries, if any: its words and its colour.
+fn badge_mark(badge: SessionBadge, locale: Locale, p: Palette) -> Option<(&'static str, Hsla)> {
+    match badge {
+        SessionBadge::AwaitingUser => Some((
+            SessionStatus::AwaitingUser.label(locale),
+            session_color(SessionStatus::AwaitingUser, p),
+        )),
+        SessionBadge::Error => Some((
+            SessionStatus::Error.label(locale),
+            session_color(SessionStatus::Error, p),
+        )),
+        SessionBadge::Running => Some((
+            SessionStatus::Running.label(locale),
+            session_color(SessionStatus::Running, p),
+        )),
+        SessionBadge::Unread => Some((crate::i18n::t(locale, "status.unread"), p.accent)),
+        SessionBadge::None => None,
     }
 }
 
@@ -769,21 +832,50 @@ fn step_color(status: StepStatus, p: Palette) -> Hsla {
     }
 }
 
-fn block_color(kind: BlockKind, p: Palette) -> Hsla {
-    match kind {
-        BlockKind::User => p.fg,
-        BlockKind::Assistant => p.info,
-        BlockKind::Tool => p.success,
-        BlockKind::Plan => p.warning,
-        BlockKind::Check => p.success,
+fn tool_color(status: ToolStatus, p: Palette) -> Hsla {
+    match status {
+        ToolStatus::AwaitingApproval => p.warning,
+        ToolStatus::Running => p.info,
+        ToolStatus::Done => p.success,
+        ToolStatus::Failed => p.danger,
+        ToolStatus::Cancelled | ToolStatus::Rejected => p.muted,
     }
 }
 
-fn tool_color(state: ToolState, p: Palette) -> Hsla {
-    match state {
-        ToolState::Running => p.info,
-        ToolState::Done => p.success,
-        ToolState::Failed => p.danger,
+/// The label an entry is headed with, and its colour.
+fn entry_head(kind: &EntryKind, locale: Locale, p: Palette) -> (&'static str, Hsla) {
+    let (key, color) = match kind {
+        EntryKind::User { .. } => ("entry.user", p.fg),
+        EntryKind::Assistant { .. } => ("entry.assistant", p.info),
+        EntryKind::Thinking { .. } => ("entry.thinking", p.muted),
+        EntryKind::Tool(_) => ("entry.tool", p.success),
+        EntryKind::Plan { .. } => ("entry.plan", p.warning),
+        EntryKind::Check { passed: true, .. } => ("entry.check", p.success),
+        EntryKind::Check { passed: false, .. } => ("entry.check", p.danger),
+        EntryKind::TurnEnd { .. } => ("entry.turn_end", p.muted),
+        EntryKind::Error { .. } => ("entry.error", p.danger),
+    };
+    (crate::i18n::t(locale, key), color)
+}
+
+/// An entry's text as one plain string: how every kind is shown until the
+/// conversation stream gets its per-kind appearance.
+fn entry_text(kind: &EntryKind) -> String {
+    match kind {
+        EntryKind::User { text } | EntryKind::Thinking { text, .. } => text.clone(),
+        EntryKind::Assistant { markdown, .. } => markdown.clone(),
+        EntryKind::Tool(call) => call.title.clone(),
+        EntryKind::Plan { steps } => steps
+            .iter()
+            .map(|step| step.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        EntryKind::Check { name, details, .. } => match details {
+            Some(details) => format!("{name}\n{details}"),
+            None => name.clone(),
+        },
+        EntryKind::TurnEnd { summary } => summary.clone(),
+        EntryKind::Error { title, message, .. } => format!("{title}\n{message}"),
     }
 }
 
@@ -883,7 +975,8 @@ impl<S: SessionView> HarnessShell<S> {
             .open_project_sessions()
             .iter()
             .filter(|session| Some(session.id()) != active)
-            .filter(|session| session.status() == SessionStatus::AwaitingReview)
+            .filter(|session| !session.archived())
+            .filter(|session| self.badge_of(session).needs_attention())
             .count()
     }
 
@@ -1469,9 +1562,8 @@ impl<S: SessionView> HarnessShell<S> {
         let id = session.id().clone();
         let selected = self.active_session_id() == Some(&id);
         let (done, total) = plan_progress(&session.plan());
-        let color = session_color(session.status(), p);
+        let mark = badge_mark(self.badge_of(session), self.locale, p);
         let title = session.title();
-        let status = session.status();
         let branch = session.branch_marker();
         div()
             .px_2()
@@ -1503,7 +1595,7 @@ impl<S: SessionView> HarnessShell<S> {
                             .when(selected, |d| d.font_semibold())
                             .child(title),
                     )
-                    .child(badge(status.label(self.locale), color)),
+                    .when_some(mark, |d, (label, color)| d.child(badge(label, color))),
             )
             .child(
                 div()
@@ -1537,7 +1629,7 @@ impl<S: SessionView> HarnessShell<S> {
     fn ai_workspace(&self, ws: &S::Workspace, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
         let plan = plan_rows(&ws.plan(), p, self.locale);
-        let conversation = self.conversation_stream(&ws.conversation().blocks, p, cx);
+        let conversation = self.conversation_stream(p, cx);
         div()
             .flex_1()
             .h_full()
@@ -1748,28 +1840,26 @@ impl<S: SessionView> HarnessShell<S> {
     }
 
     /// The conversation stream of the active session.
-    fn conversation_stream(
-        &self,
-        blocks: &[Block],
-        p: Palette,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn conversation_stream(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let selected = self.selected_block;
         let mut stream = div().flex().flex_col().gap_2();
-        for block in blocks {
-            let color = block_color(block.kind, p);
-            let anchor = format!("#{}", block.event_seq);
-            let is_selected = selected == Some(block.event_seq);
-            let seq = block.event_seq;
+        for entry in self.transcript.entries() {
+            let (label, color) = entry_head(&entry.kind, self.locale, p);
+            let anchor = format!("#{}", entry.seq);
+            let is_selected = selected == Some(entry.seq);
+            let seq = entry.seq;
             let mut head = div()
                 .flex()
                 .flex_row()
                 .items_center()
                 .gap_2()
-                .child(div().text_xs().text_color(color).child(block.kind.label(self.locale)))
+                .child(div().text_xs().text_color(color).child(label))
                 .child(div().text_xs().text_color(p.muted).child(anchor));
-            if let Some(state) = block.tool_state {
-                head = head.child(badge(state.label(self.locale), tool_color(state, p)));
+            if let EntryKind::Tool(call) = &entry.kind {
+                head = head.child(badge(
+                    call.status.label(self.locale),
+                    tool_color(call.status, p),
+                ));
             }
             stream = stream.child(
                 div()
@@ -1789,7 +1879,7 @@ impl<S: SessionView> HarnessShell<S> {
                         }),
                     )
                     .child(head)
-                    .when_some(block.selection_ref.as_ref(), |d, sel| {
+                    .when_some(entry.anchor.as_ref(), |d, anchor| {
                         d.child(
                             div()
                                 .px_2()
@@ -1799,10 +1889,10 @@ impl<S: SessionView> HarnessShell<S> {
                                 .text_color(p.info)
                                 .text_xs()
                                 .cursor_pointer()
-                                .child(format!("📍 {sel}")),
+                                .child(anchor.clone()),
                         )
                     })
-                    .child(div().text_sm().child(block.text.clone())),
+                    .child(div().text_sm().child(entry_text(&entry.kind))),
             );
         }
         stream
@@ -2273,6 +2363,18 @@ fn plan_rows(plan: &[PlanStep], p: Palette, locale: Locale) -> impl IntoElement 
 impl<S: SessionView> Render for HarnessShell<S> {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
+        // Bring the conversation on screen up to the workspace's projection.
+        // What changed comes back as changes at entry indices; nothing reads
+        // them yet (the stream is redrawn whole until it is a virtualised
+        // list), but the transcript is already what the stream draws from.
+        match self.workspace.as_ref() {
+            Some(ws) => {
+                self.transcript.reconcile(ws.conversation());
+            }
+            None => {
+                self.transcript.reconcile(Default::default());
+            }
+        }
         let window_width = f32::from(window.viewport_size().width);
         self.layout.observe(window_width);
         let regions = self.layout.regions(window_width, self.has_right_dock());

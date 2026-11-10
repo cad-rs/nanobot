@@ -27,9 +27,9 @@ use nanobot_gpu::{
     ViewportSlot,
 };
 use nanobot_ui::{
-    Block, BranchMarker, Conversation, HarnessShell, PanelArea, PanelDef, PlanPhase, PlanStep,
+    BranchMarker, Conversation, Entry, HarnessShell, PanelArea, PanelDef, PlanPhase, PlanStep,
     Project, ProjectId, SessionId, SessionStatus, SessionStore, SessionView, StepStatus,
-    ToolState, WorkspaceView,
+    ToolCall, ToolKind, ToolStatus, WorkspaceView,
 };
 
 // ---- a stand-in renderer: a colour that drifts as the pointer drags ----
@@ -128,12 +128,23 @@ impl Demo {
             id: SessionId::new(id),
             title: title.to_string(),
             status,
-            conversation: Conversation::from_blocks(vec![
-                Block::user(1, "在支架顶面开 4 个 M6 通孔，孔距 40 mm。"),
-                Block::assistant(2, "好的。我先读取 Body1 的顶面，再生成孔阵列。"),
-                Block::tool(3, "read_feature(Body1.TopFace)", ToolState::Done),
-                Block::tool(4, "pattern_holes(count=4, pitch=40)", ToolState::Running)
-                    .with_selection("Body1.TopFace"),
+            conversation: Conversation::from_entries(vec![
+                Entry::user(1, "在支架顶面开 4 个 M6 通孔，孔距 40 mm。"),
+                Entry::thinking(2, "需要先确认顶面的范围，再决定阵列的基准。", Some(1800)),
+                Entry::assistant(3, "好的。我先读取 **Body1** 的顶面，再生成孔阵列。"),
+                Entry::tool(
+                    4,
+                    ToolCall::new(ToolKind::Read, "read_feature(Body1.TopFace)", ToolStatus::Done),
+                ),
+                Entry::tool(
+                    5,
+                    ToolCall::new(
+                        ToolKind::Edit,
+                        "pattern_holes(count=4, pitch=40)",
+                        ToolStatus::Running,
+                    ),
+                )
+                .with_anchor("Body1.TopFace"),
             ]),
             plan: vec![
                 PlanStep {
@@ -222,17 +233,18 @@ fn store() -> SessionStore<Demo> {
                 id: ProjectId::new("bracket"),
                 name: "支架".to_string(),
                 sessions: vec![
-                    Demo::new("s1", "支架开孔方案", SessionStatus::Active),
-                    Demo::new("s2", "倒角待确认", SessionStatus::AwaitingReview),
+                    Demo::new("s1", "支架开孔方案", SessionStatus::Idle),
+                    Demo::new("s2", "倒角待确认", SessionStatus::AwaitingUser),
                     Demo::new("s3", "法兰初稿", SessionStatus::Running),
-                    Demo::new("s4", "加强筋待确认", SessionStatus::AwaitingReview),
+                    Demo::new("s5", "壁厚检查出错", SessionStatus::Error),
+                    Demo::new("s4", "加强筋待确认", SessionStatus::AwaitingUser),
                 ],
                 session_index: Some(SessionId::new("s1")),
             },
             Project {
                 id: ProjectId::new("housing"),
                 name: "壳体".to_string(),
-                sessions: vec![Demo::new("h1", "壳体抽壳", SessionStatus::Active)],
+                sessions: vec![Demo::new("h1", "壳体抽壳", SessionStatus::Idle)],
                 session_index: Some(SessionId::new("h1")),
             },
         ],
