@@ -77,6 +77,14 @@ gpui = { git = "https://github.com/longbridge/gpui-fast", rev = "a10f393d8033c5f
 # hands that context out.
 gpui-wgpu = { package = "gpui_wgpu", git = "https://github.com/longbridge/gpui-fast", rev = "a10f393d8033c5f52f34821d6a25cddadc6174b4" }
 gpui-web = { package = "gpui_web", git = "https://github.com/longbridge/gpui-fast", rev = "a10f393d8033c5f52f34821d6a25cddadc6174b4", default-features = false }
+# The platform layer an application is started on. The shell crates do not
+# depend on it (the product owns the application); the examples do. No default
+# features: the default `multithreaded` needs wasm threads.
+gpui-platform = { package = "gpui_platform", git = "https://github.com/longbridge/gpui-fast", rev = "a10f393d8033c5f52f34821d6a25cddadc6174b4", default-features = false, features = [
+    "font-kit",
+    "x11",
+    "wayland",
+] }
 # GPUI Kit's component layer, from crates.io. It is built on the `gpui-pre`
 # =0.3.11 snapshot, which [patch.crates-io] points at gpui-fast.
 gpui-component = "0.9.0"

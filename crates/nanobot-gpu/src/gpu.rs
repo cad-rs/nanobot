@@ -162,10 +162,21 @@ impl Gpu {
 enum GpuSlot {
     /// Not created yet (web: graphics not up yet, retried on the next frame).
     NotTried,
-    Ready(Rc<Gpu>),
+    /// Never dropped: this slot is a thread local, and at process exit its
+    /// destructor would drop the wgpu queue, whose own `Drop` reaches for a
+    /// thread local that is already gone — a panic inside a TLS destructor,
+    /// which aborts the process. The slot's reference keeps the device alive
+    /// past every viewport, and the exiting process reclaims it.
+    Ready(std::mem::ManuallyDrop<Rc<Gpu>>),
     /// Device creation failed; not retried, so it does not block every frame.
     #[cfg(not(target_family = "wasm"))]
     Failed,
+}
+
+impl GpuSlot {
+    fn ready(gpu: Gpu) -> Self {
+        Self::Ready(std::mem::ManuallyDrop::new(Rc::new(gpu)))
+    }
 }
 
 #[cfg(target_family = "wasm")]
@@ -199,13 +210,13 @@ pub fn shared_gpu(_window: &Window) -> Option<Rc<Gpu>> {
                 let context = WEB_PLATFORM
                     .with(|platform| platform.borrow().as_ref().and_then(|p| p.wgpu_context()));
                 if let Some(context) = context {
-                    *slot = GpuSlot::Ready(Rc::new(Gpu::from_web_context(context)));
+                    *slot = GpuSlot::ready(Gpu::from_web_context(context));
                 }
             }
             #[cfg(not(target_family = "wasm"))]
             {
                 match Gpu::new() {
-                    Ok(gpu) => *slot = GpuSlot::Ready(Rc::new(gpu)),
+                    Ok(gpu) => *slot = GpuSlot::ready(gpu),
                     Err(error) => {
                         log::error!("failed to init the wgpu device: {error:#}");
                         *slot = GpuSlot::Failed;
@@ -214,7 +225,7 @@ pub fn shared_gpu(_window: &Window) -> Option<Rc<Gpu>> {
             }
         }
         match &*slot {
-            GpuSlot::Ready(gpu) => Some(gpu.clone()),
+            GpuSlot::Ready(gpu) => Some(Rc::clone(gpu)),
             _ => None,
         }
     })

@@ -16,3 +16,12 @@ nanobot-rhai = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+
+[dev-dependencies]
+# The acceptance checks (tests/acceptance.rs) draw on gpui's headless test
+# platform.
+gpui = { workspace = true, features = ["test-support"] }
+gpui-component = { workspace = true, features = ["test-support"] }
+# examples/viewport_overlay.rs opens a real window with a viewport in it.
+gpui-platform = { workspace = true }
+wgpu = { workspace = true }
