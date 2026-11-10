@@ -43,7 +43,7 @@ use gpui::{Bounds, DevicePixels, Pixels};
 #[cfg(target_family = "wasm")]
 pub use gpu::set_web_platform;
 pub use gpu::{set_gpu_requirements, shared_gpu, Gpu, GpuRequirements};
-pub use present::{viewport_element, Viewport, ViewportContent};
+pub use present::{suspend_viewport_input, viewport_element, Viewport, ViewportContent};
 
 /// Device-pixel size of a paint bounds at the window's scale factor, at least
 /// 1×1 and clamped to a sane maximum.

@@ -23,6 +23,7 @@
 //! settings panel that persists the choice through `ui.theme`.
 
 pub mod i18n;
+pub mod layout;
 pub mod model;
 pub mod panels;
 pub mod poll;
@@ -37,7 +38,8 @@ pub use model::{
 };
 pub use panels::{Entitlements, PanelArea, PanelDef, PanelHost, PanelSource, ScriptRuntime};
 pub use poll::poll_periodically;
-pub use shell::HarnessShell;
+pub use layout::{Divider, Fold, Layout, LayoutState, Regions, Stacked};
+pub use shell::{init, HarnessShell, ToggleDock, ToggleSidebar, KEY_CONTEXT};
 pub use i18n::{t, t_replace, Locale};
 pub use theme::{
     apply, apply_font, apply_from_settings, set_theme, ThemeKind, FONT_FAMILY_KEY,
@@ -517,6 +519,90 @@ mod tests {
         PanelDef::product(id, title, area, order, Rc::new(|_shell, _ws, _window, _cx| {
             gpui::div().into_any_element()
         }))
+    }
+
+    // ---- layout ----
+
+    #[test]
+    fn the_badge_counts_other_sessions_waiting_for_the_user() {
+        let waiting = |id: &str| TestSession {
+            status: SessionStatus::AwaitingReview,
+            ..TestSession::new(id)
+        };
+        let store = SessionStore::new(
+            vec![project(
+                "p1",
+                vec![
+                    TestSession::new("s1"),
+                    waiting("s2"),
+                    TestSession {
+                        status: SessionStatus::Running,
+                        ..TestSession::new("s3")
+                    },
+                    waiting("s4"),
+                ],
+                Some("s1"),
+            )],
+            ProjectId::new("p1"),
+        );
+        let mut shell = HarnessShell::new(store);
+        assert_eq!(shell.attention_count(), 2, "s2 and s4; running is not waiting");
+
+        // The session on screen is not counted: the user is looking at it.
+        shell.switch_session(&SessionId::new("s2"));
+        assert_eq!(shell.attention_count(), 1);
+    }
+
+    #[test]
+    fn hiding_the_sidebar_is_remembered_across_launches() {
+        use std::sync::{Arc, Mutex};
+
+        let settings = Arc::new(Mutex::new(nanobot_boot::Settings::in_memory()));
+        let mut shell = HarnessShell::new(two_project_store());
+        shell.set_settings(Some(Arc::clone(&settings)));
+        assert!(shell.sidebar_shown(1600.), "shown by default");
+
+        shell.toggle_sidebar(1600.);
+        assert!(!shell.sidebar_shown(1600.));
+        assert_eq!(
+            settings.lock().unwrap().get(layout::SIDEBAR_OPEN_KEY),
+            Some(&serde_json::Value::Bool(false)),
+            "written through at once"
+        );
+
+        // The next launch reads it back.
+        let mut next = HarnessShell::new(two_project_store());
+        next.set_settings(Some(Arc::clone(&settings)));
+        assert!(!next.sidebar_shown(1600.));
+        assert!(!next.layout().sidebar_open);
+    }
+
+    #[test]
+    fn a_narrow_window_hides_the_sidebar_without_saving_that() {
+        use std::sync::{Arc, Mutex};
+
+        let settings = Arc::new(Mutex::new(nanobot_boot::Settings::in_memory()));
+        let mut shell = HarnessShell::new(two_project_store());
+        shell.set_settings(Some(Arc::clone(&settings)));
+
+        assert!(!shell.sidebar_shown(1100.), "folded away by the width");
+        shell.toggle_sidebar(1100.);
+        assert!(shell.sidebar_shown(1100.), "opened by hand for now");
+        assert!(shell.layout().sidebar_open, "the preference never changed");
+        assert_eq!(
+            settings.lock().unwrap().get(layout::SIDEBAR_OPEN_KEY),
+            None,
+            "and nothing was written"
+        );
+    }
+
+    #[test]
+    fn the_viewport_is_the_main_area() {
+        let shell = HarnessShell::new(two_project_store());
+        let regions = LayoutState::new(shell.layout()).regions(1920., false);
+        let (column, viewport) = (regions.column.unwrap(), regions.viewport.unwrap());
+        assert_eq!(column, layout::COLUMN_DEFAULT, "the session column keeps its width");
+        assert!(viewport > column * 2., "the viewport takes the rest: {viewport}");
     }
 
     #[test]

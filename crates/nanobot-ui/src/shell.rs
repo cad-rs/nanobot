@@ -23,6 +23,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use gpui::{
+    actions, FocusHandle, KeyBinding, MouseMoveEvent, MouseUpEvent,
     div, img, prelude::*, px, AnyElement, App, Context, Div, Entity, Hsla, Stateful,
     IntoElement,
     MouseButton, MouseDownEvent, Render, Subscription, Window,
@@ -41,12 +42,47 @@ use crate::model::{
 };
 use crate::panels::{PanelArea, PanelDef, PanelHost};
 use crate::i18n::Locale;
+use crate::layout::{Divider, Fold, Layout, LayoutState, Stacked};
 use crate::theme::ThemeKind;
 
-/// Pane widths: the workspace is the primary surface (flex), the viewport is the
-/// secondary panel, and the dock hosts the auxiliary panels.
-const SIDEBAR_W: f32 = 240.0;
-const VIEWPORT_W: f32 = 520.0;
+
+
+
+/// A divider drag in progress: which divider, where the pointer was when it
+/// began, and how wide the divider's region was then.
+#[derive(Clone, Copy, Debug)]
+struct DividerDrag {
+    divider: Divider,
+    start_x: f32,
+    start_width: f32,
+}
+
+/// Height of the session column's toolbar.
+const TOOLBAR_H: f32 = 36.0;
+/// Width of the strip a divider is grabbed by.
+const DIVIDER_W: f32 = 5.0;
+
+actions!(
+    nanobot_ui,
+    [
+        /// Shows or hides the session sidebar.
+        ToggleSidebar,
+        /// Shows or hides the right dock.
+        ToggleDock,
+    ]
+);
+
+/// The key context the shell's bindings live in.
+pub const KEY_CONTEXT: &str = "HarnessShell";
+
+/// Installs the shell's default key bindings. The product calls this once at
+/// startup (after `gpui_component::init`); bindings it adds afterwards win.
+pub fn init(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("ctrl-alt-j", ToggleSidebar, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-alt-b", ToggleDock, Some(KEY_CONTEXT)),
+    ]);
+}
 
 /// A shell callback keyed by session (activate / undo / redo / save / load /
 /// import all share the shape).
@@ -124,6 +160,14 @@ pub struct HarnessShell<S: SessionView> {
     /// The settings panel's font-family input, created on first show.
     font_input: Rc<RefCell<Option<Entity<InputState>>>>,
     _font_input_sub: Rc<RefCell<Option<Subscription>>>,
+    /// How the window is divided: the saved preference and what the window's
+    /// width does to it now.
+    layout: LayoutState,
+    /// The divider being dragged, with where the drag began.
+    dragging: Option<DividerDrag>,
+    /// Where the keyboard rests when nothing else holds the focus, so the
+    /// shell's key bindings work before anything was clicked.
+    focus_anchor: Option<FocusHandle>,
 }
 
 /// One script plugin as the plugins panel shows it.
@@ -167,6 +211,9 @@ impl<S: SessionView> HarnessShell<S> {
             locale: Locale::default(),
             font_input: Rc::new(RefCell::new(None)),
             _font_input_sub: Rc::new(RefCell::new(None)),
+            layout: LayoutState::default(),
+            dragging: None,
+            focus_anchor: None,
         };
         // Framework chrome: the diagnostics panel is always there (it reads
         // nothing but shell state), the settings panel joins when the app
@@ -324,6 +371,9 @@ impl<S: SessionView> HarnessShell<S> {
                 .and_then(|v| v.as_str().map(str::to_string))
             {
                 self.locale = Locale::from_code(&code);
+            }
+            if let Ok(store) = store.lock() {
+                self.layout = LayoutState::new(Layout::load(&store));
             }
             const SETTINGS_PANEL_ID: &str = "harness.settings";
             if !self
@@ -782,19 +832,226 @@ fn panel(caption: &str, p: Palette, body: impl IntoElement) -> impl IntoElement 
 // ---- rendering ----
 
 impl<S: SessionView> HarnessShell<S> {
-    fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    // ---- layout ----
+
+    /// Whether any panel the user may see is registered for the right dock.
+    fn has_right_dock(&self) -> bool {
+        !self.panel_host.panels_in(PanelArea::Right).is_empty()
+    }
+
+    /// The saved layout preference (sidebar and dock open, the three widths).
+    pub fn layout(&self) -> Layout {
+        self.layout.layout()
+    }
+
+    /// Writes the layout preference through the settings store, when the app
+    /// layer shared one. A failed write loses the preference, never the UI.
+    fn save_layout(&self) {
+        if let Some(Ok(mut settings)) = self.settings.as_ref().map(|s| s.lock()) {
+            let _ = self.layout.layout().store(&mut settings);
+        }
+    }
+
+    /// Shows or hides the session sidebar in a window `window_width` wide.
+    pub fn toggle_sidebar(&mut self, window_width: f32) {
+        if self.layout.toggle_sidebar(window_width) {
+            self.save_layout();
+        }
+    }
+
+    /// Shows or hides the right dock in a window `window_width` wide.
+    pub fn toggle_dock(&mut self, window_width: f32) {
+        if self.layout.toggle_dock(window_width) {
+            self.save_layout();
+        }
+    }
+
+    /// Whether the session sidebar shows in a window `window_width` wide.
+    pub fn sidebar_shown(&self, window_width: f32) -> bool {
+        self.layout
+            .regions(window_width, self.has_right_dock())
+            .sidebar
+            .is_some()
+    }
+
+    /// How many sessions other than the one on screen are waiting for the
+    /// user: what the toolbar badge counts while the sidebar may be hidden.
+    pub fn attention_count(&self) -> usize {
+        let active = self.active_session_id();
+        self.store
+            .borrow()
+            .open_project_sessions()
+            .iter()
+            .filter(|session| Some(session.id()) != active)
+            .filter(|session| session.status() == SessionStatus::AwaitingReview)
+            .count()
+    }
+
+    fn end_drag(&mut self) {
+        if self.dragging.take().is_some() {
+            nanobot_gpu::suspend_viewport_input(false);
+            self.save_layout();
+        }
+    }
+
+    /// The strip between two regions that a drag resizes them by.
+    fn divider(&self, divider: Divider, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
-        let store = self.store.borrow();
-        let project = store.open_project();
+        let active = self.dragging.is_some_and(|drag| drag.divider == divider);
+        div()
+            .id(match divider {
+                Divider::Sidebar => "harness-divider-sidebar",
+                Divider::Column => "harness-divider-column",
+                Divider::Dock => "harness-divider-dock",
+            })
+            .w(px(DIVIDER_W))
+            .h_full()
+            .flex_none()
+            .cursor_col_resize()
+            .border_l_1()
+            .border_color(p.border)
+            .when(active, |d| d.bg(p.accent.opacity(0.5)))
+            .hover(|d| d.bg(p.accent.opacity(0.3)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this: &mut Self, ev: &MouseDownEvent, window, cx| {
+                    let width = f32::from(window.viewport_size().width);
+                    let Some(start_width) =
+                        this.layout.width_at(divider, width, this.has_right_dock())
+                    else {
+                        return;
+                    };
+                    this.dragging = Some(DividerDrag {
+                        divider,
+                        start_x: f32::from(ev.position.x),
+                        start_width,
+                    });
+                    // The pointer will cross the viewport: on Windows its
+                    // native surface would otherwise keep the moves and the
+                    // release to itself, and the drag would stall at its edge.
+                    nanobot_gpu::suspend_viewport_input(true);
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+    }
+
+    /// The count of sessions waiting for the user, as the toolbar shows it.
+    fn attention_badge(&self, waiting: usize, p: Palette) -> Stateful<Div> {
+        div()
+            .id("harness-attention")
+            .px_2()
+            .rounded(px(9.))
+            .bg(p.warning.opacity(0.18))
+            .text_color(p.warning)
+            .text_xs()
+            .child(self.trf("shell.attention", &[("count", &waiting.to_string())]))
+    }
+
+    /// The session column toolbar: what belongs to the session on screen, plus
+    /// the two things that must stay reachable while the sidebar is hidden —
+    /// its toggle and the count of sessions waiting for the user.
+    fn toolbar(&self, fold: Fold, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = palette(cx);
+        let waiting = self.attention_count();
         let workspace = self.workspace.as_ref();
-        let (done, total) = workspace.map(plan_progress_of).unwrap_or((0, 0));
-        let session_line = match workspace {
-            Some(ws) => ws.title(),
-            None => self.tr("shell.no_sessions").to_string(),
-        };
+        let title = workspace
+            .map_or_else(|| self.tr("shell.no_sessions").to_string(), |ws| ws.title());
         let status = workspace.map(|ws| ws.status());
         div()
-            .h(px(46.))
+            .h(px(TOOLBAR_H))
+            .flex_none()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .border_b_1()
+            .border_color(p.border)
+            .when(fold != Fold::Stacked, |d| {
+                d.child(toolbar_button("harness-toggle-sidebar", "sidebar").on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this: &mut Self, _ev: &MouseDownEvent, window, cx| {
+                        this.toggle_sidebar(f32::from(window.viewport_size().width));
+                        cx.notify();
+                    }),
+                ))
+            })
+            .when(waiting > 0, |d| {
+                d.child(self.attention_badge(waiting, p).cursor_pointer().on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this: &mut Self, _ev: &MouseDownEvent, window, cx| {
+                        let width = f32::from(window.viewport_size().width);
+                        if this.layout.reveal_sidebar(width) {
+                            this.save_layout();
+                        }
+                        cx.notify();
+                    }),
+                ))
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_sm()
+                    .font_semibold()
+                    .truncate()
+                    .child(title),
+            )
+            .when_some(status, |d, status| {
+                d.child(badge(status.label(self.locale), session_color(status, p)))
+            })
+            .when(fold == Fold::Stacked, |d| {
+                // Too narrow for both: the one way to reach the viewport.
+                d.child(
+                    text_button("harness-show-viewport", self.tr("shell.show_viewport"), p)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this: &mut Self, _ev: &MouseDownEvent, _w, cx| {
+                                this.layout.set_stacked(Stacked::Viewport);
+                                cx.notify();
+                            }),
+                        ),
+                )
+            })
+    }
+
+    /// The strip over a viewport that has the window to itself (a stacked
+    /// layout): the way back to the session column.
+    fn viewport_return_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = palette(cx);
+        let waiting = self.attention_count();
+        div()
+            .h(px(TOOLBAR_H))
+            .flex_none()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .border_b_1()
+            .border_color(p.border)
+            .child(
+                text_button("harness-show-column", self.tr("shell.show_column"), p).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this: &mut Self, _ev: &MouseDownEvent, _w, cx| {
+                        this.layout.set_stacked(Stacked::Column);
+                        cx.notify();
+                    }),
+                ),
+            )
+            .when(waiting > 0, |d| d.child(self.attention_badge(waiting, p)))
+    }
+
+    /// The title bar: only what is global — the product, the open project and
+    /// the operations on it. What belongs to one session is in the session
+    /// column's toolbar.
+    fn header(&self, fold: Fold, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = palette(cx);
+        let project = self.store.borrow().open_project().name.clone();
+        let has_dock = self.has_right_dock();
+        div()
+            .h(px(40.))
             .flex_none()
             .flex()
             .flex_row()
@@ -804,15 +1061,7 @@ impl<S: SessionView> HarnessShell<S> {
             .border_b_1()
             .border_color(p.border)
             .child(div().font_semibold().child(self.product_name.clone()))
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(p.muted)
-                    .child(format!("{} · {}", project.name, session_line)),
-            )
-            .when_some(status, |d, status| {
-                d.child(badge(status.label(self.locale), session_color(status, p)))
-            })
+            .child(div().text_sm().text_color(p.muted).child(project))
             .child(div().flex_1())
             .child(
                 div()
@@ -822,10 +1071,15 @@ impl<S: SessionView> HarnessShell<S> {
                     .child(self.undo_redo_buttons(cx))
                     .child(self.file_ops_buttons(cx)),
             )
-            .child(div().text_xs().text_color(p.muted).child(self.trf(
-                "shell.viewport_caption",
-                &[("done", &done.to_string()), ("total", &total.to_string())],
-            )))
+            .when(has_dock && fold != Fold::Stacked, |d| {
+                d.child(toolbar_button("harness-toggle-dock", "dock").on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this: &mut Self, _ev: &MouseDownEvent, window, cx| {
+                        this.toggle_dock(f32::from(window.viewport_size().width));
+                        cx.notify();
+                    }),
+                ))
+            })
     }
 
     fn undo_redo_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -939,7 +1193,7 @@ impl<S: SessionView> HarnessShell<S> {
 
     /// The session list (home sidebar): project switcher on top, then the open
     /// project's sessions grouped by project.
-    fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn sidebar(&self, width: f32, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
         let mut projects = div().flex().flex_col().gap_1();
         for project in self.store.borrow().projects() {
@@ -1053,7 +1307,7 @@ impl<S: SessionView> HarnessShell<S> {
         }
 
         div()
-            .w(px(SIDEBAR_W))
+            .w(px(width))
             .h_full()
             .flex_none()
             .flex()
@@ -1260,18 +1514,6 @@ impl<S: SessionView> HarnessShell<S> {
             )
     }
 
-    /// The viewport region: the product renderer's element (drag = orbit,
-    /// Shift+drag = pan, wheel = zoom — the mapping lives in the renderer).
-    fn viewport_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let p = palette(cx);
-        div()
-            .w(px(VIEWPORT_W))
-            .flex_none()
-            .h_full()
-            .border_l_1()
-            .border_color(p.border)
-            .child(self.viewport_slot())
-    }
 
     fn viewport_slot(&self) -> impl IntoElement {
         let Some(ws) = self.workspace.as_ref() else {
@@ -1645,15 +1887,12 @@ mod assets {
             "harness-save" => "save",
             "harness-load" => "load",
             "harness-import" => "import",
+            "sidebar" => "sidebar",
+            "dock" => "dock",
             _ => "settings",
         };
         format!("{}/assets/{name}.svg", env!("CARGO_MANIFEST_DIR"))
     }
-}
-
-/// `(done, total)` of a workspace's plan.
-fn plan_progress_of<W: WorkspaceView>(ws: &W) -> (usize, usize) {
-    plan_progress(&ws.plan())
 }
 
 /// The avatar letter the account chip shows: the display name's first
@@ -2034,6 +2273,21 @@ fn plan_rows(plan: &[PlanStep], p: Palette, locale: Locale) -> impl IntoElement 
 impl<S: SessionView> Render for HarnessShell<S> {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
+        let window_width = f32::from(window.viewport_size().width);
+        self.layout.observe(window_width);
+        let regions = self.layout.regions(window_width, self.has_right_dock());
+
+        // Where the keyboard rests when nothing else holds the focus: without
+        // it GPUI has no focus path to send the shell's key bindings along
+        // until something is clicked.
+        let anchor = self
+            .focus_anchor
+            .get_or_insert_with(|| cx.focus_handle())
+            .clone();
+        if window.focused(cx).is_none() {
+            window.focus(&anchor, cx);
+        }
+
         // The registry is cloned out so the panel factories can be called with
         // an immutable borrow of the shell.
         let panels = self.panel_host.visible_panels();
@@ -2042,31 +2296,71 @@ impl<S: SessionView> Render for HarnessShell<S> {
         let top = self.dock_region(PanelArea::Top, &panels, window, cx);
         let bottom = self.dock_region(PanelArea::Bottom, &panels, window, cx);
 
-        let body = match self.workspace.as_ref() {
+        let mut body = div().flex_1().flex().flex_row().overflow_hidden().child(left);
+        if let Some(width) = regions.sidebar {
+            body = body
+                .child(self.sidebar(width, cx))
+                .child(self.divider(Divider::Sidebar, cx));
+        }
+        match self.workspace.as_ref() {
             Some(ws) => {
-                let ai = self.ai_workspace(ws, cx).into_any_element();
-                let viewport = self.viewport_panel(cx).into_any_element();
-                div()
-                    .flex_1()
-                    .flex()
-                    .flex_row()
-                    .overflow_hidden()
-                    .child(self.sidebar(cx))
-                    .child(ai)
-                    .child(viewport)
-                    .child(right)
-                    .into_any_element()
+                if let Some(width) = regions.column {
+                    // Alone in a stacked layout the column takes the window.
+                    let alone = regions.viewport.is_none();
+                    body = body.child(
+                        div()
+                            .h_full()
+                            .flex()
+                            .flex_col()
+                            .overflow_hidden()
+                            .map(|d| {
+                                if alone {
+                                    d.flex_1().min_w_0()
+                                } else {
+                                    d.w(px(width)).flex_none()
+                                }
+                            })
+                            .child(self.toolbar(regions.fold, cx))
+                            .child(self.ai_workspace(ws, cx)),
+                    );
+                }
+                if regions.column.is_some() && regions.viewport.is_some() {
+                    body = body.child(self.divider(Divider::Column, cx));
+                }
+                if regions.viewport.is_some() {
+                    // The main area: it takes whatever the others leave.
+                    body = body.child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .flex()
+                            .flex_col()
+                            .when(regions.column.is_none(), |d| {
+                                d.child(self.viewport_return_bar(cx))
+                            })
+                            .child(div().flex_1().min_h_0().child(self.viewport_slot())),
+                    );
+                }
             }
-            None => div()
-                .flex_1()
-                .flex()
-                .flex_row()
-                .overflow_hidden()
-                .child(self.sidebar(cx))
-                .child(self.empty_workspace(cx))
-                .child(right)
-                .into_any_element(),
-        };
+            None => {
+                body = body.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .flex()
+                        .flex_col()
+                        .child(self.toolbar(regions.fold, cx))
+                        .child(self.empty_workspace(cx)),
+                );
+            }
+        }
+        if let Some(width) = regions.dock {
+            body = body
+                .child(self.divider(Divider::Dock, cx))
+                .child(div().w(px(width)).flex_none().h_full().overflow_hidden().child(right));
+        }
 
         div()
             .size_full()
@@ -2074,17 +2368,75 @@ impl<S: SessionView> Render for HarnessShell<S> {
             .flex_col()
             .bg(cx.theme().background)
             .text_color(p.fg)
-            .child(self.header(cx))
-            .child(top)
-            .child(
-                div()
-                    .flex_1()
-                    .flex()
-                    .flex_row()
-                    .overflow_hidden()
-                    .child(left)
-                    .child(body),
+            .key_context(KEY_CONTEXT)
+            .on_action(cx.listener(|this: &mut Self, _: &ToggleSidebar, window, cx| {
+                this.toggle_sidebar(f32::from(window.viewport_size().width));
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this: &mut Self, _: &ToggleDock, window, cx| {
+                this.toggle_dock(f32::from(window.viewport_size().width));
+                cx.notify();
+            }))
+            // A divider drag is followed here, at the root, so it keeps going
+            // wherever the pointer is.
+            .on_mouse_move(cx.listener(|this: &mut Self, ev: &MouseMoveEvent, window, cx| {
+                let Some(drag) = this.dragging else {
+                    return;
+                };
+                if !ev.dragging() {
+                    // The button came up somewhere that did not tell us.
+                    this.end_drag();
+                    cx.notify();
+                    return;
+                }
+                let moved = f32::from(ev.position.x) - drag.start_x;
+                // The dock grows as its divider moves left.
+                let width = match drag.divider {
+                    Divider::Dock => drag.start_width - moved,
+                    _ => drag.start_width + moved,
+                };
+                let window_width = f32::from(window.viewport_size().width);
+                let has_dock = this.has_right_dock();
+                if this.layout.resize(drag.divider, width, window_width, has_dock) {
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this: &mut Self, _ev: &MouseUpEvent, _w, cx| {
+                    if this.dragging.is_some() {
+                        this.end_drag();
+                        cx.notify();
+                    }
+                }),
             )
+            // Sizeless, so a click never lands on it and pulls the focus away
+            // from a panel or an input.
+            .child(div().track_focus(&anchor))
+            .child(self.header(regions.fold, cx))
+            .child(top)
+            .child(body)
             .child(bottom)
     }
+}
+
+/// A toolbar button that is only an icon.
+fn toolbar_button(id: &'static str, icon: &'static str) -> Stateful<Div> {
+    div()
+        .id(id)
+        .p_1()
+        .rounded(px(4.))
+        .cursor_pointer()
+        .child(img(assets::icon(icon)).w(px(16.)).h(px(16.)))
+}
+
+/// A toolbar button that is only a word.
+fn text_button(id: &'static str, label: &'static str, p: Palette) -> Stateful<Div> {
+    div()
+        .id(id)
+        .px_2()
+        .text_xs()
+        .text_color(p.muted)
+        .cursor_pointer()
+        .child(label)
 }
