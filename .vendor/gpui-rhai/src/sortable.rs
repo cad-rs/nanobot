@@ -1,0 +1,932 @@
+//! Keyed controlled sorting over the shared application drag runtime.
+
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
+
+use gpui::{
+    AnyElement, App, AppContext, Background, Bounds, Context, DispatchPhase, Edges, Element,
+    ElementId, Entity, FocusHandle, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId,
+    InteractiveElement, IntoElement, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent,
+    PaintQuad, ParentElement, Pixels, Point, Render, Style, Styled, Window, div, point, px,
+    relative, rgba, size,
+};
+
+use crate::{
+    ComponentStateSchema, EventSchema, GeometryBounds, ObjectField, PrimitiveContext,
+    PrimitiveDescriptor, PrimitiveHandler, PrimitiveId, PrimitiveInstance, PrimitiveInstanceId,
+    PrimitiveProps, PrimitiveTheme, Rgba8, UiValue, ValueSchema,
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SortDirection {
+    Vertical,
+    Horizontal,
+    Grid,
+}
+
+impl SortDirection {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "vertical" => Some(Self::Vertical),
+            "horizontal" => Some(Self::Horizontal),
+            "grid" => Some(Self::Grid),
+            _ => None,
+        }
+    }
+
+    const fn uses_vertical_targets(self) -> bool {
+        matches!(self, Self::Vertical)
+    }
+}
+
+/// Whether `placement` is the item's physical far half (the bottom, or the right); in a
+/// mirrored row `before` is the right half.
+fn far_half(mirrored: bool, placement: Placement) -> bool {
+    (placement == Placement::After) != mirrored
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Placement {
+    Before,
+    After,
+}
+
+impl Placement {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Before => "before",
+            Self::After => "after",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SortableConfig {
+    id: String,
+    collection: String,
+    item_key: String,
+    source_index: Option<usize>,
+    source_snapshot: Option<UiValue>,
+    previous_key: Option<String>,
+    next_key: Option<String>,
+    first_key: String,
+    last_key: String,
+    direction: SortDirection,
+    threshold: f64,
+    disabled: bool,
+    item_ref: Option<crate::ElementRef>,
+    focus: Option<FocusHandle>,
+    /// A press focuses the item (false: the press leaves focus where it is, for items
+    /// inside a control that keeps one tab stop, such as reorderable `Tabs`).
+    take_focus: bool,
+    /// A release before the drag threshold proposes `tap` with the item key, so the
+    /// item can be pressed as well as dragged.
+    tap: bool,
+    text_direction: crate::TextDirection,
+    accent: Rgba8,
+}
+
+impl SortableConfig {
+    /// A horizontal row runs right to left in RTL; a grid keeps its left-to-right layout.
+    fn mirrored(&self) -> bool {
+        self.direction == SortDirection::Horizontal
+            && self.text_direction == crate::TextDirection::RightToLeft
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SortableFingerprint {
+    collection: String,
+    item_key: String,
+    source_index: Option<usize>,
+    source_snapshot: Option<UiValue>,
+    previous_key: Option<String>,
+    next_key: Option<String>,
+    direction: SortDirection,
+    disabled: bool,
+}
+
+#[derive(Clone)]
+struct SortableState(Rc<RefCell<SortableFingerprint>>);
+
+impl SortableState {
+    fn new(config: &SortableConfig) -> Self {
+        Self(Rc::new(RefCell::new(sortable_fingerprint(config))))
+    }
+}
+
+fn sortable_fingerprint(config: &SortableConfig) -> SortableFingerprint {
+    SortableFingerprint {
+        collection: config.collection.clone(),
+        item_key: config.item_key.clone(),
+        source_index: config.source_index,
+        source_snapshot: config.source_snapshot.clone(),
+        previous_key: config.previous_key.clone(),
+        next_key: config.next_key.clone(),
+        direction: config.direction,
+        disabled: config.disabled,
+    }
+}
+
+struct SortablePrepaint {
+    hitbox: Hitbox,
+    before_hitbox: Hitbox,
+    after_hitbox: Hitbox,
+    item_bounds: Bounds<Pixels>,
+}
+
+struct SortableElement {
+    config: SortableConfig,
+    context: PrimitiveContext,
+}
+
+impl IntoElement for SortableElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for SortableElement {
+    type RequestLayoutState = ();
+    type PrepaintState = SortablePrepaint;
+
+    fn id(&self) -> Option<ElementId> {
+        Some(ElementId::Name(self.config.id.clone().into()))
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        (
+            window.request_layout(
+                Style {
+                    size: size(relative(1.0).into(), relative(1.0).into()),
+                    ..Style::default()
+                },
+                None,
+                cx,
+            ),
+            (),
+        )
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        (): &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) -> SortablePrepaint {
+        let state = window
+            .use_state(cx, |_, _| SortableState::new(&self.config))
+            .read(cx)
+            .clone();
+        let changed = {
+            let next = sortable_fingerprint(&self.config);
+            let mut fingerprint = state.0.borrow_mut();
+            let changed = *fingerprint != next;
+            *fingerprint = next;
+            changed
+        };
+        let source = source_owner(&self.context, &self.config);
+        if changed {
+            self.context.cancel_interaction(&source, window, cx);
+        }
+        let item_bounds = self
+            .config
+            .item_ref
+            .as_ref()
+            .and_then(|reference| self.context.element_bounds(reference, cx))
+            .map_or(bounds, geometry_bounds);
+        SortablePrepaint {
+            hitbox: window.insert_hitbox(bounds, HitboxBehavior::Normal),
+            before_hitbox: window.insert_hitbox(
+                target_half(item_bounds, &self.config, Placement::Before),
+                HitboxBehavior::Normal,
+            ),
+            after_hitbox: window.insert_hitbox(
+                target_half(item_bounds, &self.config, Placement::After),
+                HitboxBehavior::Normal,
+            ),
+            item_bounds,
+        }
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        (): &mut (),
+        prepaint: &mut SortablePrepaint,
+        window: &mut Window,
+        _: &mut App,
+    ) {
+        let source = source_owner(&self.context, &self.config);
+        self.context.present_interaction(source.clone());
+        register_target(
+            &self.context,
+            &self.config,
+            prepaint.item_bounds,
+            Placement::Before,
+            prepaint.before_hitbox.clone(),
+            window,
+        );
+        register_target(
+            &self.context,
+            &self.config,
+            prepaint.item_bounds,
+            Placement::After,
+            prepaint.after_hitbox.clone(),
+            window,
+        );
+        paint_sortable_feedback(&self.context, &self.config, prepaint.item_bounds, window);
+        if !self.config.disabled {
+            register_pointer_source(prepaint, &self.config, &self.context, window);
+        }
+    }
+}
+
+fn geometry_bounds(bounds: GeometryBounds) -> Bounds<Pixels> {
+    Bounds::new(
+        point(px(f64_to_f32(bounds.x)), px(f64_to_f32(bounds.y))),
+        size(px(f64_to_f32(bounds.width)), px(f64_to_f32(bounds.height))),
+    )
+}
+
+fn source_owner(
+    context: &PrimitiveContext,
+    config: &SortableConfig,
+) -> crate::interaction::InteractionOwner {
+    context.interaction_owner(&config.id).child("source")
+}
+
+fn target_owner(
+    context: &PrimitiveContext,
+    config: &SortableConfig,
+    placement: Placement,
+) -> crate::interaction::InteractionOwner {
+    context
+        .interaction_owner(&config.id)
+        .child(placement.as_str())
+}
+
+fn payload_type(config: &SortableConfig) -> String {
+    format!("gpui-rhai/sortable/{}", config.collection)
+}
+
+fn target_id(config: &SortableConfig, anchor: &str, placement: Placement) -> String {
+    format!("{}:{}:{}", config.collection, placement.as_str(), anchor)
+}
+
+fn drag_spec(
+    context: &PrimitiveContext,
+    config: &SortableConfig,
+    notify: gpui::EntityId,
+) -> crate::interaction::ApplicationDragSpec {
+    crate::interaction::ApplicationDragSpec::new(
+        source_owner(context, config),
+        config.item_key.clone(),
+        payload_type(config),
+        UiValue::Map(BTreeMap::from([(
+            "key".to_owned(),
+            UiValue::String(config.item_key.clone()),
+        )])),
+        crate::interaction::DragOperation::Move,
+        notify,
+    )
+    .with_collection(
+        config.collection.clone(),
+        config.source_index,
+        config.source_snapshot.clone(),
+    )
+}
+
+fn target_half(
+    bounds: Bounds<Pixels>,
+    config: &SortableConfig,
+    placement: Placement,
+) -> Bounds<Pixels> {
+    let far = far_half(config.mirrored(), placement);
+    if config.direction.uses_vertical_targets() {
+        let half = bounds.size.height / 2.0;
+        Bounds::new(
+            point(
+                bounds.origin.x,
+                bounds.origin.y + if far { half } else { px(0.0) },
+            ),
+            size(bounds.size.width, half),
+        )
+    } else {
+        let half = bounds.size.width / 2.0;
+        Bounds::new(
+            point(
+                bounds.origin.x + if far { half } else { px(0.0) },
+                bounds.origin.y,
+            ),
+            size(half, bounds.size.height),
+        )
+    }
+}
+
+fn register_target(
+    context: &PrimitiveContext,
+    config: &SortableConfig,
+    bounds: Bounds<Pixels>,
+    placement: Placement,
+    hitbox: Hitbox,
+    window: &mut Window,
+) {
+    let half = target_half(bounds, config, placement);
+    let Ok(bounds) = GeometryBounds::new(
+        f64::from(half.origin.x),
+        f64::from(half.origin.y),
+        f64::from(half.size.width),
+        f64::from(half.size.height),
+    ) else {
+        return;
+    };
+    let target_context = context.clone();
+    let anchor = config.item_key.clone();
+    let previous = config.previous_key.clone();
+    let next = config.next_key.clone();
+    context.register_drop_target(crate::interaction::DropTargetRegistration::new(
+        target_owner(context, config, placement),
+        target_id(config, &config.item_key, placement),
+        bounds,
+        BTreeSet::from([payload_type(config)]),
+        BTreeSet::from([crate::interaction::DragOperation::Move]),
+        100,
+        hitbox,
+        context.ancestor_scroll_handles(),
+        window.current_view(),
+        move |drag, position, window, cx| {
+            let source = drag.source_id();
+            let no_op = source == anchor
+                || match placement {
+                    Placement::Before => previous.as_deref() == Some(source),
+                    Placement::After => next.as_deref() == Some(source),
+                };
+            if no_op {
+                return;
+            }
+            target_context.propose(
+                "reorder",
+                reorder_value(source, &anchor, placement, position),
+                window,
+                cx,
+            );
+        },
+    ));
+}
+
+fn register_pointer_source(
+    prepaint: &SortablePrepaint,
+    config: &SortableConfig,
+    context: &PrimitiveContext,
+    window: &mut Window,
+) {
+    let hitbox = prepaint.hitbox.clone();
+    let config = config.clone();
+    let context = context.clone();
+    let view = window.current_view();
+    window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+        if phase != DispatchPhase::Bubble
+            || event.button != MouseButton::Left
+            || !hitbox.is_hovered(window)
+        {
+            return;
+        }
+        if config.take_focus
+            && let Some(focus) = config.focus.as_ref()
+        {
+            focus.focus(window, cx);
+        }
+        let spec = drag_spec(&context, &config, view);
+        let on_tap: Option<crate::interaction::TapHandler> = config.tap.then(|| {
+            let tap_context = context.clone();
+            let key = config.item_key.clone();
+            Rc::new(move |window: &mut Window, cx: &mut App| {
+                tap_context.propose("tap", UiValue::String(key.clone()), window, cx);
+            }) as crate::interaction::TapHandler
+        });
+        context.begin_application_drag(
+            spec,
+            event.position,
+            config.threshold,
+            |_, _, _, _| {},
+            on_tap,
+            window,
+            cx,
+        );
+        cx.stop_propagation();
+    });
+}
+
+fn reorder_value(
+    source: &str,
+    anchor: &str,
+    placement: Placement,
+    position: Point<Pixels>,
+) -> UiValue {
+    UiValue::Map(BTreeMap::from([
+        ("source_key".to_owned(), UiValue::String(source.to_owned())),
+        ("anchor_key".to_owned(), UiValue::String(anchor.to_owned())),
+        (
+            "placement".to_owned(),
+            UiValue::String(placement.as_str().to_owned()),
+        ),
+        ("x".to_owned(), UiValue::Float(f64::from(position.x))),
+        ("y".to_owned(), UiValue::Float(f64::from(position.y))),
+    ]))
+}
+
+fn paint_sortable_feedback(
+    context: &PrimitiveContext,
+    config: &SortableConfig,
+    bounds: Bounds<Pixels>,
+    window: &mut Window,
+) {
+    if context.app_drag_source_active(&source_owner(context, config)) {
+        window.paint_quad(PaintQuad {
+            bounds,
+            corner_radii: px(0.0).into(),
+            background: Background::from(rgba((config.accent.as_rgba_hex() & 0xffff_ff00) | 0x12)),
+            border_widths: Edges::all(px(1.0)),
+            border_color: rgba(config.accent.as_rgba_hex()).into(),
+            border_style: gpui::BorderStyle::default(),
+        });
+    }
+    for placement in [Placement::Before, Placement::After] {
+        if context.drop_target_state(&target_owner(context, config, placement))
+            != crate::interaction::DropTargetState::Active
+        {
+            continue;
+        }
+        let far = far_half(config.mirrored(), placement);
+        let indicator = if config.direction.uses_vertical_targets() {
+            let y = if far {
+                bounds.bottom() - px(2.0)
+            } else {
+                bounds.top()
+            };
+            Bounds::new(point(bounds.left(), y), size(bounds.size.width, px(2.0)))
+        } else {
+            let x = if far {
+                bounds.right() - px(2.0)
+            } else {
+                bounds.left()
+            };
+            Bounds::new(point(x, bounds.top()), size(px(2.0), bounds.size.height))
+        };
+        window.paint_quad(PaintQuad {
+            bounds: indicator,
+            corner_radii: px(0.0).into(),
+            background: Background::from(rgba(config.accent.as_rgba_hex())),
+            border_widths: Edges::all(px(0.0)),
+            border_color: rgba(0x0000_0000).into(),
+            border_style: gpui::BorderStyle::default(),
+        });
+    }
+}
+
+struct SortableEntity {
+    focus: FocusHandle,
+    config: SortableConfig,
+    context: PrimitiveContext,
+}
+
+impl SortableEntity {
+    fn new(mut config: SortableConfig, context: PrimitiveContext, cx: &mut Context<Self>) -> Self {
+        let focus = config.focus.clone().unwrap_or_else(|| cx.focus_handle());
+        config.focus = Some(focus.clone());
+        Self {
+            focus,
+            config,
+            context,
+        }
+    }
+
+    fn update(&mut self, mut config: SortableConfig, context: PrimitiveContext) {
+        config.focus = Some(self.focus.clone());
+        self.config = config;
+        self.context = context;
+    }
+
+    fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.config.disabled || !event.keystroke.modifiers.alt {
+            return;
+        }
+        // In a mirrored row, Left points towards the next item.
+        let key = match (event.keystroke.key.as_str(), self.config.mirrored()) {
+            ("left", true) => "right",
+            ("right", true) => "left",
+            (key, _) => key,
+        };
+        let target = match key {
+            "up" | "left" => self
+                .config
+                .previous_key
+                .as_ref()
+                .map(|anchor| (anchor, Placement::Before)),
+            "down" | "right" => self
+                .config
+                .next_key
+                .as_ref()
+                .map(|anchor| (anchor, Placement::After)),
+            "home" => Some((&self.config.first_key, Placement::Before)),
+            "end" => Some((&self.config.last_key, Placement::After)),
+            _ => return,
+        };
+        let Some((anchor, placement)) = target else {
+            cx.stop_propagation();
+            return;
+        };
+        if anchor != &self.config.item_key {
+            self.context.propose(
+                "reorder",
+                reorder_value(
+                    &self.config.item_key,
+                    anchor,
+                    placement,
+                    point(px(0.0), px(0.0)),
+                ),
+                window,
+                cx,
+            );
+        }
+        cx.stop_propagation();
+    }
+}
+
+impl Render for SortableEntity {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::app::read_host_frame_epoch(cx);
+        div()
+            .size_full()
+            .track_focus(&self.focus.clone().tab_stop(!self.config.disabled))
+            .on_key_down(cx.listener(Self::key_down))
+            .child(SortableElement {
+                config: self.config.clone(),
+                context: self.context.clone(),
+            })
+    }
+}
+
+#[derive(Default)]
+pub struct SortablePrimitiveHandler {
+    instances: BTreeMap<PrimitiveInstanceId, Entity<SortableEntity>>,
+}
+
+impl PrimitiveHandler for SortablePrimitiveHandler {
+    fn uses_primary_focus(&self) -> bool {
+        true
+    }
+
+    fn render(
+        &mut self,
+        instance: &PrimitiveInstance,
+        context: &PrimitiveContext,
+        theme: &PrimitiveTheme,
+        _: &mut Window,
+        cx: &mut App,
+    ) -> Result<AnyElement, String> {
+        let id = instance
+            .id
+            .clone()
+            .ok_or_else(|| "SortableItemPrimitive requires a stable key".to_owned())?;
+        let config = parse_config(
+            &instance.node.props,
+            instance.focus_handle().cloned(),
+            theme,
+        )?;
+        let entity = if let Some(entity) = self.instances.get(&id) {
+            entity.clone()
+        } else {
+            let entity = cx.new(|cx| SortableEntity::new(config.clone(), context.clone(), cx));
+            self.instances.insert(id.clone(), entity.clone());
+            entity
+        };
+        entity.update(cx, |sortable, _| {
+            sortable.update(config, context.clone());
+        });
+        Ok(entity.into_any_element())
+    }
+
+    fn unmount(&mut self, instance: &PrimitiveInstanceId) {
+        self.instances.remove(instance);
+    }
+}
+
+fn parse_config(
+    props: &PrimitiveProps,
+    focus: Option<FocusHandle>,
+    theme: &PrimitiveTheme,
+) -> Result<SortableConfig, String> {
+    let list_id = required_safe_string(props, "list_id")?;
+    let collection = required_collection_id(props)?;
+    let item_key = required_safe_string(props, "item_key")?;
+    let first_key = required_safe_string(props, "first_key")?;
+    let last_key = required_safe_string(props, "last_key")?;
+    let direction = props
+        .string("direction")
+        .and_then(SortDirection::parse)
+        .ok_or_else(|| "sortable direction must be vertical, horizontal, or grid".to_owned())?;
+    let threshold = props.number("threshold").unwrap_or(4.0);
+    if !threshold.is_finite() || !(0.0..=64.0).contains(&threshold) {
+        return Err("sortable threshold must be finite and in [0,64]".to_owned());
+    }
+    Ok(SortableConfig {
+        id: format!("gpui-rhai-sortable:{list_id}:{item_key}"),
+        collection,
+        item_key,
+        source_index: props.usize("source_index"),
+        source_snapshot: props.data("source_item").cloned(),
+        previous_key: optional_string(props, "previous_key")?,
+        next_key: optional_string(props, "next_key")?,
+        first_key,
+        last_key,
+        direction,
+        threshold,
+        disabled: props.boolean("disabled").unwrap_or(false),
+        item_ref: props.element_ref("item_ref").cloned(),
+        focus,
+        take_focus: props.boolean("take_focus").unwrap_or(true),
+        tap: props.boolean("tap").unwrap_or(false),
+        text_direction: theme.direction(),
+        accent: theme
+            .color("accent")
+            .unwrap_or(Rgba8::from_rgba_hex(0x3b82_f6ff)),
+    })
+}
+
+fn required_safe_string(props: &PrimitiveProps, name: &str) -> Result<String, String> {
+    let value = props
+        .string(name)
+        .ok_or_else(|| format!("{name} is required"))?;
+    if value.is_empty() || value.len() > 128 || value.chars().any(char::is_control) {
+        Err(format!("{name} must be 1-128 non-control characters"))
+    } else {
+        Ok(value.to_owned())
+    }
+}
+
+fn required_collection_id(props: &PrimitiveProps) -> Result<String, String> {
+    let value = props
+        .string("collection_id")
+        .ok_or_else(|| "collection_id is required".to_owned())?;
+    if value.is_empty() || value.len() > 1_024 || value.chars().any(char::is_control) {
+        Err("collection_id must be 1-1024 non-control characters".to_owned())
+    } else {
+        Ok(value.to_owned())
+    }
+}
+
+fn optional_string(props: &PrimitiveProps, name: &str) -> Result<Option<String>, String> {
+    match props.data(name) {
+        None | Some(UiValue::Null) => Ok(None),
+        Some(UiValue::String(value))
+            if !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control) =>
+        {
+            Ok(Some(value.clone()))
+        }
+        _ => Err(format!("{name} must be null or a safe string")),
+    }
+}
+
+fn reorder_schema() -> ValueSchema {
+    ValueSchema::object(BTreeMap::from([
+        (
+            "source_key".to_owned(),
+            ObjectField::required(ValueSchema::string()),
+        ),
+        (
+            "anchor_key".to_owned(),
+            ObjectField::required(ValueSchema::string()),
+        ),
+        (
+            "placement".to_owned(),
+            ObjectField::required(ValueSchema::String {
+                allowed: vec!["before".to_owned(), "after".to_owned()],
+            }),
+        ),
+        ("x".to_owned(), ObjectField::required(ValueSchema::number())),
+        ("y".to_owned(), ObjectField::required(ValueSchema::number())),
+    ]))
+}
+
+/// `reorder` from a drop or Alt+Arrow, `tap` from a press released before it dragged.
+fn sortable_events() -> BTreeMap<String, EventSchema> {
+    BTreeMap::from([
+        (
+            "reorder".to_owned(),
+            EventSchema {
+                doc: Some(
+                    "Emitted when a drop or an Alt-key move changes the order; the payload moves `source_key` `before` or `after` `anchor_key`."
+                        .to_owned(),
+                ),
+                payload: reorder_schema(),
+            },
+        ),
+        (
+            "tap".to_owned(),
+            EventSchema {
+                doc: Some(
+                    "Emitted when `tap` is on and a press is released before it became a drag; the payload is `item_key`."
+                        .to_owned(),
+                ),
+                payload: ValueSchema::string(),
+            },
+        ),
+    ])
+}
+
+/// Build the native keyed sortable-item interaction schema.
+///
+/// # Panics
+///
+/// Panics only if the static primitive ID becomes invalid.
+#[must_use]
+#[allow(clippy::too_many_lines)] // One declarative list of documented props and events.
+pub fn sortable_primitive_descriptor() -> PrimitiveDescriptor {
+    let optional_string = || ValueSchema::optional(ValueSchema::string());
+    PrimitiveDescriptor {
+        id: PrimitiveId::parse("gpui_rhai.sortable_item").expect("static primitive ID"),
+        export: "SortableItemPrimitive".to_owned(),
+        props: BTreeMap::from([
+            (
+                "list_id".to_owned(),
+                ObjectField::required(ValueSchema::string()).with_doc(
+                    "Identifier of the list the item belongs to; with `item_key` it names the item's native interaction.",
+                ),
+            ),
+            (
+                "collection_id".to_owned(),
+                ObjectField::required(ValueSchema::string()).with_doc(
+                    "Drag scope: items take drops only from items with the same id, and a virtual list pins the dragged row by it.",
+                ),
+            ),
+            (
+                "item_key".to_owned(),
+                ObjectField::required(ValueSchema::string()).with_doc(
+                    "Stable key of this item; it is the `source_key` or `anchor_key` of `reorder` and the `tap` payload.",
+                ),
+            ),
+            (
+                "source_index".to_owned(),
+                ObjectField::optional(ValueSchema::optional(ValueSchema::Integer {
+                    min: Some(0),
+                    max: None,
+                }))
+                .with_doc(
+                    "Index of the item in a virtual collection, so its row stays realized while dragged out of view; `()` otherwise.",
+                ),
+            ),
+            (
+                "source_item".to_owned(),
+                ObjectField::optional(ValueSchema::optional(ValueSchema::UiValue)).with_doc(
+                    "The item's value in a virtual collection; with `source_index` it identifies the dragged row to keep realized.",
+                ),
+            ),
+            (
+                "previous_key".to_owned(),
+                ObjectField::required(optional_string()).with_doc(
+                    "Key of the item before this one, or `()` for the first; drops next to it are no-ops and Alt+Up moves before it.",
+                ),
+            ),
+            (
+                "next_key".to_owned(),
+                ObjectField::required(optional_string()).with_doc(
+                    "Key of the item after this one, or `()` for the last; drops next to it are no-ops and Alt+Down moves after it.",
+                ),
+            ),
+            (
+                "first_key".to_owned(),
+                ObjectField::required(ValueSchema::string())
+                    .with_doc("Key of the first item in the list; Alt+Home moves this item before it."),
+            ),
+            (
+                "last_key".to_owned(),
+                ObjectField::required(ValueSchema::string())
+                    .with_doc("Key of the last item in the list; Alt+End moves this item after it."),
+            ),
+            (
+                "direction".to_owned(),
+                ObjectField::required(ValueSchema::String {
+                    allowed: vec![
+                        "vertical".to_owned(),
+                        "horizontal".to_owned(),
+                        "grid".to_owned(),
+                    ],
+                })
+                .with_doc(
+                    "`vertical` splits the item into top and bottom drop halves; `horizontal` and `grid` into left and right halves.",
+                ),
+            ),
+            (
+                "threshold".to_owned(),
+                ObjectField::optional(ValueSchema::bounded_number(Some(0.0), Some(64.0))).with_doc(
+                    "Pointer movement in logical pixels before a press becomes a drag; defaults to 4.",
+                ),
+            ),
+            (
+                "disabled".to_owned(),
+                ObjectField::optional(ValueSchema::Bool)
+                    .with_default(UiValue::Bool(false))
+                    .with_doc(
+                        "Stops this item from being dragged or moved by key; it still takes drops from other items.",
+                    ),
+            ),
+            (
+                "item_ref".to_owned(),
+                ObjectField::optional(ValueSchema::optional(ValueSchema::Ref)).with_doc(
+                    "Ref to the element whose bounds hold the drop halves and the drag highlight; defaults to this primitive's bounds.",
+                ),
+            ),
+            (
+                "take_focus".to_owned(),
+                ObjectField::optional(ValueSchema::Bool)
+                    .with_default(UiValue::Bool(true))
+                    .with_doc(
+                        "Whether a press focuses the item; `false` leaves focus alone, for items inside a control with one tab stop.",
+                    ),
+            ),
+            (
+                "tap".to_owned(),
+                ObjectField::optional(ValueSchema::Bool)
+                    .with_default(UiValue::Bool(false))
+                    .with_doc(
+                        "Whether a press released before the drag threshold emits `tap`, so the item can be clicked as well as dragged.",
+                    ),
+            ),
+            (
+                "on_reorder".to_owned(),
+                ObjectField::optional(ValueSchema::optional(ValueSchema::Callback)).with_doc(
+                    "Called with the proposed move when an item is dropped on this one, or this item moves by Alt+Arrow, Home or End.",
+                ),
+            ),
+            (
+                "on_tap".to_owned(),
+                ObjectField::optional(ValueSchema::optional(ValueSchema::Callback)).with_doc(
+                    "Called with `item_key` when a press is released before it became a drag; needs `tap`.",
+                ),
+            ),
+        ]),
+        events: sortable_events(),
+        state: ComponentStateSchema::default(),
+        lifecycle: true,
+        effect: None,
+    }
+}
+
+fn f64_to_f32(value: f64) -> f32 {
+    value.to_string().parse().unwrap_or_else(|_| {
+        if value.is_sign_negative() {
+            f32::MIN
+        } else {
+            f32::MAX
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Placement, far_half};
+
+    #[test]
+    fn a_mirrored_row_swaps_its_before_and_after_halves() {
+        assert!(far_half(false, Placement::After));
+        assert!(!far_half(false, Placement::Before));
+        assert!(far_half(true, Placement::Before));
+        assert!(!far_half(true, Placement::After));
+    }
+
+    #[test]
+    fn adjacent_and_self_moves_are_no_ops() {
+        let before = |source: &str, anchor: &str, previous: Option<&str>| {
+            source == anchor || previous == Some(source)
+        };
+        let after = |source: &str, anchor: &str, next: Option<&str>| {
+            source == anchor || next == Some(source)
+        };
+        assert!(before("b", "b", Some("a")));
+        assert!(before("a", "b", Some("a")));
+        assert!(after("b", "b", Some("c")));
+        assert!(after("c", "b", Some("c")));
+        assert!(!before("c", "b", Some("a")));
+        assert!(!after("a", "b", Some("c")));
+    }
+}

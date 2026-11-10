@@ -32,6 +32,8 @@
 //! including `Extension` unless the product registers a projector — serves UI
 //! replay and audit only.
 
+#[cfg(not(target_family = "wasm"))]
+pub mod atomic;
 pub mod event;
 pub mod persistence;
 pub mod projection;

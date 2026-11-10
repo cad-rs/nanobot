@@ -1,7 +1,8 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 use thiserror::Error;
 
@@ -51,6 +52,277 @@ impl GeometryBounds {
     }
 }
 
+/// Finite two-dimensional affine transform using column-vector coordinates.
+///
+/// Points map as `x' = m11*x + m21*y + tx` and
+/// `y' = m12*x + m22*y + ty`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Affine2D {
+    m11: f64,
+    m12: f64,
+    m21: f64,
+    m22: f64,
+    tx: f64,
+    ty: f64,
+}
+
+impl Default for Affine2D {
+    fn default() -> Self {
+        Self::IDENTITY
+    }
+}
+
+impl Affine2D {
+    pub const IDENTITY: Self = Self {
+        m11: 1.0,
+        m12: 0.0,
+        m21: 0.0,
+        m22: 1.0,
+        tx: 0.0,
+        ty: 0.0,
+    };
+
+    /// Construct one validated affine matrix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GeometryError::InvalidTransform`] for non-finite members.
+    pub fn new(
+        m11: f64,
+        m12: f64,
+        m21: f64,
+        m22: f64,
+        tx: f64,
+        ty: f64,
+    ) -> Result<Self, GeometryError> {
+        let transform = Self {
+            m11,
+            m12,
+            m21,
+            m22,
+            tx,
+            ty,
+        };
+        if transform.is_finite() {
+            Ok(transform)
+        } else {
+            Err(GeometryError::InvalidTransform)
+        }
+    }
+
+    /// Construct a translation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GeometryError::InvalidTransform`] for non-finite offsets.
+    pub fn translation(x: f64, y: f64) -> Result<Self, GeometryError> {
+        Self::new(1.0, 0.0, 0.0, 1.0, x, y)
+    }
+
+    /// Construct an axis-aligned scale.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GeometryError::InvalidTransform`] for non-finite scales.
+    pub fn scale(x: f64, y: f64) -> Result<Self, GeometryError> {
+        Self::new(x, 0.0, 0.0, y, 0.0, 0.0)
+    }
+
+    /// Construct a rotation in degrees.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GeometryError::InvalidTransform`] for a non-finite angle.
+    pub fn rotation_degrees(degrees: f64) -> Result<Self, GeometryError> {
+        if !degrees.is_finite() {
+            return Err(GeometryError::InvalidTransform);
+        }
+        let radians = degrees.to_radians();
+        let (sin, cos) = radians.sin_cos();
+        Self::new(cos, sin, -sin, cos, 0.0, 0.0)
+    }
+
+    /// Construct independent X/Y skews in degrees.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GeometryError::InvalidTransform`] for invalid angles.
+    pub fn skew_degrees(x: f64, y: f64) -> Result<Self, GeometryError> {
+        if !x.is_finite() || !y.is_finite() {
+            return Err(GeometryError::InvalidTransform);
+        }
+        Self::new(
+            1.0,
+            y.to_radians().tan(),
+            x.to_radians().tan(),
+            1.0,
+            0.0,
+            0.0,
+        )
+    }
+
+    /// Apply `self`, then `next`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GeometryError::InvalidTransform`] if composition overflows.
+    pub fn then(self, next: Self) -> Result<Self, GeometryError> {
+        Self::new(
+            next.m11.mul_add(self.m11, next.m21 * self.m12),
+            next.m12.mul_add(self.m11, next.m22 * self.m12),
+            next.m11.mul_add(self.m21, next.m21 * self.m22),
+            next.m12.mul_add(self.m21, next.m22 * self.m22),
+            next.m11
+                .mul_add(self.tx, next.m21.mul_add(self.ty, next.tx)),
+            next.m12
+                .mul_add(self.tx, next.m22.mul_add(self.ty, next.ty)),
+        )
+    }
+
+    /// Rebase this transform around an origin.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GeometryError::InvalidTransform`] for invalid coordinates.
+    pub fn around(self, origin: (f64, f64)) -> Result<Self, GeometryError> {
+        Self::translation(-origin.0, -origin.1)?
+            .then(self)?
+            .then(Self::translation(origin.0, origin.1)?)
+    }
+
+    #[must_use]
+    pub fn components(self) -> (f64, f64, f64, f64, f64, f64) {
+        (self.m11, self.m12, self.m21, self.m22, self.tx, self.ty)
+    }
+
+    #[must_use]
+    pub fn map_point(self, point: (f64, f64)) -> (f64, f64) {
+        (
+            self.m11
+                .mul_add(point.0, self.m21.mul_add(point.1, self.tx)),
+            self.m12
+                .mul_add(point.0, self.m22.mul_add(point.1, self.ty)),
+        )
+    }
+
+    #[must_use]
+    pub fn inverse(self) -> Option<Self> {
+        let scale = self
+            .m11
+            .abs()
+            .max(self.m12.abs())
+            .max(self.m21.abs())
+            .max(self.m22.abs());
+        if scale == 0.0 || !scale.is_finite() {
+            return None;
+        }
+        let (a, b, c, d) = (
+            self.m11 / scale,
+            self.m12 / scale,
+            self.m21 / scale,
+            self.m22 / scale,
+        );
+        let determinant = a.mul_add(d, -(b * c));
+        if !determinant.is_finite() || determinant.abs() <= f64::EPSILON {
+            return None;
+        }
+        let m11 = (d / determinant) / scale;
+        let m12 = (-b / determinant) / scale;
+        let m21 = (-c / determinant) / scale;
+        let m22 = (a / determinant) / scale;
+        Self::new(
+            m11,
+            m12,
+            m21,
+            m22,
+            -(m11.mul_add(self.tx, m21 * self.ty)),
+            -(m12.mul_add(self.tx, m22 * self.ty)),
+        )
+        .ok()
+    }
+
+    #[must_use]
+    pub fn transform_bounds(self, bounds: GeometryBounds) -> GeometryBounds {
+        let points = [
+            self.map_point((bounds.x, bounds.y)),
+            self.map_point((bounds.x + bounds.width, bounds.y)),
+            self.map_point((bounds.x, bounds.y + bounds.height)),
+            self.map_point((bounds.x + bounds.width, bounds.y + bounds.height)),
+        ];
+        let (min_x, max_x) = points
+            .iter()
+            .map(|point| point.0)
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(min, max), value| {
+                (min.min(value), max.max(value))
+            });
+        let (min_y, max_y) = points
+            .iter()
+            .map(|point| point.1)
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(min, max), value| {
+                (min.min(value), max.max(value))
+            });
+        GeometryBounds {
+            x: min_x,
+            y: min_y,
+            width: max_x - min_x,
+            height: max_y - min_y,
+        }
+    }
+
+    #[must_use]
+    pub fn is_finite(self) -> bool {
+        [self.m11, self.m12, self.m21, self.m22, self.tx, self.ty]
+            .into_iter()
+            .all(f64::is_finite)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PresentedGeometry {
+    pub local: GeometryBounds,
+    pub layout: GeometryBounds,
+    pub visual: GeometryBounds,
+    pub local_to_window: Affine2D,
+    pub window_to_local: Option<Affine2D>,
+    pub clip: Option<GeometryBounds>,
+}
+
+impl PresentedGeometry {
+    /// Build bidirectional presented coordinates from committed element facts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GeometryError::InvalidTransform`] if derived scale or
+    /// translation overflows.
+    pub fn from_element(geometry: ElementGeometry) -> Result<Self, GeometryError> {
+        let scale_x = if geometry.layout.width.abs() <= f64::EPSILON {
+            1.0
+        } else {
+            geometry.visual.width / geometry.layout.width
+        };
+        let scale_y = if geometry.layout.height.abs() <= f64::EPSILON {
+            1.0
+        } else {
+            geometry.visual.height / geometry.layout.height
+        };
+        let local_to_window = Affine2D::scale(scale_x, scale_y)?
+            .then(Affine2D::translation(geometry.visual.x, geometry.visual.y)?)?;
+        Ok(Self {
+            local: GeometryBounds {
+                x: 0.0,
+                y: 0.0,
+                width: geometry.layout.width,
+                height: geometry.layout.height,
+            },
+            layout: geometry.layout,
+            visual: geometry.visual,
+            local_to_window,
+            window_to_local: local_to_window.inverse(),
+            clip: geometry.clip,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ElementGeometry {
     pub layout: GeometryBounds,
@@ -62,14 +334,26 @@ pub struct ElementGeometry {
 struct GeometryState {
     committed: BTreeMap<NodeId, ElementGeometry>,
     presented: BTreeSet<NodeId>,
-    readers: BTreeMap<NodeId, BTreeSet<ComponentInstancePath>>,
+    /// Nodes presented by cache islands replayed this frame, each sorted.
+    presented_islands: Vec<Rc<[NodeId]>>,
+    /// The nodes presented while an island records its render.
+    island_record: Option<Vec<NodeId>>,
+    readers: BTreeMap<NodeId, BTreeSet<crate::read_dependency::ReadDependency>>,
+    // Keep direct NodeId dependencies separate: detaching a ref must not detach
+    // an independent direct read of the same node by the same contribution.
+    ref_readers: crate::element_ref::ElementRefGeometryBindings,
     dirty: BTreeSet<ComponentInstancePath>,
     layout_motion: BTreeMap<NodeId, LayoutMotionState>,
     shared_layout: BTreeMap<(String, String), (NodeId, GeometryBounds)>,
     motion_progress: BTreeMap<(NodeId, crate::MotionProperty), f64>,
     motion_trigger_targets: BTreeMap<(NodeId, crate::MotionProgressDriver), bool>,
-    motion_triggers: BTreeMap<(NodeId, crate::MotionProgressDriver), TriggerMotionState>,
+    motion_triggers: BTreeMap<(NodeId, crate::MotionProperty), TriggerMotionState>,
     canvas_transforms: BTreeMap<NodeId, CanvasMotionTransform>,
+    canvas_drawables: BTreeMap<NodeId, ElementGeometry>,
+    element_offsets: BTreeMap<NodeId, (f64, f64)>,
+    /// This frame's hitbox of each node with an element ref, so native code
+    /// can ask whether the pointer is over its visible, unoccluded part.
+    hitboxes: BTreeMap<NodeId, gpui::HitboxId>,
 }
 
 #[derive(Clone, Debug)]
@@ -173,12 +457,20 @@ impl GeometryRegistry {
         let mut current = self.inner.borrow_mut();
         let state = Rc::make_mut(&mut current);
         state.presented.insert(node);
+        if let Some(record) = &mut state.island_record {
+            record.push(node);
+        }
         if state.committed.get(&node) == Some(&geometry) {
             return false;
         }
+        let size_changed = state
+            .committed
+            .get(&node)
+            .map(|previous| (previous.layout.width, previous.layout.height))
+            != Some((geometry.layout.width, geometry.layout.height));
         state.committed.insert(node, geometry);
-        let readers = state.readers.get(&node).cloned().unwrap_or_default();
-        state.dirty.extend(readers);
+        let owners = geometry_read_owners(state, node, size_changed);
+        state.dirty.extend(owners);
         true
     }
 
@@ -244,7 +536,7 @@ impl GeometryRegistry {
         let result = LayoutMotionSample {
             offset_x: sampled.x - layout.x,
             offset_y: sampled.y - layout.y,
-            // GPUI 0.2.2 exposes an element offset but no public arbitrary
+            // GPUI exposes an element offset but no public arbitrary
             // subtree scale transform. Keep visual/hit geometry honest and
             // snap size while animating position.
             scale_x: 1.0,
@@ -330,6 +622,60 @@ impl GeometryRegistry {
             .unwrap_or_default()
     }
 
+    pub(crate) fn record_hitbox(&self, node: NodeId, hitbox: gpui::HitboxId) {
+        Rc::make_mut(&mut self.inner.borrow_mut())
+            .hitboxes
+            .insert(node, hitbox);
+    }
+
+    pub(crate) fn hitbox(&self, node: NodeId) -> Option<gpui::HitboxId> {
+        self.inner.borrow().hitboxes.get(&node).copied()
+    }
+
+    pub(crate) fn record_element_offset(&self, node: NodeId, offset: (f64, f64)) {
+        Rc::make_mut(&mut self.inner.borrow_mut())
+            .element_offsets
+            .insert(node, offset);
+    }
+
+    pub(crate) fn update_canvas_drawable(
+        &self,
+        node: NodeId,
+        visual: GeometryBounds,
+        offset: (f64, f64),
+    ) {
+        let mut current = self.inner.borrow_mut();
+        let state = Rc::make_mut(&mut current);
+        let Some(outer) = state.committed.get(&node) else {
+            return;
+        };
+        let base_offset = state
+            .element_offsets
+            .get(&node)
+            .copied()
+            .unwrap_or_default();
+        let geometry = ElementGeometry {
+            layout: GeometryBounds {
+                x: visual.x - (offset.0 - base_offset.0),
+                y: visual.y - (offset.1 - base_offset.1),
+                ..visual
+            },
+            visual,
+            clip: outer.clip,
+        };
+        if state.canvas_drawables.get(&node) != Some(&geometry) {
+            state.canvas_drawables.insert(node, geometry);
+            // Drawable motion does not change the committed layout size read
+            // through element_size, even when its visual extent changes.
+            let owners = geometry_read_owners(state, node, false);
+            state.dirty.extend(owners);
+        }
+    }
+
+    pub(crate) fn canvas_drawable(&self, node: NodeId) -> Option<ElementGeometry> {
+        self.inner.borrow().canvas_drawables.get(&node).copied()
+    }
+
     pub(crate) fn sample_motion_trigger(
         &self,
         node: NodeId,
@@ -337,19 +683,30 @@ impl GeometryRegistry {
         preference: crate::MotionPreference,
         now: Instant,
     ) -> TriggerMotionSample {
+        let active = self
+            .inner
+            .borrow()
+            .motion_trigger_targets
+            .get(&(node, binding.driver))
+            .copied()
+            .unwrap_or(false);
+        self.sample_motion_trigger_target(node, binding, active, preference, now)
+    }
+
+    pub(crate) fn sample_motion_trigger_target(
+        &self,
+        node: NodeId,
+        binding: &crate::MotionProgressBinding,
+        active: bool,
+        preference: crate::MotionPreference,
+        now: Instant,
+    ) -> TriggerMotionSample {
         let mut current = self.inner.borrow_mut();
         let state = Rc::make_mut(&mut current);
-        let key = (node, binding.driver);
-        let target = if state
-            .motion_trigger_targets
-            .get(&key)
-            .copied()
-            .unwrap_or(false)
-        {
-            1.0
-        } else {
-            0.0
-        };
+        // Each property owns its own clock, even when several properties share
+        // one trigger but intentionally use different durations.
+        let key = (node, binding.property());
+        let target = if active { 1.0 } else { 0.0 };
         if preference != crate::MotionPreference::Normal {
             state.motion_triggers.remove(&key);
             return TriggerMotionSample {
@@ -407,47 +764,179 @@ impl GeometryRegistry {
             .readers
             .entry(node)
             .or_default()
-            .insert(reader.clone());
+            .insert(crate::read_dependency::ReadDependency::component(reader));
         Ok(geometry)
     }
 
+    #[cfg(test)]
     pub(crate) fn read_tracked(
         &self,
         node: NodeId,
-        reader: &ComponentInstancePath,
+        reader: impl Into<crate::read_dependency::ReadDependency>,
     ) -> Option<ElementGeometry> {
         let mut current = self.inner.borrow_mut();
         let state = Rc::make_mut(&mut current);
-        state
-            .readers
-            .entry(node)
-            .or_default()
-            .insert(reader.clone());
+        state.readers.entry(node).or_default().insert(reader.into());
         state.committed.get(&node).copied()
     }
 
-    pub(crate) fn register_readers(&self, node: NodeId, readers: BTreeSet<ComponentInstancePath>) {
-        if readers.is_empty() {
-            return;
-        }
+    pub(crate) fn read_ref_tracked(
+        &self,
+        reference: &crate::ElementRefId,
+        node: NodeId,
+        reader: impl Into<crate::read_dependency::ReadDependency>,
+    ) -> Option<ElementGeometry> {
+        self.read_ref_observation(
+            reference,
+            node,
+            reader,
+            crate::element_ref::ElementRefGeometryRead::Bounds,
+        )
+    }
+
+    pub(crate) fn read_ref_observation(
+        &self,
+        reference: &crate::ElementRefId,
+        node: NodeId,
+        reader: impl Into<crate::read_dependency::ReadDependency>,
+        observation: crate::element_ref::ElementRefGeometryRead,
+    ) -> Option<ElementGeometry> {
         let mut current = self.inner.borrow_mut();
         let state = Rc::make_mut(&mut current);
-        let committed = state.committed.contains_key(&node);
-        for reader in readers {
-            if state
-                .readers
+        crate::element_ref::track_geometry_ref_reader(
+            state
+                .ref_readers
                 .entry(node)
                 .or_default()
-                .insert(reader.clone())
-                && committed
-            {
-                state.dirty.insert(reader);
+                .entry(reference.clone())
+                .or_default(),
+            reader.into(),
+            observation,
+        );
+        state.committed.get(&node).copied()
+    }
+
+    /// Replace the logical-ref observation targets for one committed view scope.
+    /// The snapshot is authoritative even when no binding currently exists.
+    pub(crate) fn sync_ref_readers(
+        &self,
+        scope: &ComponentInstancePath,
+        bindings: crate::element_ref::ElementRefGeometryBindings,
+    ) {
+        let mut current = self.inner.borrow_mut();
+        let state = Rc::make_mut(&mut current);
+        let previous = state.ref_readers.clone();
+        for refs in state.ref_readers.values_mut() {
+            refs.retain(|reference, _| !reference.component().is_within(scope));
+        }
+        state.ref_readers.retain(|_, refs| !refs.is_empty());
+        for (node, refs) in bindings {
+            for (reference, readers) in refs {
+                if state.committed.contains_key(&node) {
+                    let previous_readers =
+                        previous.get(&node).and_then(|refs| refs.get(&reference));
+                    state.dirty.extend(
+                        readers
+                            .keys()
+                            .filter(|reader| {
+                                previous_readers.is_none_or(|previous| {
+                                    previous.get(*reader).is_none_or(|previous_observation| {
+                                        *previous_observation < readers[*reader]
+                                    })
+                                })
+                            })
+                            .map(|reader| reader.owner.clone()),
+                    );
+                }
+                state
+                    .ref_readers
+                    .entry(node)
+                    .or_default()
+                    .insert(reference, readers);
             }
         }
     }
 
     pub(crate) fn get(&self, node: NodeId) -> Option<ElementGeometry> {
         self.inner.borrow().committed.get(&node).copied()
+    }
+
+    // The state is shared with the snapshot a transaction holds: each change
+    // below first checks that it changes something, so a transaction does not
+    // copy the state of every view it passes over.
+
+    pub(crate) fn reset_contribution(&self, reader: &crate::read_dependency::ReadDependency) {
+        let mut current = self.inner.borrow_mut();
+        let keep = |existing: &crate::read_dependency::ReadDependency| existing != reader;
+        if !geometry_readers_kept(&current, &keep) {
+            retain_geometry_readers(Rc::make_mut(&mut current), keep);
+        }
+    }
+    pub(crate) fn retain_contributions(
+        &self,
+        scope: &ComponentInstancePath,
+        active: &BTreeSet<crate::read_dependency::ReadContribution>,
+    ) {
+        let mut current = self.inner.borrow_mut();
+        let keep = |reader: &crate::read_dependency::ReadDependency| {
+            reader.retained_in_contribution_scope(scope, active)
+        };
+        if !geometry_readers_kept(&current, &keep) {
+            retain_geometry_readers(Rc::make_mut(&mut current), keep);
+        }
+    }
+
+    pub(crate) fn retain_reader_scope(
+        &self,
+        scope: &ComponentInstancePath,
+        active: &BTreeSet<ComponentInstancePath>,
+    ) {
+        let mut current = self.inner.borrow_mut();
+        let keep = |reader: &crate::read_dependency::ReadDependency| {
+            reader.retained_in_owner_scope(scope, active)
+        };
+        let provided = |reference: &crate::ElementRefId| {
+            let provider = reference.component();
+            !provider.is_within(scope) || provider == scope || active.contains(provider)
+        };
+        if geometry_readers_kept(&current, &keep)
+            && current
+                .ref_readers
+                .values()
+                .all(|refs| refs.keys().all(provided))
+            && current
+                .dirty
+                .iter()
+                .all(|owner| !owner.is_within(scope) || owner == scope || active.contains(owner))
+        {
+            return;
+        }
+        let state = Rc::make_mut(&mut current);
+        retain_geometry_readers(state, keep);
+        for refs in state.ref_readers.values_mut() {
+            refs.retain(|reference, _| provided(reference));
+        }
+        state.ref_readers.retain(|_, refs| !refs.is_empty());
+        state
+            .dirty
+            .retain(|owner| !owner.is_within(scope) || owner == scope || active.contains(owner));
+    }
+
+    pub(crate) fn remove_scope(&self, scope: &ComponentInstancePath) {
+        let mut current = self.inner.borrow_mut();
+        let state = Rc::make_mut(&mut current);
+        retain_geometry_readers(state, |reader| !reader.owner.is_within(scope));
+        for refs in state.ref_readers.values_mut() {
+            refs.retain(|reference, _| !reference.component().is_within(scope));
+        }
+        state.ref_readers.retain(|_, refs| !refs.is_empty());
+        state.dirty.retain(|owner| !owner.is_within(scope));
+    }
+
+    pub(crate) fn presented(&self, node: NodeId) -> Result<PresentedGeometry, GeometryError> {
+        self.get(node)
+            .ok_or(GeometryError::Unavailable(node))
+            .and_then(PresentedGeometry::from_element)
     }
 
     pub(crate) fn begin_frame(&self) {
@@ -457,6 +946,35 @@ impl GeometryRegistry {
             .shared_layout
             .retain(|_, (node, _)| state.presented.contains(node));
         state.presented.clear();
+        state.presented_islands.clear();
+        // A node that is not drawn this frame has no hitbox.
+        state.hitboxes.clear();
+    }
+
+    /// Starts recording the nodes an island's render presents.
+    pub(crate) fn begin_island_record(&self) {
+        Rc::make_mut(&mut self.inner.borrow_mut()).island_record = Some(Vec::new());
+    }
+
+    /// The nodes presented since [`Self::begin_island_record`], sorted.
+    pub(crate) fn end_island_record(&self) -> Rc<[NodeId]> {
+        let mut nodes = Rc::make_mut(&mut self.inner.borrow_mut())
+            .island_record
+            .take()
+            .unwrap_or_default();
+        nodes.sort_unstable();
+        nodes.dedup();
+        nodes.into()
+    }
+
+    /// Presents the nodes an island presented when it last rendered: a frame
+    /// that replays the island's drawing does not run its elements.
+    pub(crate) fn replay_presented(&self, nodes: Rc<[NodeId]>) {
+        if !nodes.is_empty() {
+            Rc::make_mut(&mut self.inner.borrow_mut())
+                .presented_islands
+                .push(nodes);
+        }
     }
 
     pub(crate) fn finish_frame(&self) {
@@ -468,28 +986,76 @@ impl GeometryRegistry {
     }
 
     pub(crate) fn is_presented(&self, node: NodeId) -> bool {
-        self.inner.borrow().presented.contains(&node)
+        let state = self.inner.borrow();
+        state.presented.contains(&node)
+            || state
+                .presented_islands
+                .iter()
+                .any(|nodes| nodes.binary_search(&node).is_ok())
     }
 
-    pub(crate) fn retain_nodes(&self, active: &BTreeSet<NodeId>) {
+    /// Forgets every node `tree` does not hold.
+    pub(crate) fn retain_tree(&self, tree: &crate::RetainedUiTree) {
+        // Sorted ids answer membership faster than the tree's own table.
+        let live = tree
+            .nodes()
+            .map(crate::RetainedNode::id)
+            .collect::<Vec<_>>();
+        self.retain_nodes(|node| live.binary_search(&node).is_ok());
+    }
+
+    /// Forgets every node for which `active` is false.
+    pub(crate) fn retain_nodes(&self, active: impl Fn(NodeId) -> bool) {
         let mut current = self.inner.borrow_mut();
+        let state = &**current;
+        let kept = |mut nodes: Box<dyn Iterator<Item = NodeId> + '_>| nodes.all(&active);
+        let kept = kept(Box::new(state.committed.keys().copied()))
+            && kept(Box::new(state.presented.iter().copied()))
+            && kept(Box::new(
+                state
+                    .presented_islands
+                    .iter()
+                    .flat_map(|nodes| nodes.iter().copied()),
+            ))
+            && kept(Box::new(state.readers.keys().copied()))
+            && kept(Box::new(state.ref_readers.keys().copied()))
+            && kept(Box::new(state.layout_motion.keys().copied()))
+            && kept(Box::new(
+                state.motion_progress.keys().map(|(node, _)| *node),
+            ))
+            && kept(Box::new(
+                state.motion_trigger_targets.keys().map(|(node, _)| *node),
+            ))
+            && kept(Box::new(
+                state.motion_triggers.keys().map(|(node, _)| *node),
+            ))
+            && kept(Box::new(state.canvas_transforms.keys().copied()))
+            && kept(Box::new(state.canvas_drawables.keys().copied()))
+            && kept(Box::new(state.element_offsets.keys().copied()))
+            && kept(Box::new(state.hitboxes.keys().copied()));
+        if kept {
+            return;
+        }
         let state = Rc::make_mut(&mut current);
-        state.committed.retain(|node, _| active.contains(node));
-        state.presented.retain(|node| active.contains(node));
-        state.readers.retain(|node, _| active.contains(node));
-        state.layout_motion.retain(|node, _| active.contains(node));
-        state
-            .motion_progress
-            .retain(|(node, _), _| active.contains(node));
+        state.committed.retain(|node, _| active(*node));
+        state.presented.retain(|node| active(*node));
+        for nodes in &mut state.presented_islands {
+            if nodes.iter().any(|node| !active(*node)) {
+                *nodes = nodes.iter().copied().filter(|node| active(*node)).collect();
+            }
+        }
+        state.readers.retain(|node, _| active(*node));
+        state.ref_readers.retain(|node, _| active(*node));
+        state.layout_motion.retain(|node, _| active(*node));
+        state.motion_progress.retain(|(node, _), _| active(*node));
         state
             .motion_trigger_targets
-            .retain(|(node, _), _| active.contains(node));
-        state
-            .motion_triggers
-            .retain(|(node, _), _| active.contains(node));
-        state
-            .canvas_transforms
-            .retain(|node, _| active.contains(node));
+            .retain(|(node, _), _| active(*node));
+        state.motion_triggers.retain(|(node, _), _| active(*node));
+        state.canvas_transforms.retain(|node, _| active(*node));
+        state.canvas_drawables.retain(|node, _| active(*node));
+        state.element_offsets.retain(|node, _| active(*node));
+        state.hitboxes.retain(|node, _| active(*node));
     }
 
     pub(crate) fn retain_shared_layout_ids(&self, active: &BTreeSet<(String, String)>) {
@@ -511,6 +1077,61 @@ impl GeometryRegistry {
     }
 }
 
+fn geometry_read_owners(
+    state: &GeometryState,
+    node: NodeId,
+    size_changed: bool,
+) -> BTreeSet<ComponentInstancePath> {
+    state
+        .readers
+        .get(&node)
+        .into_iter()
+        .flatten()
+        .chain(
+            state
+                .ref_readers
+                .get(&node)
+                .into_iter()
+                .flat_map(BTreeMap::values)
+                .flat_map(BTreeMap::iter)
+                .filter(|(_, observation)| {
+                    size_changed
+                        || **observation == crate::element_ref::ElementRefGeometryRead::Bounds
+                })
+                .map(|(reader, _)| reader),
+        )
+        .map(|reader| reader.owner.clone())
+        .collect()
+}
+
+/// Whether [`retain_geometry_readers`] would keep every reader and entry.
+fn geometry_readers_kept(
+    state: &GeometryState,
+    predicate: &impl Fn(&crate::read_dependency::ReadDependency) -> bool,
+) -> bool {
+    state
+        .readers
+        .values()
+        .all(|readers| !readers.is_empty() && readers.iter().all(predicate))
+        && state.ref_readers.values().all(|refs| {
+            !refs.is_empty()
+                && refs
+                    .values()
+                    .all(|readers| !readers.is_empty() && readers.keys().all(predicate))
+        })
+}
+
+fn retain_geometry_readers(
+    state: &mut GeometryState,
+    predicate: impl Fn(&crate::read_dependency::ReadDependency) -> bool,
+) {
+    crate::read_dependency::retain_readers(&mut state.readers, &predicate);
+    for refs in state.ref_readers.values_mut() {
+        crate::element_ref::retain_geometry_ref_readers(refs, &predicate);
+    }
+    state.ref_readers.retain(|_, refs| !refs.is_empty());
+}
+
 fn sample_layout_bounds(motion: &LayoutMotionState, now: Instant) -> GeometryBounds {
     let progress = if motion.duration.is_zero() {
         1.0
@@ -519,13 +1140,7 @@ fn sample_layout_bounds(motion: &LayoutMotionState, now: Instant) -> GeometryBou
             / motion.duration.as_secs_f64())
         .clamp(0.0, 1.0)
     };
-    let progress = match motion.easing {
-        crate::MotionEasing::Linear => progress,
-        crate::MotionEasing::EaseIn => progress * progress,
-        crate::MotionEasing::EaseOut => 1.0 - (1.0 - progress).powi(2),
-        crate::MotionEasing::EaseInOut if progress < 0.5 => 2.0 * progress * progress,
-        crate::MotionEasing::EaseInOut => 1.0 - (-2.0 * progress + 2.0).powi(2) / 2.0,
-    };
+    let progress = motion.easing.sample(progress);
     let interpolate = |from: f64, to: f64| from + (to - from) * progress;
     GeometryBounds {
         x: interpolate(motion.from.x, motion.to.x),
@@ -558,6 +1173,8 @@ pub enum GeometryError {
         width: f64,
         height: f64,
     },
+    #[error("affine transform members must be finite")]
+    InvalidTransform,
     #[error("geometry for retained node {0} is not committed")]
     Unavailable(NodeId),
 }
@@ -565,6 +1182,68 @@ pub enum GeometryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn affine_inverse_is_scale_relative_and_rejects_singular_matrices() {
+        for scale in [1e-200, 1e-10, 1e-5, 1.0, 1e5, 1e200] {
+            let transform = Affine2D::scale(scale, scale * 2.0)
+                .unwrap()
+                .then(Affine2D::rotation_degrees(31.0).unwrap())
+                .unwrap();
+            let inverse = transform.inverse().unwrap();
+            for point in [(0.0, 0.0), (1.0, 2.0), (-10.0, 40.0)] {
+                let restored = inverse.map_point(transform.map_point(point));
+                assert!((restored.0 - point.0).abs() < 1e-10);
+                assert!((restored.1 - point.1).abs() < 1e-10);
+            }
+        }
+        assert!(Affine2D::scale(0.0, 1.0).unwrap().inverse().is_none());
+        assert!(
+            Affine2D::new(1.0, 2.0, 2.0, 4.0, 0.0, 0.0)
+                .unwrap()
+                .inverse()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn affine_composition_inverse_and_bounds_share_one_coordinate_fact() {
+        let transform = Affine2D::scale(2.0, 3.0)
+            .unwrap()
+            .then(Affine2D::rotation_degrees(90.0).unwrap())
+            .unwrap()
+            .then(Affine2D::translation(10.0, 20.0).unwrap())
+            .unwrap();
+        let mapped = transform.map_point((1.0, 2.0));
+        assert!((mapped.0 - 4.0).abs() < 0.000_001);
+        assert!((mapped.1 - 22.0).abs() < 0.000_001);
+        let restored = transform.inverse().unwrap().map_point(mapped);
+        assert!((restored.0 - 1.0).abs() < 0.000_001);
+        assert!((restored.1 - 2.0).abs() < 0.000_001);
+
+        let rotated = Affine2D::rotation_degrees(90.0)
+            .unwrap()
+            .transform_bounds(GeometryBounds::new(0.0, 0.0, 10.0, 5.0).unwrap());
+        assert!((rotated.x + 5.0).abs() < 0.000_001);
+        assert!(rotated.y.abs() < 0.000_001);
+        assert!((rotated.width - 5.0).abs() < 0.000_001);
+        assert!((rotated.height - 10.0).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn presented_geometry_maps_local_and_window_coordinates_both_ways() {
+        let presented = PresentedGeometry::from_element(ElementGeometry {
+            layout: GeometryBounds::new(10.0, 20.0, 100.0, 50.0).unwrap(),
+            visual: GeometryBounds::new(30.0, 40.0, 200.0, 25.0).unwrap(),
+            clip: Some(GeometryBounds::new(0.0, 0.0, 300.0, 200.0).unwrap()),
+        })
+        .unwrap();
+        let window = presented.local_to_window.map_point((25.0, 10.0));
+        assert_eq!(window, (80.0, 45.0));
+        let local = presented.window_to_local.unwrap().map_point(window);
+        assert!((local.0 - 25.0).abs() < 0.000_001);
+        assert!((local.1 - 10.0).abs() < 0.000_001);
+    }
 
     #[test]
     fn changed_geometry_invalidates_exact_readers_and_snapshot_restores() {
@@ -662,6 +1341,73 @@ mod tests {
             start + Duration::from_millis(100),
         );
         assert!((sample.value - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn native_trigger_properties_keep_independent_clocks_and_policy_endpoints() {
+        let mut tree = crate::RetainedUiTree::new();
+        tree.reconcile(crate::UiNode::text("target")).unwrap();
+        let node = tree.root_id().unwrap();
+        let registry = GeometryRegistry::new();
+        let start = Instant::now();
+        let binding = |property, duration| {
+            let mut source = crate::MotionTransition::new(property, 0.0, 1.0, duration);
+            source.easing = crate::MotionEasing::Linear;
+            crate::MotionProgressBinding::new(
+                crate::MotionProgressDriver::Hover,
+                crate::MotionSource::Transition(source),
+            )
+            .unwrap()
+        };
+        let fast = binding(crate::MotionProperty::Width, 80);
+        let slow = binding(crate::MotionProperty::Height, 160);
+        registry.set_motion_trigger(node, crate::MotionProgressDriver::Hover, true);
+        for source in [&fast, &slow] {
+            assert!(
+                registry
+                    .sample_motion_trigger(node, source, crate::MotionPreference::Normal, start)
+                    .active
+            );
+        }
+        let at = start + Duration::from_millis(40);
+        assert!(
+            (registry
+                .sample_motion_trigger(node, &fast, crate::MotionPreference::Normal, at)
+                .value
+                - 0.5)
+                .abs()
+                < 0.001
+        );
+        assert!(
+            (registry
+                .sample_motion_trigger(node, &slow, crate::MotionPreference::Normal, at)
+                .value
+                - 0.25)
+                .abs()
+                < 0.001
+        );
+        registry.set_motion_trigger(node, crate::MotionProgressDriver::Hover, false);
+        assert!(
+            (registry
+                .sample_motion_trigger(node, &fast, crate::MotionPreference::Normal, at)
+                .value
+                - 0.5)
+                .abs()
+                < 0.001
+        );
+        for preference in [
+            crate::MotionPreference::Reduced,
+            crate::MotionPreference::None,
+        ] {
+            let sample = registry.sample_motion_trigger(node, &slow, preference, at);
+            assert!(sample.value.abs() < f64::EPSILON);
+            assert!(!sample.active);
+            registry.set_motion_trigger(node, crate::MotionProgressDriver::Hover, true);
+            let sample = registry.sample_motion_trigger(node, &slow, preference, at);
+            assert!((sample.value - 1.0).abs() < f64::EPSILON);
+            assert!(!sample.active);
+            registry.set_motion_trigger(node, crate::MotionProgressDriver::Hover, false);
+        }
     }
 
     #[test]

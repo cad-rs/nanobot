@@ -1,25 +1,30 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
+use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AnyElement, App, Bounds, BoxShadow, ClickEvent, DispatchPhase, Display, Element, ElementId,
-    FocusHandle, GlobalElementId, InspectorElementId, InteractiveElement, IntoElement,
-    KeyDownEvent, LayoutId, MouseDownEvent, ParentElement, Pixels, Point, SharedString,
-    StatefulInteractiveElement, Style as GpuiStyle, Styled, WeakFocusHandle, Window, deferred, div,
-    point, px, relative, rgba, size,
+    FlexDirection, FocusHandle, GlobalElementId, InspectorElementId, InteractiveElement,
+    IntoElement, KeyDownEvent, LayoutId, MouseDownEvent, ParentElement, Pixels, Point,
+    SharedString, StatefulInteractiveElement, Style as GpuiStyle, Styled, WeakFocusHandle, Window,
+    deferred, div, point, px, relative, rgba, size,
 };
 
 use crate::{
-    FocusToken, LayerNodeSpec, LayerPlacement, OverlayBounds, OverlayId, OverlayInitialFocus,
-    OverlayKind, OverlayManager, OverlayNodeSpec, OverlayPlacement, OverlaySpec,
-    OverlayWidthPolicy, PlacementResult, Rgba8,
+    FocusToken, LayerNodeSpec, LayerPlacement, OpenOverlay, OverlayBounds, OverlayId,
+    OverlayInitialFocus, OverlayKind, OverlayManager, OverlayNodeSpec, OverlayPlacement,
+    OverlaySpec, OverlayWidthPolicy, PlacementResult, Rgba8,
 };
 
 pub(crate) type OpenChangeHandler = Rc<dyn Fn(bool, &mut Window, &mut App)>;
 pub(crate) type PanelKeyHandler = Rc<dyn Fn(&KeyDownEvent, &mut Window, &mut App) -> bool>;
 pub(crate) type BackdropStyleHandler = Rc<dyn Fn(gpui::Div) -> gpui::Div>;
+/// Gives an element a view's keyboard handling (its key context, Tab and the
+/// actions Host bindings dispatch to it).
+pub(crate) type LayerKeyScope = Rc<dyn Fn(gpui::Div) -> gpui::Div>;
 
 #[derive(Clone)]
 pub(crate) struct WindowOverlayCoordinator(Rc<RefCell<OverlayCoordinatorState>>);
@@ -33,7 +38,24 @@ struct OverlayCoordinatorState {
     viewport: OverlayBounds,
     tooltip_owners: BTreeMap<String, BTreeSet<OverlayId>>,
     layer_elements: BTreeMap<OverlayId, (usize, AnyElement)>,
+    /// Who declared each overlay rendered this frame, for Host lookups by key.
+    identities: BTreeMap<OverlayId, OverlayIdentity>,
+    /// The panels of the modals open this frame; only the topmost holds focus.
+    modal_panels: BTreeMap<OverlayId, FocusHandle>,
+    modal_focus_check: bool,
+    /// Each view's keyboard scope, for the layer content the Host portal
+    /// paints outside the view root.
+    layer_key_scopes: BTreeMap<String, LayerKeyScope>,
     host_managed: bool,
+}
+
+/// An overlay's identity: the view, the declaring component instance and the
+/// script key. The window-wide id is derived from it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OverlayIdentity {
+    pub(crate) view_id: String,
+    pub(crate) owner: Option<String>,
+    pub(crate) local: OverlayId,
 }
 
 impl Default for WindowOverlayCoordinator {
@@ -47,6 +69,10 @@ impl Default for WindowOverlayCoordinator {
             outside_listener_claimed: false,
             viewport: OverlayBounds::default(),
             tooltip_owners: BTreeMap::new(),
+            identities: BTreeMap::new(),
+            modal_panels: BTreeMap::new(),
+            modal_focus_check: false,
+            layer_key_scopes: BTreeMap::new(),
             layer_elements: BTreeMap::new(),
             host_managed: false,
         })))
@@ -72,6 +98,9 @@ impl WindowOverlayCoordinator {
         state.viewport = viewport;
         state.callbacks.clear();
         state.priorities.clear();
+        state.identities.clear();
+        state.modal_panels.clear();
+        state.modal_focus_check = false;
         state.next_priority = 1;
         state.outside_listener_claimed = false;
         state.layer_elements.clear();
@@ -92,6 +121,21 @@ impl WindowOverlayCoordinator {
             .borrow_mut()
             .layer_elements
             .insert(id, (priority, element));
+    }
+
+    pub(crate) fn set_layer_key_scope(&self, view_id: &str, scope: LayerKeyScope) {
+        self.0
+            .borrow_mut()
+            .layer_key_scopes
+            .insert(view_id.to_owned(), scope);
+    }
+
+    fn with_layer_key_scope(&self, view_id: &str, layer: gpui::Div) -> gpui::Div {
+        let scope = self.0.borrow().layer_key_scopes.get(view_id).cloned();
+        match scope {
+            Some(scope) => scope(layer),
+            None => layer,
+        }
     }
 
     pub(crate) fn take_layer_elements(&self) -> Vec<AnyElement> {
@@ -123,13 +167,100 @@ impl WindowOverlayCoordinator {
         }
     }
 
-    pub(crate) fn scoped_id(view_id: &str, local: &OverlayId) -> OverlayId {
-        OverlayId::new(format!("{view_id}::{}", local.as_str()))
+    /// The window-wide id of a view's overlay: scoped by the view and by the
+    /// component instance that declared it.
+    pub(crate) fn scoped_id(
+        view_id: &str,
+        owner: Option<&crate::ComponentInstancePath>,
+        local: &OverlayId,
+    ) -> OverlayId {
+        match owner {
+            Some(owner) => OverlayId::new(format!("{view_id}::{owner}::{}", local.as_str())),
+            None => OverlayId::new(format!("{view_id}::{}", local.as_str())),
+        }
     }
 
-    pub(crate) fn placement(&self, view_id: &str, local: &OverlayId) -> Option<PlacementResult> {
-        let id = Self::scoped_id(view_id, local);
-        self.0.borrow().manager.placement(&id)
+    pub(crate) fn record_identity(&self, id: OverlayId, identity: OverlayIdentity) {
+        self.0.borrow_mut().identities.insert(id, identity);
+    }
+
+    /// Placements of the overlays a view rendered with this key in the last
+    /// frame, by declaring instance; `owner` narrows them to one instance.
+    pub(crate) fn placements(
+        &self,
+        view_id: &str,
+        owner: Option<&str>,
+        local: &OverlayId,
+    ) -> Vec<(Option<String>, Option<PlacementResult>)> {
+        let state = self.0.borrow();
+        state
+            .identities
+            .iter()
+            .filter(|(_, identity)| {
+                identity.view_id == view_id
+                    && identity.local == *local
+                    && owner.is_none_or(|owner| identity.owner.as_deref() == Some(owner))
+            })
+            .map(|(id, identity)| (identity.owner.clone(), state.manager.placement(id)))
+            .collect()
+    }
+
+    /// The script overlays open as of the last frame, topmost last.
+    pub(crate) fn open_overlays(&self) -> Vec<OpenOverlay> {
+        let state = self.0.borrow();
+        state
+            .manager
+            .stack()
+            .filter_map(|spec| {
+                let identity = state.identities.get(&spec.id)?;
+                Some(OpenOverlay {
+                    view_id: identity.view_id.clone(),
+                    owner: identity.owner.clone(),
+                    key: identity.local.as_str().to_owned(),
+                    kind: spec.kind,
+                    modal: spec.modal,
+                    dismiss_on_escape: spec.dismiss_on_escape,
+                })
+            })
+            .collect()
+    }
+
+    fn record_modal_panel(&self, id: OverlayId, panel: FocusHandle) {
+        self.0.borrow_mut().modal_panels.insert(id, panel);
+    }
+
+    /// Move focus into the topmost open modal once this frame is built. A
+    /// modal notices focus outside its panel during its own layout, before
+    /// the overlays above it have registered; if each modal took focus for
+    /// itself there, two open modals would take it from each other every
+    /// frame and the window would never go idle.
+    fn keep_focus_in_topmost_modal(&self, window: &mut Window, cx: &mut App) {
+        {
+            let mut state = self.0.borrow_mut();
+            if state.modal_focus_check {
+                return;
+            }
+            state.modal_focus_check = true;
+        }
+        let coordinator = self.clone();
+        window.defer(cx, move |window, cx| {
+            let topmost = {
+                let mut state = coordinator.0.borrow_mut();
+                state.modal_focus_check = false;
+                state
+                    .manager
+                    .stack()
+                    .rev()
+                    .filter(|spec| spec.modal)
+                    .find_map(|spec| state.modal_panels.get(&spec.id).cloned())
+            };
+            // Outside a frame `focus()` asks for the next one itself.
+            if let Some(panel) = topmost
+                && !panel.contains_focused(window, cx)
+            {
+                panel.focus(window, cx);
+            }
+        });
     }
 
     pub(crate) fn remove_view(&self, view_id: &str) {
@@ -145,6 +276,13 @@ impl WindowOverlayCoordinator {
         state
             .layer_elements
             .retain(|id, _| !id.as_str().starts_with(&prefix));
+        state
+            .modal_panels
+            .retain(|id, _| !id.as_str().starts_with(&prefix));
+        state
+            .identities
+            .retain(|_, identity| identity.view_id != view_id);
+        state.layer_key_scopes.remove(view_id);
         if let Some(tooltips) = state.tooltip_owners.remove(view_id) {
             for id in tooltips {
                 state.manager.tooltips_mut().remove(&id);
@@ -273,7 +411,7 @@ impl WindowOverlayCoordinator {
                 .entry(view_id.to_owned())
                 .or_default()
                 .insert(id.clone());
-            let now = std::time::Instant::now();
+            let now = cx.background_executor().now();
             if hovered {
                 state
                     .manager
@@ -379,7 +517,17 @@ impl Element for ScriptLayerElement {
         let content = self.content.take().expect("layer content rendered once");
         let positioned = self.positioned(content);
         let mut layer = if self.coordinator.host_managed() {
-            let id = WindowOverlayCoordinator::scoped_id(&self.view_id, &self.spec.id);
+            let id = WindowOverlayCoordinator::scoped_id(
+                &self.view_id,
+                self.spec.owner.as_ref(),
+                &self.spec.id,
+            );
+            // The Host portal paints the content outside the view root, so it
+            // takes the view's keyboard handling along: Tab and the view's
+            // bound actions work in a layer as in the rest of the view.
+            let positioned = self
+                .coordinator
+                .with_layer_key_scope(&self.view_id, positioned);
             self.coordinator.register_layer_element(
                 id,
                 self.spec.priority,
@@ -397,7 +545,7 @@ impl Element for ScriptLayerElement {
                     .h(pixel_from_f64(viewport.height))
                     .child(positioned),
             )
-            .priority(self.spec.priority)
+            .with_priority(self.spec.priority)
             .into_any_element()
         };
         let layout = layer.request_layout(window, cx);
@@ -448,7 +596,16 @@ pub(crate) struct ScriptOverlayElement {
     backdrop_style: Option<BackdropStyleHandler>,
     focus_ring: Rgba8,
     focus_surface: Rgba8,
+    /// Whether the trigger's focus ring paints (the view's focus indicators).
+    focus_indicators: bool,
     restore_focus_on_close: bool,
+    /// The trigger content holds its own tab stop (a Button, a field), so the
+    /// trigger wrapper must not add a second one.
+    trigger_focusable: bool,
+    /// The panel's focus handle when the view owns it (a retained overlay);
+    /// otherwise the element keeps its own.
+    panel_focus: Option<FocusHandle>,
+    identity: Option<OverlayIdentity>,
     coordinator: WindowOverlayCoordinator,
 }
 
@@ -473,9 +630,34 @@ impl ScriptOverlayElement {
             backdrop_style: None,
             focus_ring: Rgba8::from_rgb_hex(0x003b_82f6),
             focus_surface: Rgba8::from_rgb_hex(0x0018_181b),
+            focus_indicators: true,
             restore_focus_on_close,
+            trigger_focusable: false,
+            panel_focus: None,
+            identity: None,
             coordinator,
         }
+    }
+
+    pub(crate) fn with_identity(mut self, identity: OverlayIdentity) -> Self {
+        self.identity = Some(identity);
+        self
+    }
+
+    pub(crate) fn with_panel_focus(mut self, handle: Option<FocusHandle>) -> Self {
+        self.panel_focus = handle;
+        self
+    }
+
+    pub(crate) fn with_trigger_focusable(mut self, focusable: bool) -> Self {
+        self.trigger_focusable = focusable;
+        self
+    }
+
+    /// The trigger wrapper is a tab stop only when it is the activation
+    /// target: it opens the overlay and its content cannot take focus itself.
+    fn trigger_tab_stop(&self) -> bool {
+        self.open_change.is_some() && self.spec.activate_on_trigger && !self.trigger_focusable
     }
 
     pub(crate) fn with_backdrop_style(mut self, style: Option<BackdropStyleHandler>) -> Self {
@@ -485,6 +667,11 @@ impl ScriptOverlayElement {
 
     pub(crate) fn with_focus_ring(mut self, color: Rgba8) -> Self {
         self.focus_ring = color;
+        self
+    }
+
+    pub(crate) fn with_focus_indicators(mut self, shown: bool) -> Self {
+        self.focus_indicators = shown;
         self
     }
 
@@ -503,8 +690,11 @@ impl ScriptOverlayElement {
             if self.restore_focus_on_close {
                 state.previous_focus = window.focused(cx).map(|focus| focus.downgrade());
             }
-            if self.spec.modal || self.spec.kind == OverlayKind::Menu {
-                state.panel_focus.focus(window, cx);
+            if self.spec.modal
+                || self.spec.kind == OverlayKind::Menu
+                || self.spec.initial_focus == OverlayInitialFocus::First
+            {
+                focus_during_layout(&state.panel_focus, window, cx);
                 if self.spec.initial_focus == OverlayInitialFocus::First {
                     // Initial focus is bound to the closed -> open presentation
                     // cycle, never to render: controlled contents re-render on
@@ -541,17 +731,34 @@ impl ScriptOverlayElement {
                     previous.focus(window, cx);
                 }
             } else {
-                state.trigger_focus.focus(window, cx);
+                // Back to where focus was when the menu opened (the trigger's own
+                // focusable content, a table row, a field), whose keys open it again;
+                // the trigger wrapper only when that is gone or was in the panel.
+                let previous = state
+                    .previous_focus
+                    .take()
+                    .and_then(|focus| focus.upgrade())
+                    .filter(|focus| !state.panel_focus.contains(focus, window));
+                match previous {
+                    Some(previous) => previous.focus(window, cx),
+                    None => state.trigger_focus.focus(window, cx),
+                }
             }
         }
-        if self.spec.open && self.spec.modal && !state.panel_focus.contains_focused(window, cx) {
-            // A modal is a focus boundary, including when an embedding Host
-            // programmatically focuses an ancestor after mount. `focus()`
-            // dirties the GPUI window, so this invariant is rechecked in that
-            // very frame instead of relying on a focus-out listener (whose old
-            // path is not observable for every programmatic focus transfer in
-            // GPUI 0.2.x).
-            state.panel_focus.focus(window, cx);
+        if self.spec.open && self.spec.modal {
+            self.coordinator
+                .record_modal_panel(self.spec.id.clone(), state.panel_focus.clone());
+            if !state.panel_focus.contains_focused(window, cx) {
+                // A modal is a focus boundary, including when an embedding
+                // Host programmatically focuses an ancestor after mount.
+                // `focus()` dirties the GPUI window, so the frame it causes
+                // finds focus outside and the panel takes it back right after
+                // that frame, instead of relying on a focus-out listener
+                // (whose old path is not observable for every programmatic
+                // focus transfer in GPUI). With several modals open only
+                // the topmost takes it back.
+                self.coordinator.keep_focus_in_topmost_modal(window, cx);
+            }
         }
         state.was_open = self.spec.open;
     }
@@ -573,9 +780,12 @@ impl ScriptOverlayElement {
         let focus_surface = self.focus_surface;
         let mut trigger = div()
             .id(SharedString::from(format!("{}-trigger", self.id)))
+            .min_w_0()
             .track_focus(trigger_focus)
-            .tab_stop(activate_on_trigger && click_callback.is_some())
-            .focus(move |style| overlay_focus_shadow(style, focus_ring, focus_surface))
+            .tab_stop(self.trigger_tab_stop())
+            .when(self.focus_indicators, |trigger| {
+                trigger.focus(move |style| overlay_focus_shadow(style, focus_ring, focus_surface))
+            })
             .child(self.trigger.take().expect("overlay trigger rendered once"))
             .on_click(move |event, window, cx| {
                 if !activate_on_trigger || !matches!(event, ClickEvent::Mouse(_)) {
@@ -665,7 +875,8 @@ impl ScriptOverlayElement {
         let mut panel = div()
             .id(SharedString::from(format!("{}-panel", self.id)))
             .track_focus(panel_focus)
-            .tab_stop(true)
+            // A tooltip is never a keyboard target.
+            .tab_stop(self.spec.kind != OverlayKind::Tooltip)
             .occlude()
             .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
             .on_key_down(move |event, window, cx| {
@@ -709,6 +920,12 @@ impl ScriptOverlayElement {
         if self.spec.width_policy == OverlayWidthPolicy::MatchTrigger {
             panel = panel.w_full();
         }
+        // The wrapper takes its content's width, so a percentage width inside it would
+        // resolve against itself; it caps the dialog at 90% of the backdrop instead, and the
+        // content may fill it (`max_width(relative(1.0))`).
+        if self.spec.kind == OverlayKind::Dialog {
+            panel = panel.max_w(relative(0.9));
+        }
 
         let overlay = if matches!(self.spec.kind, OverlayKind::Dialog | OverlayKind::Sheet) {
             self.build_modal_backdrop(panel, viewport)
@@ -720,13 +937,14 @@ impl ScriptOverlayElement {
             overlay.child(panel).into_any_element()
         };
         if self.spec.parent.is_some() {
-            // GPUI 0.2.x forbids calling `defer_draw` while it is already
-            // prepainting a deferred element. A nested overlay is rendered as
-            // part of its parent's deferred subtree, while the shared overlay
-            // coordinator still owns placement, ordering, and dismissal.
+            // A nested overlay is rendered as part of its parent's deferred
+            // subtree, while the shared overlay coordinator still owns
+            // placement, ordering, and dismissal. This path exists because
+            // GPUI 0.2 panicked on a nested `defer_draw`; gpui-pre 0.3.9
+            // allows up to ten nested levels.
             Some(overlay)
         } else {
-            Some(deferred(overlay).priority(priority).into_any_element())
+            Some(deferred(overlay).with_priority(priority).into_any_element())
         }
     }
 
@@ -776,20 +994,32 @@ fn overlay_focus_shadow(
 ) -> gpui::StyleRefinement {
     style.shadow(vec![
         BoxShadow {
-            inset: false,
-            color: gpui::rgb_to_hsla(rgba(ring.as_rgba_hex())).into(),
+            color: rgba(ring.as_rgba_hex()).into(),
             offset: point(px(0.0), px(0.0)),
             blur_radius: px(0.0),
             spread_radius: px(4.0),
+            inset: false,
         },
         BoxShadow {
-            inset: false,
-            color: gpui::rgb_to_hsla(rgba(surface.as_rgba_hex())).into(),
+            color: rgba(surface.as_rgba_hex()).into(),
             offset: point(px(0.0), px(0.0)),
             blur_radius: px(0.0),
             spread_radius: px(2.0),
+            inset: false,
         },
     ])
+}
+
+/// Focus a handle from inside layout. GPUI ignores the refresh `focus()` asks
+/// for while a frame is being drawn, so the view would keep showing the old
+/// focus (a panel's focus frame, `group_focus` styles) until something else
+/// redraws; ask for the next frame once this one is done.
+fn focus_during_layout(handle: &FocusHandle, window: &mut Window, cx: &mut App) {
+    if handle.is_focused(window) {
+        return;
+    }
+    handle.focus(window, cx);
+    window.defer(cx, |window, _| window.refresh());
 }
 
 struct OverlayElementState {
@@ -837,14 +1067,21 @@ impl Element for ScriptOverlayElement {
                     .ensure_window_viewport(window.viewport_size());
                 let mut state = state.unwrap_or_else(|| OverlayElementState {
                     was_open: false,
-                    trigger_focus: cx.focus_handle().tab_stop(self.open_change.is_some()),
-                    panel_focus: cx.focus_handle().tab_stop(true),
+                    trigger_focus: cx.focus_handle().tab_stop(self.trigger_tab_stop()),
+                    panel_focus: cx
+                        .focus_handle()
+                        .tab_stop(self.spec.kind != OverlayKind::Tooltip),
                     previous_focus: None,
                 });
                 state.trigger_focus = state
                     .trigger_focus
                     .clone()
-                    .tab_stop(self.open_change.is_some());
+                    .tab_stop(self.trigger_tab_stop());
+                if let Some(handle) = &self.panel_focus {
+                    state.panel_focus = handle
+                        .clone()
+                        .tab_stop(self.spec.kind != OverlayKind::Tooltip);
+                }
                 if state.was_open && !self.spec.open {
                     let _ = self.coordinator.dismiss(&self.spec.id, window, cx);
                 }
@@ -856,6 +1093,10 @@ impl Element for ScriptOverlayElement {
                     self.spec.kind,
                     self.open_change.clone(),
                 );
+                if let Some(identity) = &self.identity {
+                    self.coordinator
+                        .record_identity(self.spec.id.clone(), identity.clone());
+                }
                 let mut overlay = self.build_overlay(
                     &state.panel_focus,
                     self.coordinator.viewport_or_window(window.viewport_size()),
@@ -865,8 +1106,12 @@ impl Element for ScriptOverlayElement {
                     .as_mut()
                     .map(|overlay| overlay.request_layout(window, cx));
                 let children = std::iter::once(trigger_layout).chain(overlay_layout);
+                // A column, so the trigger stretches across the overlay node as it
+                // would without the overlay around it: a row inside a ContextMenu
+                // still fills its sidebar and truncates its title.
                 let mut style = GpuiStyle {
                     display: Display::Flex,
+                    flex_direction: FlexDirection::Column,
                     ..GpuiStyle::default()
                 };
                 if self.spec.width_policy == OverlayWidthPolicy::MatchTrigger {
@@ -989,6 +1234,7 @@ fn native_overlay_spec(
         width: f64::from(panel.width),
         height: f64::from(panel.height),
         preferred: node.placement,
+        align: node.align,
         gap: node.gap,
         modal: node.modal,
         dismiss_on_escape: node.dismiss.escape,
@@ -1051,6 +1297,7 @@ mod tests {
             width: 160.0,
             height: 100.0,
             preferred: crate::OverlayPlacement::Bottom,
+            align: crate::OverlayAlign::Center,
             gap: 4.0,
             modal: false,
             dismiss_on_escape: true,
@@ -1088,11 +1335,76 @@ mod tests {
     }
 
     #[test]
+    fn open_overlays_follow_the_stack_and_name_their_declarer() {
+        let coordinator = WindowOverlayCoordinator::default();
+        coordinator.begin_frame(overlay_viewport(size(px(800.0), px(600.0))));
+        let mut ids = Vec::new();
+        for (view_id, owner, local, modal) in [
+            ("left", None, "menu", false),
+            (
+                "right",
+                Some("/View[main]/Dialog[confirm]"),
+                "confirm",
+                true,
+            ),
+        ] {
+            let local = OverlayId::new(local);
+            let id = OverlayId::new(format!("{view_id}::{}", local.as_str()));
+            let mut overlay = spec(id.as_str(), None);
+            overlay.modal = modal;
+            if modal {
+                overlay.kind = OverlayKind::Dialog;
+                overlay.dismiss_on_escape = false;
+            }
+            coordinator.register(overlay).unwrap();
+            coordinator.record_identity(
+                id.clone(),
+                OverlayIdentity {
+                    view_id: view_id.to_owned(),
+                    owner: owner.map(str::to_owned),
+                    local,
+                },
+            );
+            ids.push(id);
+        }
+        // An overlay rendered without an identity is not a script overlay.
+        coordinator.register(spec("anonymous", None)).unwrap();
+
+        let open = coordinator.open_overlays();
+        assert_eq!(
+            open,
+            vec![
+                OpenOverlay {
+                    view_id: "left".to_owned(),
+                    owner: None,
+                    key: "menu".to_owned(),
+                    kind: OverlayKind::Popover,
+                    modal: false,
+                    dismiss_on_escape: true,
+                },
+                OpenOverlay {
+                    view_id: "right".to_owned(),
+                    owner: Some("/View[main]/Dialog[confirm]".to_owned()),
+                    key: "confirm".to_owned(),
+                    kind: OverlayKind::Dialog,
+                    modal: true,
+                    dismiss_on_escape: false,
+                },
+            ]
+        );
+
+        let _ = coordinator.0.borrow_mut().manager.dismiss(&ids[0]);
+        assert_eq!(coordinator.open_overlays().len(), 1);
+        coordinator.remove_view("right");
+        assert_eq!(coordinator.open_overlays(), [] as [OpenOverlay; 0]);
+    }
+
+    #[test]
     fn removing_a_view_closes_overlays_without_callbacks() {
         let coordinator = WindowOverlayCoordinator::default();
         coordinator.begin_frame(overlay_viewport(size(px(800.0), px(600.0))));
         let local = OverlayId::new("menu");
-        let scoped = WindowOverlayCoordinator::scoped_id("left", &local);
+        let scoped = WindowOverlayCoordinator::scoped_id("left", None, &local);
         let mut overlay = spec(scoped.as_str(), None);
         overlay.id = scoped.clone();
         coordinator.register(overlay).unwrap();

@@ -35,7 +35,7 @@ pub use model::{
     PlanDecision, PlanPhase, PlanStep, Project, ProjectId, SessionId, SessionStatus, SessionStore,
     SessionView, SidebarGroup, SidebarProjection, StepStatus, ToolState, WorkspaceView,
 };
-pub use panels::{PanelArea, PanelDef, PanelHost, PanelSource, ScriptRuntime};
+pub use panels::{Entitlements, PanelArea, PanelDef, PanelHost, PanelSource, ScriptRuntime};
 pub use poll::poll_periodically;
 pub use shell::HarnessShell;
 pub use i18n::{t, t_replace, Locale};
@@ -49,7 +49,7 @@ pub use widgets::{button, line, picker, short_hash, show, truncate, HashedRef};
 mod tests {
     use super::*;
     use gpui::{AnyElement, IntoElement as _};
-    use nanobot_gpu::{ViewportInput, ViewportProjection, ViewportSlot};
+    use nanobot_gpu::{ViewportProjection, ViewportSlot};
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -146,7 +146,6 @@ mod tests {
         fn new_handle() -> Self::Handle {
             Rc::new(RefCell::new(TestViewportHandle::default()))
         }
-        fn feed_input(_handle: &Self::Handle, _input: ViewportInput) {}
         fn update_scene(handle: &Self::Handle, _scene: &Self::Scene) {
             handle.borrow_mut().frames += 1;
         }
@@ -540,6 +539,35 @@ mod tests {
             .collect();
         assert_eq!(left, vec!["b".to_string()]);
         assert!(host.panels_in(PanelArea::Bottom).is_empty());
+    }
+
+    #[test]
+    fn a_panel_shows_only_with_the_capability_it_requires() {
+        use std::cell::Cell;
+
+        let mut host = PanelHost::<TestSession>::default();
+        host.register(product_panel("free", "Free", PanelArea::Right, 1));
+        host.register(product_panel("pro", "Pro", PanelArea::Right, 2).with_requires("pro"));
+        let shown = |host: &PanelHost<TestSession>| -> Vec<String> {
+            host.panels_in(PanelArea::Right)
+                .into_iter()
+                .map(|p| p.id.clone())
+                .collect()
+        };
+        assert_eq!(shown(&host), ["free", "pro"], "nothing injected: everything shows");
+
+        let owned = Rc::new(Cell::new(false));
+        let answer = owned.clone();
+        host.set_entitlements(Rc::new(move |capability| capability == "pro" && answer.get()));
+        assert_eq!(shown(&host), ["free"]);
+        assert_eq!(host.visible_panels().len(), 1);
+        assert_eq!(host.len(), 2, "the panel stays registered");
+
+        // An activation while the app runs: asked again on the next frame.
+        owned.set(true);
+        assert_eq!(shown(&host), ["free", "pro"]);
+        owned.set(false);
+        assert_eq!(shown(&host), ["free"]);
     }
 
     #[test]

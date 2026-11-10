@@ -13,8 +13,9 @@ pub enum Length {
     Pixels(f64),
     Rems(f64),
     Relative(f64),
-    ThemeSpacing(SpacingToken),
-    ThemeRadius(RadiusToken),
+    /// A named token resolved against the active theme and the inherited
+    /// environment during native rendering.
+    Token(crate::token::LengthToken),
 }
 
 impl<'de> Deserialize<'de> for Length {
@@ -28,16 +29,27 @@ impl<'de> Deserialize<'de> for Length {
             Pixels(f64),
             Rems(f64),
             Relative(f64),
-            ThemeSpacing(SpacingToken),
-            ThemeRadius(RadiusToken),
+            Token(TokenRepr),
+        }
+
+        #[derive(Deserialize)]
+        struct TokenRepr {
+            path: String,
+            #[serde(default = "unit_scale")]
+            scale: f64,
+        }
+
+        const fn unit_scale() -> f64 {
+            1.0
         }
 
         match Repr::deserialize(deserializer)? {
             Repr::Pixels(value) => Self::pixels(value),
             Repr::Rems(value) => Self::rems(value),
             Repr::Relative(value) => Self::relative(value),
-            Repr::ThemeSpacing(value) => Ok(Self::ThemeSpacing(value)),
-            Repr::ThemeRadius(value) => Ok(Self::ThemeRadius(value)),
+            Repr::Token(token) => {
+                Self::token(&token.path).and_then(|length| length.scaled(token.scale))
+            }
         }
         .map_err(serde::de::Error::custom)
     }
@@ -141,68 +153,6 @@ impl From<SignedLength> for LayoutLength {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SpacingToken {
-    Xxs,
-    Xs,
-    Sm,
-    Md,
-    Lg,
-}
-
-impl SpacingToken {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Xxs => "xxs",
-            Self::Xs => "xs",
-            Self::Sm => "sm",
-            Self::Md => "md",
-            Self::Lg => "lg",
-        }
-    }
-
-    fn parse(value: &str) -> Result<Self, LengthError> {
-        match value {
-            "xxs" => Ok(Self::Xxs),
-            "xs" => Ok(Self::Xs),
-            "sm" => Ok(Self::Sm),
-            "md" => Ok(Self::Md),
-            "lg" => Ok(Self::Lg),
-            _ => Err(LengthError::UnknownSpacingToken(value.to_owned())),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RadiusToken {
-    Sm,
-    Md,
-    Lg,
-}
-
-impl RadiusToken {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Sm => "sm",
-            Self::Md => "md",
-            Self::Lg => "lg",
-        }
-    }
-
-    fn parse(value: &str) -> Result<Self, LengthError> {
-        match value {
-            "sm" => Ok(Self::Sm),
-            "md" => Ok(Self::Md),
-            "lg" => Ok(Self::Lg),
-            _ => Err(LengthError::UnknownRadiusToken(value.to_owned())),
-        }
-    }
-}
-
 impl Length {
     /// Create a finite, non-negative pixel length.
     ///
@@ -235,27 +185,56 @@ impl Length {
         }
     }
 
-    /// Create one standard semantic spacing reference.
+    /// Reference a named length token such as `metrics.row`.
     ///
     /// # Errors
     ///
-    /// Returns [`LengthError`] for an unknown standard token.
-    pub fn theme_spacing(value: &str) -> Result<Self, LengthError> {
-        SpacingToken::parse(value).map(Self::ThemeSpacing)
+    /// Returns [`LengthError::InvalidToken`] for a malformed path.
+    pub fn token(path: &str) -> Result<Self, LengthError> {
+        crate::token::LengthToken::new(path)
+            .map(Self::Token)
+            .map_err(|error| LengthError::InvalidToken(error.to_string()))
     }
 
-    /// Create one standard semantic radius reference.
+    /// Reference a spacing token: `theme_spacing("sm")` is `spacing.sm`.
     ///
     /// # Errors
     ///
-    /// Returns [`LengthError`] for an unknown standard token.
+    /// Returns [`LengthError::InvalidToken`] for a malformed name.
+    pub fn theme_spacing(value: &str) -> Result<Self, LengthError> {
+        Self::token(&format!("spacing.{value}"))
+    }
+
+    /// Reference a radius token: `theme_radius("md")` is `radius.md`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LengthError::InvalidToken`] for a malformed name.
     pub fn theme_radius(value: &str) -> Result<Self, LengthError> {
-        RadiusToken::parse(value).map(Self::ThemeRadius)
+        Self::token(&format!("radius.{value}"))
+    }
+
+    /// Multiply a length by a non-negative factor. Tokens keep the factor and
+    /// apply it after resolution.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LengthError`] for negative or non-finite factors and results.
+    pub fn scaled(self, factor: f64) -> Result<Self, LengthError> {
+        match self {
+            Self::Pixels(value) => Self::pixels(value * factor),
+            Self::Rems(value) => Self::rems(value * factor),
+            Self::Relative(value) => Self::relative(value * factor),
+            Self::Token(token) => token
+                .scaled(factor)
+                .map(Self::Token)
+                .map_err(|error| LengthError::InvalidToken(error.to_string())),
+        }
     }
 
     #[must_use]
     pub const fn is_theme_token(self) -> bool {
-        matches!(self, Self::ThemeSpacing(_) | Self::ThemeRadius(_))
+        matches!(self, Self::Token(_))
     }
 
     /// Revalidate a deserialized length.
@@ -268,7 +247,7 @@ impl Length {
         match self {
             Self::Pixels(value) | Self::Rems(value) => validate_non_negative(value),
             Self::Relative(value) => Self::relative(value).map(|_| ()),
-            Self::ThemeSpacing(_) | Self::ThemeRadius(_) => Ok(()),
+            Self::Token(_) => Ok(()),
         }
     }
 }
@@ -287,10 +266,8 @@ pub enum LengthError {
     InvalidRelative(f64),
     #[error("signed relative length must be finite and between -10 and 10, got {0}")]
     InvalidSignedRelative(f64),
-    #[error("spacing token `{0}` is unknown; expected xs, sm, md, or lg")]
-    UnknownSpacingToken(String),
-    #[error("radius token `{0}` is unknown; expected sm, md, or lg")]
-    UnknownRadiusToken(String),
+    #[error("invalid length token: {0}")]
+    InvalidToken(String),
 }
 
 fn validate_signed(value: f64) -> Result<(), LengthError> {
@@ -299,6 +276,26 @@ fn validate_signed(value: f64) -> Result<(), LengthError> {
     } else {
         Err(LengthError::InvalidLength(value))
     }
+}
+
+fn thousandths(value: f64) -> Result<u16, StyleValueError> {
+    if value.is_finite() && (0.0..=1.0).contains(&value) {
+        Ok(bounded_u16(value * 1000.0))
+    } else {
+        Err(StyleValueError::InvalidColorFactor(value))
+    }
+}
+
+/// Round a value already validated to lie within `0..=u16::MAX`.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn bounded_u16(value: f64) -> u16 {
+    value.round().clamp(0.0, f64::from(u16::MAX)) as u16
+}
+
+/// Round a color channel value into `0..=255`.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn channel_byte(value: f64) -> u32 {
+    value.round().clamp(0.0, 255.0) as u32
 }
 
 fn validate_non_negative(value: f64) -> Result<(), LengthError> {
@@ -318,6 +315,66 @@ impl Rgba8 {
         Self(value)
     }
 
+    fn channel(self, shift: u32) -> f64 {
+        f64::from(((self.0 >> shift) & 0xff) as u8)
+    }
+
+    /// Interpolate every channel, including alpha, toward `other`.
+    #[must_use]
+    pub fn mix(self, other: Self, weight: f64) -> Self {
+        let weight = weight.clamp(0.0, 1.0);
+        let channel = |shift| {
+            let value = self.channel(shift) * (1.0 - weight) + other.channel(shift) * weight;
+            channel_byte(value) << shift
+        };
+        Self(channel(24) | channel(16) | channel(8) | channel(0))
+    }
+
+    /// Multiply the alpha channel by `factor`.
+    #[must_use]
+    pub fn with_alpha_factor(self, factor: f64) -> Self {
+        let alpha = channel_byte(self.channel(0) * factor.clamp(0.0, 1.0));
+        Self((self.0 & 0xffff_ff00) | alpha)
+    }
+
+    /// WCAG relative luminance of the color channels (alpha ignored).
+    #[must_use]
+    pub fn relative_luminance(self) -> f64 {
+        let channel = |shift| {
+            let encoded = self.channel(shift) / 255.0;
+            if encoded <= 0.04045 {
+                encoded / 12.92
+            } else {
+                ((encoded + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(24) + 0.7152 * channel(16) + 0.0722 * channel(8)
+    }
+
+    /// WCAG contrast ratio between two colors (alpha ignored).
+    #[must_use]
+    pub fn contrast_ratio(self, other: Self) -> f64 {
+        let left = self.relative_luminance();
+        let right = other.relative_luminance();
+        (left.max(right) + 0.05) / (left.min(right) + 0.05)
+    }
+
+    /// Move toward `toward` in small steps until the contrast against
+    /// `background` reaches `ratio`; returns `toward` if no step does.
+    #[must_use]
+    pub fn readable(self, toward: Self, background: Self, ratio: f64) -> Self {
+        if self.contrast_ratio(background) >= ratio {
+            return self;
+        }
+        for step in 1..=64 {
+            let candidate = self.mix(toward, f64::from(step) / 64.0);
+            if candidate.contrast_ratio(background) >= ratio {
+                return candidate;
+            }
+        }
+        toward
+    }
+
     #[must_use]
     pub const fn from_rgb_hex(value: u32) -> Self {
         Self((value << 8) | 0xff)
@@ -329,11 +386,30 @@ impl Rgba8 {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "source", content = "value", rename_all = "snake_case")]
 pub enum ColorValue {
     Literal(Rgba8),
     Token(String),
+    /// `base` moved toward `other` by `weight` thousandths, per channel.
+    Mix {
+        base: Box<ColorValue>,
+        other: Box<ColorValue>,
+        weight: u16,
+    },
+    /// `color` with its alpha multiplied by `alpha` thousandths.
+    Alpha {
+        color: Box<ColorValue>,
+        alpha: u16,
+    },
+    /// `color` moved toward `toward` only as far as needed to reach `ratio`
+    /// hundredths of contrast against `background`.
+    Readable {
+        color: Box<ColorValue>,
+        toward: Box<ColorValue>,
+        background: Box<ColorValue>,
+        ratio: u16,
+    },
 }
 
 impl CustomType for ColorValue {
@@ -343,6 +419,102 @@ impl CustomType for ColorValue {
 }
 
 impl ColorValue {
+    /// Reference a theme color token: a palette name such as `accent` or a
+    /// `namespace.name` path such as `text.danger`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StyleValueError::InvalidColorToken`] for a malformed path.
+    /// Whether the token exists is decided by the active theme at render time.
+    pub fn token(path: &str) -> Result<Self, StyleValueError> {
+        if crate::token::valid_token_segment(path)
+            || crate::token::validate_token_path(path).is_ok()
+        {
+            Ok(Self::Token(path.to_owned()))
+        } else {
+            Err(StyleValueError::InvalidColorToken(path.to_owned()))
+        }
+    }
+
+    /// Resolve the expression, asking `lookup` for token leaves.
+    pub fn resolve_with(&self, lookup: &mut dyn FnMut(&str) -> Option<Rgba8>) -> Option<Rgba8> {
+        match self {
+            Self::Literal(color) => Some(*color),
+            Self::Token(token) => lookup(token),
+            Self::Mix {
+                base,
+                other,
+                weight,
+            } => {
+                let base = base.resolve_with(lookup)?;
+                let other = other.resolve_with(lookup)?;
+                Some(base.mix(other, f64::from(*weight) / 1000.0))
+            }
+            Self::Alpha { color, alpha } => color
+                .resolve_with(lookup)
+                .map(|color| color.with_alpha_factor(f64::from(*alpha) / 1000.0)),
+            Self::Readable {
+                color,
+                toward,
+                background,
+                ratio,
+            } => {
+                let color = color.resolve_with(lookup)?;
+                let toward = toward.resolve_with(lookup)?;
+                let background = background.resolve_with(lookup)?;
+                Some(color.readable(toward, background, f64::from(*ratio) / 100.0))
+            }
+        }
+    }
+
+    /// Move toward `other` by `weight` (0 to 1).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StyleValueError::InvalidColorFactor`] outside 0 to 1.
+    pub fn mix(self, other: Self, weight: f64) -> Result<Self, StyleValueError> {
+        Ok(Self::Mix {
+            base: Box::new(self),
+            other: Box::new(other),
+            weight: thousandths(weight)?,
+        })
+    }
+
+    /// Multiply alpha by `alpha` (0 to 1).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StyleValueError::InvalidColorFactor`] outside 0 to 1.
+    pub fn alpha(self, alpha: f64) -> Result<Self, StyleValueError> {
+        Ok(Self::Alpha {
+            color: Box::new(self),
+            alpha: thousandths(alpha)?,
+        })
+    }
+
+    /// Adjust toward `toward` until the contrast against `background`
+    /// reaches `ratio` (1 to 21).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StyleValueError::InvalidContrastRatio`] outside 1 to 21.
+    pub fn readable(
+        self,
+        toward: Self,
+        background: Self,
+        ratio: f64,
+    ) -> Result<Self, StyleValueError> {
+        if !ratio.is_finite() || !(1.0..=21.0).contains(&ratio) {
+            return Err(StyleValueError::InvalidContrastRatio(ratio));
+        }
+        Ok(Self::Readable {
+            color: Box::new(self),
+            toward: Box::new(toward),
+            background: Box::new(background),
+            ratio: bounded_u16(ratio * 100.0),
+        })
+    }
+
     /// Parse a strict, bounded color literal shared by Style and Canvas.
     ///
     /// Supported forms are `#rgb`, `#rgba`, `#rrggbb`, `#rrggbbaa`, the CSS
@@ -603,6 +775,10 @@ pub enum Align {
     Center,
     End,
     Stretch,
+    /// Cross-axis alignment of a row's text children on one baseline: each text
+    /// child's first baseline sits on the baseline of the row's own text style.
+    /// Other children align to the start. Only `items_baseline` sets it.
+    Baseline,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -769,6 +945,12 @@ impl CustomType for LinearGradientSpec {
 
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum StyleValueError {
+    #[error(
+        "automatic grid widths require 1 <= minimum <= preferred <= maximum <= 1000000, all finite"
+    )]
+    InvalidAutoGrid,
+    #[error("aspect ratio must be finite, positive and representable by GPUI, got {0}")]
+    InvalidAspectRatio(f64),
     #[error("shadow offsets must be finite and blur/spread must be finite and non-negative")]
     InvalidShadow,
     #[error("gradient angle must be finite")]
@@ -785,8 +967,14 @@ pub enum StyleValueError {
     InvalidFontFamily,
     #[error("font fallback list must contain 1-16 unique non-empty family names")]
     InvalidFontFallbacks,
-    #[error("unknown typography role `{0}`")]
-    UnknownTypographyRole(String),
+    #[error("typography role `{0}` must be a snake_case name")]
+    InvalidTypographyRole(String),
+    #[error("color token `{0}` must be `name` or `namespace.name` with snake_case segments")]
+    InvalidColorToken(String),
+    #[error("color factor must be finite and between zero and one, got {0}")]
+    InvalidColorFactor(f64),
+    #[error("contrast ratio must be finite and between 1 and 21, got {0}")]
+    InvalidContrastRatio(f64),
     #[error("OpenType feature tag must be four ASCII alphanumeric characters")]
     InvalidFontFeatureTag,
     #[error("OpenType feature value must be between 0 and 65535, got {0}")]
@@ -845,6 +1033,16 @@ impl EdgeLengths {
     }
 
     fn merge(&mut self, overlay: &Self) {
+        // Every physical edge set, as by `padding(x)`: the logical edges go too,
+        // as they do in a chain.
+        if overlay.top.is_some()
+            && overlay.right.is_some()
+            && overlay.bottom.is_some()
+            && overlay.left.is_some()
+        {
+            self.start = None;
+            self.end = None;
+        }
         merge_option(&mut self.top, overlay.top);
         merge_option(&mut self.right, overlay.right);
         merge_option(&mut self.bottom, overlay.bottom);
@@ -902,6 +1100,16 @@ impl LayoutEdgeLengths {
     }
 
     fn merge(&mut self, overlay: &Self) {
+        // Every physical edge set, as by `padding(x)`: the logical edges go too,
+        // as they do in a chain.
+        if overlay.top.is_some()
+            && overlay.right.is_some()
+            && overlay.bottom.is_some()
+            && overlay.left.is_some()
+        {
+            self.start = None;
+            self.end = None;
+        }
         merge_option(&mut self.top, overlay.top);
         merge_option(&mut self.right, overlay.right);
         merge_option(&mut self.bottom, overlay.bottom);
@@ -917,6 +1125,13 @@ pub struct CornerLengths {
     pub top_right: Option<Length>,
     pub bottom_right: Option<Length>,
     pub bottom_left: Option<Length>,
+    /// Both corners on the logical inline start; overrides the matching
+    /// physical corners (left in LTR, right in RTL).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<Length>,
+    /// Both corners on the logical inline end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end: Option<Length>,
 }
 
 impl CornerLengths {
@@ -927,15 +1142,36 @@ impl CornerLengths {
             top_right: Some(value),
             bottom_right: Some(value),
             bottom_left: Some(value),
+            start: None,
+            end: None,
         }
     }
 
     fn merge(&mut self, overlay: &Self) {
+        // Every physical corner set, as by `radius(x)`: the logical corners go
+        // too, as they do in a chain.
+        if overlay.top_left.is_some()
+            && overlay.top_right.is_some()
+            && overlay.bottom_right.is_some()
+            && overlay.bottom_left.is_some()
+        {
+            self.start = None;
+            self.end = None;
+        }
         merge_option(&mut self.top_left, overlay.top_left);
         merge_option(&mut self.top_right, overlay.top_right);
         merge_option(&mut self.bottom_right, overlay.bottom_right);
         merge_option(&mut self.bottom_left, overlay.bottom_left);
+        merge_option(&mut self.start, overlay.start);
+        merge_option(&mut self.end, overlay.end);
     }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct LayoutConstraints {
+    pub auto_grid_columns: Option<crate::AutoGridColumns>,
+    #[serde(default, deserialize_with = "deserialize_aspect_ratio")]
+    pub aspect_ratio: Option<f64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -972,6 +1208,10 @@ pub struct StyleProperties {
     pub flex_shrink: Option<bool>,
     pub flex_basis: Option<LayoutLength>,
     pub grid_columns: Option<u16>,
+    /// Optional intrinsic constraints stay off the common style's inline
+    /// footprint, including its eight pseudo-state copies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout_constraints: Option<Box<LayoutConstraints>>,
     pub grid_rows: Option<u16>,
     pub column_span: Option<u16>,
     pub row_span: Option<u16>,
@@ -984,6 +1224,8 @@ pub struct StyleProperties {
     pub bottom: Option<LayoutLength>,
     pub left: Option<LayoutLength>,
     pub opacity: Option<f64>,
+    pub inset_start: Option<LayoutLength>,
+    pub inset_end: Option<LayoutLength>,
     pub visible: Option<bool>,
     pub cursor: Option<CursorKind>,
     pub hit_test: Option<HitTestBehavior>,
@@ -1004,7 +1246,29 @@ pub struct StyleProperties {
 }
 
 impl StyleProperties {
-    fn merge(&mut self, overlay: &Self) {
+    pub fn auto_grid_columns(&self) -> Option<crate::AutoGridColumns> {
+        self.layout_constraints
+            .as_deref()
+            .and_then(|layout| layout.auto_grid_columns)
+    }
+
+    pub fn aspect_ratio(&self) -> Option<f64> {
+        self.layout_constraints
+            .as_deref()
+            .and_then(|layout| layout.aspect_ratio)
+    }
+
+    fn constraints_mut(&mut self) -> &mut LayoutConstraints {
+        self.layout_constraints.get_or_insert_with(Box::default)
+    }
+
+    fn clear_auto_grid_columns(&mut self) {
+        if let Some(layout) = &mut self.layout_constraints {
+            layout.auto_grid_columns = None;
+        }
+    }
+
+    pub(crate) fn merge(&mut self, overlay: &Self) {
         merge_option(&mut self.display, overlay.display);
         merge_option(&mut self.direction, overlay.direction);
         merge_option(&mut self.flex_wrap, overlay.flex_wrap);
@@ -1020,7 +1284,14 @@ impl StyleProperties {
         merge_option(&mut self.gap, overlay.gap);
         self.padding.merge(&overlay.padding);
         self.margin.merge(&overlay.margin);
-        merge_option(&mut self.background, overlay.background.clone());
+        // A background and a gradient replace each other, as their setters do.
+        if let Some(gradient) = &overlay.gradient {
+            self.gradient = Some(gradient.clone());
+            self.background = None;
+        } else if let Some(background) = &overlay.background {
+            self.background = Some(background.clone());
+            self.gradient = None;
+        }
         merge_option(&mut self.text_color, overlay.text_color.clone());
         merge_option(&mut self.border_color, overlay.border_color.clone());
         merge_option(&mut self.border_style, overlay.border_style);
@@ -1037,7 +1308,18 @@ impl StyleProperties {
         }
         merge_option(&mut self.flex_shrink, overlay.flex_shrink);
         merge_option(&mut self.flex_basis, overlay.flex_basis);
-        merge_option(&mut self.grid_columns, overlay.grid_columns);
+        if let Some(columns) = overlay.auto_grid_columns() {
+            self.constraints_mut().auto_grid_columns = Some(columns);
+            self.grid_columns = None;
+        } else if let Some(columns) = overlay.grid_columns {
+            self.grid_columns = Some(columns);
+            self.clear_auto_grid_columns();
+        } else if overlay.display == Some(DisplayMode::Grid) {
+            self.clear_auto_grid_columns();
+        }
+        if let Some(ratio) = overlay.aspect_ratio() {
+            self.constraints_mut().aspect_ratio = Some(ratio);
+        }
         merge_option(&mut self.grid_rows, overlay.grid_rows);
         merge_option(&mut self.column_span, overlay.column_span);
         merge_option(&mut self.row_span, overlay.row_span);
@@ -1049,6 +1331,8 @@ impl StyleProperties {
         merge_option(&mut self.right, overlay.right);
         merge_option(&mut self.bottom, overlay.bottom);
         merge_option(&mut self.left, overlay.left);
+        merge_option(&mut self.inset_start, overlay.inset_start);
+        merge_option(&mut self.inset_end, overlay.inset_end);
         merge_option(&mut self.opacity, overlay.opacity);
         merge_option(&mut self.visible, overlay.visible);
         merge_option(&mut self.cursor, overlay.cursor);
@@ -1064,7 +1348,6 @@ impl StyleProperties {
         merge_option(&mut self.text_ellipsis, overlay.text_ellipsis);
         merge_option(&mut self.line_clamp, overlay.line_clamp);
         merge_option(&mut self.shadows, overlay.shadows.clone());
-        merge_option(&mut self.gradient, overlay.gradient.clone());
         merge_option(&mut self.translate_x, overlay.translate_x);
         merge_option(&mut self.translate_y, overlay.translate_y);
     }
@@ -1086,6 +1369,21 @@ pub struct Style {
     pub active: Option<StyleProperties>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub focus: Option<StyleProperties>,
+    /// Applies while the nearest focusable ancestor-or-self that declares a
+    /// `focus` style has keyboard focus (a `tab_stop(false)` node passes
+    /// ownership to its ancestors). Lets the mark of a compound control show
+    /// focus.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_focus: Option<StyleProperties>,
+    /// Paint (background, border, text color, opacity) that applies while the
+    /// nearest ancestor declaring a `hover` style is hovered: a row's close
+    /// button or actions that show when the pointer is over the row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_hover: Option<StyleProperties>,
+    /// Applies while the node or any descendant has keyboard focus, such as
+    /// the frame of a field group around a native input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus_within: Option<StyleProperties>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disabled: Option<StyleProperties>,
 }
@@ -1098,12 +1396,19 @@ impl Style {
 
     #[must_use]
     pub fn merged(mut self, overlay: &Self) -> Self {
+        self.merge_in_place(overlay);
+        self
+    }
+
+    pub(crate) fn merge_in_place(&mut self, overlay: &Self) {
         self.base.merge(&overlay.base);
         merge_pseudo(&mut self.hover, overlay.hover.as_ref());
         merge_pseudo(&mut self.active, overlay.active.as_ref());
         merge_pseudo(&mut self.focus, overlay.focus.as_ref());
+        merge_pseudo(&mut self.group_focus, overlay.group_focus.as_ref());
+        merge_pseudo(&mut self.group_hover, overlay.group_hover.as_ref());
+        merge_pseudo(&mut self.focus_within, overlay.focus_within.as_ref());
         merge_pseudo(&mut self.disabled, overlay.disabled.as_ref());
-        self
     }
 
     #[must_use]
@@ -1121,6 +1426,16 @@ impl Style {
         }
         if state.contains(PseudoState::Focused)
             && let Some(focus) = &self.focus
+        {
+            resolved.merge(focus);
+        }
+        if state.contains(PseudoState::GroupFocused)
+            && let Some(focus) = &self.group_focus
+        {
+            resolved.merge(focus);
+        }
+        if state.contains(PseudoState::FocusWithin)
+            && let Some(focus) = &self.focus_within
         {
             resolved.merge(focus);
         }
@@ -1305,6 +1620,21 @@ impl Style {
         self
     }
 
+    /// Round both corners on the logical inline start (the first item of a
+    /// joined group); they mirror in RTL.
+    #[must_use]
+    pub fn radius_start(mut self, value: Length) -> Self {
+        self.base.radii.start = Some(value);
+        self
+    }
+
+    /// Round both corners on the logical inline end.
+    #[must_use]
+    pub fn radius_end(mut self, value: Length) -> Self {
+        self.base.radii.end = Some(value);
+        self
+    }
+
     #[must_use]
     pub fn radius_top_left(mut self, value: Length) -> Self {
         self.base.radii.top_left = Some(value);
@@ -1403,6 +1733,7 @@ impl Style {
 
     #[must_use]
     pub fn grid(mut self) -> Self {
+        self.base.clear_auto_grid_columns();
         self.base.display = Some(DisplayMode::Grid);
         self
     }
@@ -1442,6 +1773,14 @@ impl Style {
     #[must_use]
     pub fn items_end(mut self) -> Self {
         self.base.align = Some(Align::End);
+        self
+    }
+
+    /// Aligns a row's text children on the baseline of the row's own text style,
+    /// as text in one line is set; other children align to the start.
+    #[must_use]
+    pub fn items_baseline(mut self) -> Self {
+        self.base.align = Some(Align::Baseline);
         self
     }
 
@@ -1544,7 +1883,61 @@ impl Style {
     /// Returns [`StyleValueError`] outside 1..=1024.
     pub fn grid_columns(mut self, columns: i64) -> Result<Self, StyleValueError> {
         self.base.grid_columns = Some(grid_value(columns)?);
+        self.base.clear_auto_grid_columns();
         self.base.display = Some(DisplayMode::Grid);
+        Ok(self)
+    }
+
+    /// A responsive equal-track grid over ordinary Box children. Widths are
+    /// logical pixels; row heights remain intrinsic. Native width refinement
+    /// after mount/resize does not execute Rhai or mutate application state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StyleValueError::InvalidAutoGrid`] for invalid width bounds.
+    pub fn auto_grid_columns(
+        self,
+        minimum: f64,
+        preferred: f64,
+        maximum: f64,
+    ) -> Result<Self, StyleValueError> {
+        Ok(self.with_auto_grid(crate::AutoGridColumns::new(minimum, preferred, maximum)?))
+    }
+
+    /// [`Self::auto_grid_columns`] with bounds that may be rems or theme
+    /// tokens, resolved natively in the node's environment
+    /// ([`crate::AutoGridColumns::from_lengths`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StyleValueError::InvalidAutoGrid`] for a relative bound or
+    /// invalid pixel bounds.
+    pub fn auto_grid_column_lengths(
+        self,
+        minimum: Length,
+        preferred: Length,
+        maximum: Length,
+    ) -> Result<Self, StyleValueError> {
+        Ok(self.with_auto_grid(crate::AutoGridColumns::from_lengths(
+            minimum, preferred, maximum,
+        )?))
+    }
+
+    fn with_auto_grid(mut self, columns: crate::AutoGridColumns) -> Self {
+        self.base.constraints_mut().auto_grid_columns = Some(columns);
+        self.base.grid_columns = None;
+        self.base.display = Some(DisplayMode::Block);
+        self
+    }
+
+    /// Set GPUI's width/height ratio, leaving one dimension automatic.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StyleValueError::InvalidAspectRatio`] for a non-positive,
+    /// non-finite or unrepresentable ratio.
+    pub fn aspect_ratio(mut self, ratio: f64) -> Result<Self, StyleValueError> {
+        self.base.constraints_mut().aspect_ratio = Some(validate_aspect_ratio(ratio)?);
         Ok(self)
     }
 
@@ -1554,6 +1947,7 @@ impl Style {
     ///
     /// Returns [`StyleValueError`] outside 1..=1024.
     pub fn grid_rows(mut self, rows: i64) -> Result<Self, StyleValueError> {
+        self.base.clear_auto_grid_columns();
         self.base.grid_rows = Some(grid_value(rows)?);
         self.base.display = Some(DisplayMode::Grid);
         Ok(self)
@@ -1647,6 +2041,20 @@ impl Style {
         self
     }
 
+    /// Position at the logical inline start; overrides the matching physical edge.
+    #[must_use]
+    pub fn inset_start(mut self, value: impl Into<LayoutLength>) -> Self {
+        self.base.inset_start = Some(value.into());
+        self
+    }
+
+    /// Position at the logical inline end; overrides the matching physical edge.
+    #[must_use]
+    pub fn inset_end(mut self, value: impl Into<LayoutLength>) -> Self {
+        self.base.inset_end = Some(value.into());
+        self
+    }
+
     /// Set finite unit opacity.
     ///
     /// # Errors
@@ -1684,11 +2092,13 @@ impl Style {
     ///
     /// # Errors
     ///
-    /// Returns [`StyleValueError::UnknownTypographyRole`] for non-core roles.
+    /// Returns [`StyleValueError::InvalidTypographyRole`] for a malformed
+    /// name. Whether the role exists is decided by the active theme at render
+    /// time.
     pub fn typography(mut self, role: impl Into<String>) -> Result<Self, StyleValueError> {
         let role = role.into();
-        if !crate::REQUIRED_TYPOGRAPHY.contains(&role.as_str()) {
-            return Err(StyleValueError::UnknownTypographyRole(role));
+        if !crate::token::valid_token_segment(&role) {
+            return Err(StyleValueError::InvalidTypographyRole(role));
         }
         self.base.typography = Some(role);
         Ok(self)
@@ -1870,6 +2280,24 @@ impl Style {
     }
 
     #[must_use]
+    pub fn group_focus(mut self, style: &Self) -> Self {
+        merge_pseudo(&mut self.group_focus, Some(&style.base));
+        self
+    }
+
+    #[must_use]
+    pub fn group_hover(mut self, style: &Self) -> Self {
+        merge_pseudo(&mut self.group_hover, Some(&style.base));
+        self
+    }
+
+    #[must_use]
+    pub fn focus_within(mut self, style: &Self) -> Self {
+        merge_pseudo(&mut self.focus_within, Some(&style.base));
+        self
+    }
+
+    #[must_use]
     pub fn disabled(mut self, style: &Self) -> Self {
         merge_pseudo(&mut self.disabled, Some(&style.base));
         self
@@ -1928,6 +2356,8 @@ enum LayoutSlot {
     Right,
     Bottom,
     Left,
+    InsetStart,
+    InsetEnd,
 }
 
 fn with_layout_value(mut style: Style, slot: LayoutSlot, value: LayoutLength) -> Style {
@@ -1955,6 +2385,8 @@ fn with_layout_value(mut style: Style, slot: LayoutSlot, value: LayoutLength) ->
         LayoutSlot::Right => style.base.right = Some(value),
         LayoutSlot::Bottom => style.base.bottom = Some(value),
         LayoutSlot::Left => style.base.left = Some(value),
+        LayoutSlot::InsetStart => style.base.inset_start = Some(value),
+        LayoutSlot::InsetEnd => style.base.inset_end = Some(value),
     }
     style
 }
@@ -2001,6 +2433,8 @@ fn register_property_specific_layout_methods(builder: &mut TypeBuilder<Style>) {
         ("right", LayoutSlot::Right),
         ("bottom", LayoutSlot::Bottom),
         ("left", LayoutSlot::Left),
+        ("inset_start", LayoutSlot::InsetStart),
+        ("inset_end", LayoutSlot::InsetEnd),
     ] {
         register_layout_overloads(builder, name, slot, true);
     }
@@ -2066,6 +2500,9 @@ impl CustomType for Style {
                 style.clone().items_start()
             })
             .with_fn("items_end", |style: &mut Self| style.clone().items_end())
+            .with_fn("items_baseline", |style: &mut Self| {
+                style.clone().items_baseline()
+            })
             .with_fn("justify_center", |style: &mut Self| {
                 style.clone().justify_center()
             })
@@ -2086,29 +2523,49 @@ impl CustomType for Style {
         register_property_specific_layout_methods(&mut builder);
         register_visual_methods(&mut builder);
         register_text_methods(&mut builder);
-        builder
-            .with_fn("hover", |style: &mut Self, state: Self| {
-                style.clone().hover(&state)
-            })
-            .with_fn("active", |style: &mut Self, state: Self| {
-                style.clone().active(&state)
-            })
-            .with_fn("focus", |style: &mut Self, state: Self| {
-                style.clone().focus(&state)
-            })
-            .with_fn("disabled", |style: &mut Self, state: Self| {
-                style.clone().disabled(&state)
-            })
-            .with_fn("merge", |style: &mut Self, overlay: Self| {
-                style.clone().merged(&overlay)
-            });
+        register_state_methods(&mut builder);
+        builder.with_fn("merge", |style: &mut Self, overlay: Self| {
+            style.clone().merged(&overlay)
+        });
     }
+}
+
+/// Pseudo-state variants: `style().hover(style()...)` and its siblings.
+fn register_state_methods(builder: &mut TypeBuilder<Style>) {
+    builder
+        .with_fn("hover", |style: &mut Style, state: Style| {
+            style.clone().hover(&state)
+        })
+        .with_fn("active", |style: &mut Style, state: Style| {
+            style.clone().active(&state)
+        })
+        .with_fn("focus", |style: &mut Style, state: Style| {
+            style.clone().focus(&state)
+        })
+        .with_fn("group_focus", |style: &mut Style, state: Style| {
+            style.clone().group_focus(&state)
+        })
+        .with_fn("group_hover", |style: &mut Style, state: Style| {
+            style.clone().group_hover(&state)
+        })
+        .with_fn("focus_within", |style: &mut Style, state: Style| {
+            style.clone().focus_within(&state)
+        })
+        .with_fn("disabled", |style: &mut Style, state: Style| {
+            style.clone().disabled(&state)
+        });
 }
 
 fn register_border_methods(builder: &mut TypeBuilder<Style>) {
     builder
         .with_fn("radius", |style: &mut Style, value: Length| {
             style.clone().radius(value)
+        })
+        .with_fn("radius_start", |style: &mut Style, value: Length| {
+            style.clone().radius_start(value)
+        })
+        .with_fn("radius_end", |style: &mut Style, value: Length| {
+            style.clone().radius_end(value)
         })
         .with_fn("radius_top_left", |style: &mut Style, value: Length| {
             style.clone().radius_top_left(value)
@@ -2197,6 +2654,12 @@ fn register_position_methods(builder: &mut TypeBuilder<Style>) {
         })
         .with_fn("left", |style: &mut Style, value: Length| {
             style.clone().left(value)
+        })
+        .with_fn("inset_start", |style: &mut Style, value: Length| {
+            style.clone().inset_start(value)
+        })
+        .with_fn("inset_end", |style: &mut Style, value: Length| {
+            style.clone().inset_end(value)
         });
 }
 
@@ -2261,6 +2724,25 @@ fn register_extended_layout_methods(builder: &mut TypeBuilder<Style>) {
             style
                 .clone()
                 .grid_columns(value)
+                .map_err(|error| Box::new(style_runtime_error(error.to_string())))
+        })
+        .with_fn(
+            "auto_grid_columns",
+            |style: &mut Style, minimum: Dynamic, preferred: Dynamic, maximum: Dynamic| {
+                style
+                    .clone()
+                    .auto_grid_column_lengths(
+                        grid_bound(minimum)?,
+                        grid_bound(preferred)?,
+                        grid_bound(maximum)?,
+                    )
+                    .map_err(|error| Box::new(style_runtime_error(error.to_string())))
+            },
+        )
+        .with_fn("aspect_ratio", |style: &mut Style, ratio: Dynamic| {
+            style
+                .clone()
+                .aspect_ratio(style_number(ratio)?)
                 .map_err(|error| Box::new(style_runtime_error(error.to_string())))
         })
         .with_fn("grid_rows", |style: &mut Style, value: INT| {
@@ -2461,11 +2943,17 @@ fn register_text_methods(builder: &mut TypeBuilder<Style>) {
         .with_fn("line_height", |style: &mut Style, value: Length| {
             style.clone().line_height(value)
         })
+        .with_fn("text_start", |style: &mut Style| {
+            style.clone().text_align(TextAlignMode::Start)
+        })
         .with_fn("text_left", |style: &mut Style| {
             style.clone().text_align(TextAlignMode::Start)
         })
         .with_fn("text_center", |style: &mut Style| {
             style.clone().text_align(TextAlignMode::Center)
+        })
+        .with_fn("text_end", |style: &mut Style| {
+            style.clone().text_align(TextAlignMode::End)
         })
         .with_fn("text_right", |style: &mut Style| {
             style.clone().text_align(TextAlignMode::End)
@@ -2492,6 +2980,10 @@ pub enum PseudoState {
     Hovered,
     Active,
     Focused,
+    /// The nearest ancestor-or-self with a `focus` style has focus.
+    GroupFocused,
+    /// The node or one of its descendants has focus.
+    FocusWithin,
     Disabled,
 }
 
@@ -2562,6 +3054,7 @@ pub(crate) fn register_style_api(engine: &mut Engine) {
                     .map_err(|error| Box::new(style_runtime_error(error.to_string())))
             },
         );
+    register_token_api(engine);
     FuncRegistration::new("rgb")
         .in_global_namespace()
         .register_into_engine(engine, rgb_color);
@@ -2576,13 +3069,149 @@ pub(crate) fn register_style_api(engine: &mut Engine) {
         .register_into_engine(engine, linear_gradient_from_map);
     FuncRegistration::new("theme_color")
         .in_global_namespace()
-        .register_into_engine(engine, |token: String| ColorValue::Token(token));
+        .register_into_engine(
+            engine,
+            |token: ImmutableString| -> Result<ColorValue, Box<EvalAltResult>> {
+                ColorValue::token(token.as_str())
+                    .map_err(|error| Box::new(style_runtime_error(error.to_string())))
+            },
+        );
+    register_color_expression_api(engine);
     FuncRegistration::new("color")
         .in_global_namespace()
         .register_into_engine(
             engine,
             |value: ImmutableString| -> Result<ColorValue, Box<EvalAltResult>> {
                 ColorValue::parse(value.as_str())
+                    .map_err(|error| Box::new(style_runtime_error(error.to_string())))
+            },
+        );
+}
+
+/// Named length tokens, length scaling and environment-variant values.
+fn register_token_api(engine: &mut Engine) {
+    FuncRegistration::new("theme_length")
+        .in_global_namespace()
+        .register_into_engine(
+            engine,
+            |path: ImmutableString| -> Result<Length, Box<EvalAltResult>> {
+                Length::token(path.as_str())
+                    .map_err(|error| Box::new(style_runtime_error(error.to_string())))
+            },
+        );
+    for name in ["*", "times"] {
+        FuncRegistration::new(name)
+            .in_global_namespace()
+            .register_into_engine(
+                engine,
+                |length: Length, factor: FLOAT| -> Result<Length, Box<EvalAltResult>> {
+                    length
+                        .scaled(factor)
+                        .map_err(|error| Box::new(style_runtime_error(error.to_string())))
+                },
+            );
+        FuncRegistration::new(name)
+            .in_global_namespace()
+            .register_into_engine(
+                engine,
+                |length: Length, factor: INT| -> Result<Length, Box<EvalAltResult>> {
+                    let factor = i32::try_from(factor).map_err(|_| {
+                        Box::new(style_runtime_error(
+                            "length scale is out of range".to_owned(),
+                        ))
+                    })?;
+                    length
+                        .scaled(FLOAT::from(factor))
+                        .map_err(|error| Box::new(style_runtime_error(error.to_string())))
+                },
+            );
+    }
+    engine.build_type::<crate::theme_source::EnvTableSource>();
+    FuncRegistration::new("by_env")
+        .in_global_namespace()
+        .register_into_engine(
+            engine,
+            |keys: Dynamic,
+             table: Map|
+             -> Result<crate::theme_source::EnvTableSource, Box<EvalAltResult>> {
+                crate::theme_source::EnvTableSource::new(keys, table)
+                    .map_err(|error| Box::new(style_runtime_error(error)))
+            },
+        );
+}
+
+/// Color expressions over theme tokens: `mix`, `alpha` and `readable`. Each
+/// numeric argument takes an integer or a float.
+fn register_color_expression_api(engine: &mut Engine) {
+    FuncRegistration::new("mix")
+        .in_global_namespace()
+        .register_into_engine(
+            engine,
+            |base: ColorValue,
+             other: ColorValue,
+             weight: FLOAT|
+             -> Result<ColorValue, Box<EvalAltResult>> {
+                base.mix(other, weight)
+                    .map_err(|error| Box::new(style_runtime_error(error.to_string())))
+            },
+        );
+    FuncRegistration::new("mix")
+        .in_global_namespace()
+        .register_into_engine(
+            engine,
+            |base: ColorValue,
+             other: ColorValue,
+             weight: INT|
+             -> Result<ColorValue, Box<EvalAltResult>> {
+                base.mix(other, numeric_to_f64(&weight)?)
+                    .map_err(|error| Box::new(style_runtime_error(error.to_string())))
+            },
+        );
+    FuncRegistration::new("alpha")
+        .in_global_namespace()
+        .register_into_engine(
+            engine,
+            |color: ColorValue, alpha: FLOAT| -> Result<ColorValue, Box<EvalAltResult>> {
+                color
+                    .alpha(alpha)
+                    .map_err(|error| Box::new(style_runtime_error(error.to_string())))
+            },
+        );
+    FuncRegistration::new("alpha")
+        .in_global_namespace()
+        .register_into_engine(
+            engine,
+            |color: ColorValue, alpha: INT| -> Result<ColorValue, Box<EvalAltResult>> {
+                color
+                    .alpha(numeric_to_f64(&alpha)?)
+                    .map_err(|error| Box::new(style_runtime_error(error.to_string())))
+            },
+        );
+    FuncRegistration::new("readable")
+        .in_global_namespace()
+        .register_into_engine(
+            engine,
+            |color: ColorValue,
+             toward: ColorValue,
+             background: ColorValue,
+             ratio: FLOAT|
+             -> Result<ColorValue, Box<EvalAltResult>> {
+                color
+                    .readable(toward, background, ratio)
+                    .map_err(|error| Box::new(style_runtime_error(error.to_string())))
+            },
+        );
+    FuncRegistration::new("readable")
+        .in_global_namespace()
+        .register_into_engine(
+            engine,
+            |color: ColorValue,
+             toward: ColorValue,
+             background: ColorValue,
+             ratio: INT|
+             -> Result<ColorValue, Box<EvalAltResult>> {
+                color
+                    .readable(toward, background, numeric_to_f64(&ratio)?)
                     .map_err(|error| Box::new(style_runtime_error(error.to_string())))
             },
         );
@@ -2723,6 +3352,42 @@ fn optional_map_number(value: &mut Map, name: &str) -> Result<Option<f64>, Box<E
         .transpose()
 }
 
+/// An `auto_grid_columns` bound: a Length, or a number of logical pixels.
+fn grid_bound(value: Dynamic) -> Result<Length, Box<EvalAltResult>> {
+    if value.is::<Length>() {
+        Ok(value.cast::<Length>())
+    } else {
+        style_number(value).map(Length::Pixels)
+    }
+}
+
+fn style_number(value: Dynamic) -> Result<f64, Box<EvalAltResult>> {
+    if value.is::<FLOAT>() {
+        Ok(value.cast::<FLOAT>())
+    } else if value.is::<INT>() {
+        numeric_to_f64(&value.cast::<INT>())
+    } else {
+        Err(Box::new(style_runtime_error("expected a number".into())))
+    }
+}
+
+fn validate_aspect_ratio(ratio: f64) -> Result<f64, StyleValueError> {
+    if ratio.is_finite() && (f64::from(f32::MIN_POSITIVE)..=f64::from(f32::MAX)).contains(&ratio) {
+        Ok(ratio)
+    } else {
+        Err(StyleValueError::InvalidAspectRatio(ratio))
+    }
+}
+
+fn deserialize_aspect_ratio<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<f64>, D::Error> {
+    Option::<f64>::deserialize(deserializer)?
+        .map(validate_aspect_ratio)
+        .transpose()
+        .map_err(serde::de::Error::custom)
+}
+
 fn reject_style_map_unknown(value: Map, context: &str) -> Result<(), Box<EvalAltResult>> {
     if let Some((name, _)) = value.into_iter().next() {
         Err(Box::new(style_runtime_error(format!(
@@ -2799,10 +3464,10 @@ mod tests {
             .unwrap();
         assert_eq!(style.base.direction, Some(FlexDirection::Column));
         assert_eq!(style.base.align_self, Some(Align::Start));
-        assert_eq!(style.base.gap, Some(Length::ThemeSpacing(SpacingToken::Sm)));
+        assert_eq!(style.base.gap, Some(Length::theme_spacing("sm").unwrap()));
         assert_eq!(
             style.base.radii,
-            CornerLengths::all(Length::ThemeRadius(RadiusToken::Md))
+            CornerLengths::all(Length::theme_radius("md").unwrap())
         );
         assert!(style.hover.is_some());
     }
@@ -2828,17 +3493,65 @@ mod tests {
         let standard = Style::new()
             .flex_grow_weight(4.0)
             .unwrap()
-            .merged(&Style::new().flex_grow(1.0));
+            .merged(&Style::new().flex_grow());
         assert_eq!(standard.base.flex_grow, Some(true));
         assert_eq!(standard.base.flex_grow_weight, None);
         let weighted = Style::new()
-            .flex_grow(1.0)
+            .flex_grow()
             .merged(&Style::new().flex_grow_weight(4.0).unwrap());
         assert_eq!(weighted.base.flex_grow, None);
         assert_eq!(weighted.base.flex_grow_weight, Some(4.0));
 
         let encoded = serde_json::to_string(&weighted).unwrap();
         assert_eq!(serde_json::from_str::<Style>(&encoded).unwrap(), weighted);
+    }
+
+    #[test]
+    fn merging_an_all_edge_setter_replaces_logical_edges_as_a_chain_does() {
+        let base = Style::new()
+            .padding_start(Length::Pixels(4.0))
+            .radius_start(Length::Pixels(6.0))
+            .margin_end(Length::Pixels(2.0))
+            .border_start(Length::Pixels(1.0));
+        let overlay = Style::new()
+            .padding(Length::Pixels(20.0))
+            .radius(Length::Pixels(0.0))
+            .margin(Length::Pixels(0.0))
+            .border(Length::Pixels(3.0));
+        let chained = base
+            .clone()
+            .padding(Length::Pixels(20.0))
+            .radius(Length::Pixels(0.0))
+            .margin(Length::Pixels(0.0))
+            .border(Length::Pixels(3.0));
+        assert_eq!(base.clone().merged(&overlay).base, chained.base);
+        // One physical edge leaves the logical edge in place, in a chain and in a merge.
+        let one_edge = Style::new().padding_left(Length::Pixels(20.0));
+        assert_eq!(
+            base.clone().merged(&one_edge).base.padding.start,
+            Some(Length::Pixels(4.0))
+        );
+    }
+
+    #[test]
+    fn merging_a_background_replaces_a_gradient_and_back() {
+        let gradient = LinearGradientSpec::new(
+            90.0,
+            ColorValue::Literal(Rgba8::from_rgb_hex(0x0011_2233)),
+            ColorValue::Literal(Rgba8::from_rgb_hex(0x0044_5566)),
+        )
+        .unwrap();
+        let solid = ColorValue::Literal(Rgba8::from_rgb_hex(0x00aa_bbcc));
+        let merged = Style::new()
+            .linear_gradient(gradient.clone())
+            .merged(&Style::new().background(solid.clone()));
+        assert_eq!(merged.base.gradient, None);
+        assert_eq!(merged.base.background, Some(solid.clone()));
+        let merged = Style::new()
+            .background(solid)
+            .merged(&Style::new().linear_gradient(gradient.clone()));
+        assert_eq!(merged.base.gradient, Some(gradient));
+        assert_eq!(merged.base.background, None);
     }
 
     #[test]
@@ -2917,9 +3630,111 @@ mod tests {
         assert_eq!(style.base.font_weight, Some(650));
         assert!(
             engine
-                .eval::<Style>(r#"style().typography("bodyish")"#)
+                .eval::<Style>(r#"style().typography("Body Ish")"#)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn logical_text_alignment_has_start_and_end_names_and_physical_synonyms() {
+        let mut engine = Engine::new();
+        register_style_api(&mut engine);
+        for (script, align) in [
+            ("style().text_start()", TextAlignMode::Start),
+            ("style().text_left()", TextAlignMode::Start),
+            ("style().text_center()", TextAlignMode::Center),
+            ("style().text_end()", TextAlignMode::End),
+            ("style().text_right()", TextAlignMode::End),
+        ] {
+            let style: Style = engine.eval(script).unwrap();
+            assert_eq!(style.base.text_align, Some(align), "{script}");
+        }
+    }
+
+    #[test]
+    fn color_expressions_take_integer_factors() {
+        let mut engine = Engine::new();
+        register_style_api(&mut engine);
+        let accent = || ColorValue::Token("accent".to_owned());
+        let surface = || ColorValue::Token("surface".to_owned());
+        for (script, expected) in [
+            (
+                r#"alpha(theme_color("accent"), 1)"#,
+                accent().alpha(1.0).unwrap(),
+            ),
+            (
+                r#"theme_color("accent").alpha(0)"#,
+                accent().alpha(0.0).unwrap(),
+            ),
+            (
+                r#"mix(theme_color("accent"), theme_color("surface"), 1)"#,
+                accent().mix(surface(), 1.0).unwrap(),
+            ),
+            (
+                r#"readable(theme_color("accent"), theme_color("text_primary"), theme_color("surface"), 4)"#,
+                accent()
+                    .readable(ColorValue::Token("text_primary".to_owned()), surface(), 4.0)
+                    .unwrap(),
+            ),
+        ] {
+            let color: ColorValue = engine
+                .eval(script)
+                .unwrap_or_else(|error| panic!("{script}: {error}"));
+            assert_eq!(color, expected, "{script}");
+        }
+        for (script, message) in [
+            (r#"alpha(theme_color("accent"), 2)"#, "color factor"),
+            (
+                r#"mix(theme_color("accent"), theme_color("surface"), -1)"#,
+                "color factor",
+            ),
+            (
+                r#"readable(theme_color("accent"), theme_color("text_primary"), theme_color("surface"), 22)"#,
+                "contrast ratio",
+            ),
+        ] {
+            let error = engine.eval::<ColorValue>(script).unwrap_err().to_string();
+            assert!(error.contains(message), "{script}: {error}");
+        }
+    }
+
+    #[test]
+    fn theme_color_checks_the_token_path_when_called() {
+        let mut engine = Engine::new();
+        register_style_api(&mut engine);
+        for path in [
+            "accent",
+            "surface_hover",
+            "text.danger",
+            "tabbar.active",
+            "table.selection",
+            "undefined_token",
+        ] {
+            let color: ColorValue = engine
+                .eval(&format!("theme_color(\"{path}\")"))
+                .unwrap_or_else(|error| panic!("{path}: {error}"));
+            assert_eq!(color, ColorValue::Token(path.to_owned()));
+        }
+        for path in [
+            "",
+            "Accent",
+            "text-muted",
+            "text.",
+            ".danger",
+            "a.b.c",
+            "text..danger",
+            "_accent",
+        ] {
+            let error = engine
+                .eval::<ColorValue>(&format!("theme_color(\"{path}\")"))
+                .unwrap_err();
+            assert!(
+                error.to_string().contains(&format!(
+                    "color token `{path}` must be `name` or `namespace.name`"
+                )),
+                "{path}: {error}"
+            );
+        }
     }
 
     #[test]
@@ -2938,15 +3753,28 @@ mod tests {
         register_style_api(&mut engine);
         let style: Style = engine
             .eval(
-                r"
+                r#"
                     style()
                         .width(auto()).flex_basis(auto())
                         .margin_x(auto()).margin_bottom(offset_relative(-0.5))
                         .top(offset_px(-12)).left(offset_rem(1.5))
-                ",
+                        .inset_start(offset_px(-4)).inset_end(theme_spacing("xs"))
+                "#,
             )
             .unwrap();
         assert_eq!(style.base.width, Some(LayoutLength::Auto));
+        assert_eq!(
+            style.base.inset_start,
+            Some(LayoutLength::Signed(SignedLength::Pixels(-4.0)))
+        );
+        assert_eq!(
+            style.base.inset_end,
+            Some(LayoutLength::Definite(Length::theme_spacing("xs").unwrap()))
+        );
+        let auto: Style = engine.eval("style().inset_start(auto())").unwrap();
+        assert_eq!(auto.base.inset_start, Some(LayoutLength::Auto));
+        let composed = style.clone().merged(&auto);
+        assert_eq!(composed.base.inset_start, Some(LayoutLength::Auto));
         assert_eq!(style.base.flex_basis, Some(LayoutLength::Auto));
         assert_eq!(style.base.margin.left, Some(LayoutLength::Auto));
         assert_eq!(style.base.margin.right, Some(LayoutLength::Auto));
@@ -3022,7 +3850,8 @@ mod tests {
             Err(LengthError::InvalidRelative(1.5))
         );
         assert!(Length::pixels(f64::NAN).is_err());
-        assert!(Length::theme_spacing("xxl").is_err());
+        assert!(Length::theme_spacing("Extra Large").is_err());
+        assert!(Length::token("row").is_err());
         assert!(Style::new().opacity(1.1).is_err());
         assert!(Style::new().translate_y(f64::NAN).is_err());
         assert!(Style::new().grid_columns(0).is_err());

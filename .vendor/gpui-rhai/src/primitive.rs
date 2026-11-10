@@ -11,9 +11,9 @@ use thiserror::Error;
 
 use crate::{
     AssetId, ColorResolver, ColorValue, ComponentStateSchema, EventSchema, Length,
-    NodeEventDispatcher, ObjectField, RadiusToken, Rgba8, SchemaDefinitionError,
-    SchemaValidationError, ScriptCallback, ScriptGeneration, SpacingToken, Style, UiEventHandler,
-    UiNode, UiValue, UiValueError, ValueSchema,
+    NodeEventDispatcher, ObjectField, Rgba8, SchemaDefinitionError, SchemaValidationError,
+    ScriptCallback, ScriptGeneration, Style, UiEventHandler, UiNode, UiValue, UiValueError,
+    ValueSchema,
 };
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -107,6 +107,8 @@ pub enum PrimitivePlatform {
     MacOs,
     Linux,
     Windows,
+    // workbench-rs: the browser (wasm32), where GPUI runs too.
+    Web,
 }
 
 impl PrimitivePlatform {
@@ -120,9 +122,13 @@ impl PrimitivePlatform {
         {
             Self::Linux
         }
-        #[cfg(any(target_os = "windows", target_family = "wasm"))]
+        #[cfg(target_os = "windows")]
         {
             Self::Windows
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            Self::Web
         }
     }
 }
@@ -159,10 +165,10 @@ pub enum PrimitiveValue {
 /// concrete theme family.
 #[derive(Clone, Debug)]
 pub struct PrimitiveTheme {
+    tokens: Option<std::sync::Arc<crate::ThemeTokens>>,
     colors: BTreeMap<String, Rgba8>,
-    spacing: BTreeMap<SpacingToken, Length>,
-    radii: BTreeMap<RadiusToken, Length>,
-    typography: BTreeMap<String, crate::ResolvedTypography>,
+    environment: crate::Environment,
+    inherited_disabled: bool,
     direction: crate::TextDirection,
     locale: String,
     number: Option<crate::NumberMetadata>,
@@ -172,84 +178,13 @@ pub struct PrimitiveTheme {
     clock: crate::RuntimeClock,
 }
 
-pub(crate) const RUNTIME_THEME_COLOR_TOKENS: &[&str] = &[
-    "surface",
-    "surface_raised",
-    "surface_hover",
-    "text_primary",
-    "text_muted",
-    "accent",
-    "accent_hover",
-    "on_accent",
-    "danger",
-    "on_danger",
-    "warning",
-    "on_warning",
-    "success",
-    "on_success",
-    "border",
-    "focus_ring",
-    "selection",
-    "disabled",
-    "syntax.comment",
-    "syntax.string",
-    "syntax.number",
-    "syntax.keyword",
-    "syntax.function",
-    "syntax.type",
-    "syntax.variable",
-    "syntax.constant",
-    "syntax.operator",
-    "syntax.punctuation",
-    "syntax.tag",
-    "syntax.attribute",
-    "document.search_match",
-    "document.search_current",
-    "diff.left_only",
-    "diff.right_only",
-    "diff.modified",
-    "diff.inline_left",
-    "diff.inline_right",
-    "diff.gutter",
-    "diff.fold",
-    "charts.axis",
-    "charts.grid",
-    "charts.tooltip_surface",
-    "charts.tooltip_text",
-    "charts.positive",
-    "charts.negative",
-    "charts.selection",
-    "charts.map_missing",
-    "charts.crosshair",
-    "charts.palette_1",
-    "charts.palette_2",
-    "charts.palette_3",
-    "charts.palette_4",
-    "charts.palette_5",
-    "charts.palette_6",
-    "charts.palette_7",
-    "charts.palette_8",
-    "table.selection",
-];
-
-pub(crate) const RUNTIME_THEME_SPACING_TOKENS: &[SpacingToken] = &[
-    SpacingToken::Xxs,
-    SpacingToken::Xs,
-    SpacingToken::Sm,
-    SpacingToken::Md,
-    SpacingToken::Lg,
-];
-
-pub(crate) const RUNTIME_THEME_RADIUS_TOKENS: &[RadiusToken] =
-    &[RadiusToken::Sm, RadiusToken::Md, RadiusToken::Lg];
-
 impl Default for PrimitiveTheme {
     fn default() -> Self {
         Self {
+            tokens: None,
             colors: BTreeMap::new(),
-            spacing: BTreeMap::new(),
-            radii: BTreeMap::new(),
-            typography: BTreeMap::new(),
+            environment: crate::Environment::EMPTY,
+            inherited_disabled: false,
             direction: crate::TextDirection::LeftToRight,
             locale: "en".to_owned(),
             number: None,
@@ -262,6 +197,24 @@ impl Default for PrimitiveTheme {
 }
 
 impl PrimitiveTheme {
+    /// Capture a Host's read-only color/token resolver for native components.
+    /// Capture a fresh snapshot after the Host theme or direction changes.
+    #[must_use]
+    pub fn from_colors(
+        colors: &(impl ColorResolver + ?Sized),
+        direction: crate::TextDirection,
+    ) -> Self {
+        Self::capture_with_environment(
+            colors,
+            direction,
+            "en",
+            None,
+            crate::RuntimeClock::default(),
+            crate::MotionPreference::Normal,
+            crate::MotionQuality::High,
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn capture(colors: &impl ColorResolver) -> Self {
         Self::capture_with_direction(colors, crate::TextDirection::LeftToRight)
@@ -298,9 +251,8 @@ impl PrimitiveTheme {
         )
     }
 
-    #[allow(clippy::too_many_lines)]
     pub(crate) fn capture_with_environment(
-        colors: &impl ColorResolver,
+        colors: &(impl ColorResolver + ?Sized),
         direction: crate::TextDirection,
         locale: &str,
         number: Option<&crate::NumberMetadata>,
@@ -308,34 +260,16 @@ impl PrimitiveTheme {
         motion_preference: crate::MotionPreference,
         motion_quality: crate::MotionQuality,
     ) -> Self {
+        let tokens = colors.token_set();
         Self {
-            colors: colors.color_snapshot(),
-            spacing: RUNTIME_THEME_SPACING_TOKENS
-                .iter()
-                .copied()
-                .filter_map(|token| {
-                    colors
-                        .resolve_length(Length::ThemeSpacing(token))
-                        .map(|value| (token, value))
-                })
-                .collect(),
-            radii: RUNTIME_THEME_RADIUS_TOKENS
-                .iter()
-                .copied()
-                .filter_map(|token| {
-                    colors
-                        .resolve_length(Length::ThemeRadius(token))
-                        .map(|value| (token, value))
-                })
-                .collect(),
-            typography: crate::REQUIRED_TYPOGRAPHY
-                .iter()
-                .filter_map(|role| {
-                    colors
-                        .resolve_typography(role)
-                        .map(|value| ((*role).to_owned(), value))
-                })
-                .collect(),
+            colors: if tokens.is_some() {
+                BTreeMap::new()
+            } else {
+                colors.color_snapshot()
+            },
+            tokens,
+            environment: colors.environment(),
+            inherited_disabled: false,
             direction,
             locale: locale.to_owned(),
             number: number.cloned(),
@@ -347,25 +281,60 @@ impl PrimitiveTheme {
     }
 
     #[must_use]
+    pub(crate) const fn with_inherited_disabled(mut self, disabled: bool) -> Self {
+        self.inherited_disabled = disabled;
+        self
+    }
+
+    #[must_use]
     pub fn color(&self, token: &str) -> Option<Rgba8> {
-        self.colors.get(token).copied()
+        match &self.tokens {
+            Some(tokens) => tokens.color(token),
+            None => self.colors.get(token).copied(),
+        }
     }
 
     #[must_use]
     pub fn resolve_color(&self, value: &ColorValue) -> Option<Rgba8> {
-        match value {
-            ColorValue::Literal(value) => Some(*value),
-            ColorValue::Token(token) => self.color(token),
-        }
+        value.resolve_with(&mut |token| self.color(token))
+    }
+
+    pub(crate) fn part_color(
+        &self,
+        props: &PrimitiveProps,
+        name: &str,
+        background: bool,
+    ) -> Option<Rgba8> {
+        let style = props
+            .style(name)?
+            .resolve(&crate::InteractionState::default());
+        let value = if background {
+            style.background.as_ref().or(style.text_color.as_ref())
+        } else {
+            style.text_color.as_ref().or(style.background.as_ref())
+        }?;
+        self.resolve_color(value)
     }
 
     #[must_use]
     pub fn resolve_length(&self, value: Length) -> Option<Length> {
-        match value {
-            Length::ThemeSpacing(token) => self.spacing.get(&token).copied(),
-            Length::ThemeRadius(token) => self.radii.get(&token).copied(),
-            Length::Pixels(_) | Length::Rems(_) | Length::Relative(_) => Some(value),
+        match &self.tokens {
+            Some(tokens) => tokens.resolve_length(value, &self.environment),
+            None => (!value.is_theme_token()).then_some(value),
         }
+    }
+
+    /// The environment inherited by this primitive.
+    #[must_use]
+    pub const fn environment(&self) -> crate::Environment {
+        self.environment
+    }
+
+    /// Whether an ancestor disabled this subtree. Primitives treat it like
+    /// their own `disabled` prop.
+    #[must_use]
+    pub const fn inherited_disabled(&self) -> bool {
+        self.inherited_disabled
     }
 
     #[must_use]
@@ -394,7 +363,7 @@ impl PrimitiveTheme {
     }
 
     #[must_use]
-    pub fn now(&self) -> std::time::Instant {
+    pub fn now(&self) -> web_time::Instant {
         self.clock.now()
     }
 
@@ -405,25 +374,51 @@ impl PrimitiveTheme {
 
     #[must_use]
     pub fn typography(&self, role: &str) -> Option<crate::ResolvedTypography> {
-        self.typography.get(role).cloned()
+        self.tokens
+            .as_ref()
+            .and_then(|tokens| tokens.resolve_typography(role, &self.environment))
     }
 }
 
 impl ColorResolver for PrimitiveTheme {
-    fn resolve(&self, color: &ColorValue) -> Option<Rgba8> {
-        self.resolve_color(color)
-    }
-
-    fn resolve_length(&self, length: Length) -> Option<Length> {
-        PrimitiveTheme::resolve_length(self, length)
+    fn resolve_token(&self, token: &str) -> Option<Rgba8> {
+        self.color(token)
     }
 
     fn color_snapshot(&self) -> BTreeMap<String, Rgba8> {
-        self.colors.clone()
+        match &self.tokens {
+            Some(tokens) => tokens.color_snapshot(),
+            None => self.colors.clone(),
+        }
     }
 
-    fn resolve_typography(&self, role: &str) -> Option<crate::ResolvedTypography> {
-        self.typography(role)
+    fn environment(&self) -> crate::Environment {
+        self.environment
+    }
+
+    fn resolve_length_in(
+        &self,
+        length: Length,
+        environment: &crate::Environment,
+    ) -> Option<Length> {
+        match &self.tokens {
+            Some(tokens) => tokens.resolve_length(length, environment),
+            None => (!length.is_theme_token()).then_some(length),
+        }
+    }
+
+    fn resolve_typography_in(
+        &self,
+        role: &str,
+        environment: &crate::Environment,
+    ) -> Option<crate::ResolvedTypography> {
+        self.tokens
+            .as_ref()
+            .and_then(|tokens| tokens.resolve_typography(role, environment))
+    }
+
+    fn token_set(&self) -> Option<std::sync::Arc<crate::ThemeTokens>> {
+        self.tokens.clone()
     }
 
     fn resolve_motion(&self) -> crate::ThemeMotion {
@@ -445,6 +440,85 @@ impl PrimitiveProps {
         self.0.get(name)
     }
 
+    #[must_use]
+    pub fn data(&self, name: &str) -> Option<&UiValue> {
+        match self.get(name) {
+            Some(PrimitiveValue::Data(value)) => Some(value),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn number(&self, name: &str) -> Option<f64> {
+        match self.data(name) {
+            Some(UiValue::Float(value)) => Some(*value),
+            Some(UiValue::Integer(value)) => value.to_string().parse().ok(),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn integer(&self, name: &str) -> Option<i64> {
+        match self.data(name) {
+            Some(UiValue::Integer(value)) => Some(*value),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn usize(&self, name: &str) -> Option<usize> {
+        self.integer(name)
+            .and_then(|value| usize::try_from(value).ok())
+    }
+
+    #[must_use]
+    pub fn string(&self, name: &str) -> Option<&str> {
+        match self.data(name) {
+            Some(UiValue::String(value)) => Some(value),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn boolean(&self, name: &str) -> Option<bool> {
+        match self.data(name) {
+            Some(UiValue::Bool(value)) => Some(*value),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn style(&self, name: &str) -> Option<&Style> {
+        match self.get(name) {
+            Some(PrimitiveValue::Style(style)) => Some(style),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn signal(&self, name: &str) -> Option<&crate::NativeSignal> {
+        match self.get(name) {
+            Some(PrimitiveValue::Signal(signal)) => Some(signal),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn element_ref(&self, name: &str) -> Option<&crate::ElementRef> {
+        match self.get(name) {
+            Some(PrimitiveValue::Ref(reference)) => Some(reference),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn document(&self, name: &str) -> Option<&crate::NativeTextDocument> {
+        match self.get(name) {
+            Some(PrimitiveValue::Document(document)) => Some(document),
+            _ => None,
+        }
+    }
+
     pub fn insert(
         &mut self,
         name: impl Into<String>,
@@ -461,6 +535,10 @@ impl PrimitiveProps {
 
     pub fn iter(&self) -> impl Iterator<Item = (&str, &PrimitiveValue)> {
         self.0.iter().map(|(name, value)| (name.as_str(), value))
+    }
+
+    pub(crate) fn get_mut(&mut self, name: &str) -> Option<&mut PrimitiveValue> {
+        self.0.get_mut(name)
     }
 
     pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = (&str, &mut PrimitiveValue)> {
@@ -520,6 +598,14 @@ pub struct PrimitiveInstanceId {
 }
 
 impl PrimitiveInstanceId {
+    pub(crate) fn new(primitive: PrimitiveId, key: String, node: crate::NodeId) -> Self {
+        Self {
+            primitive,
+            key,
+            node,
+        }
+    }
+
     #[must_use]
     pub const fn primitive(&self) -> &PrimitiveId {
         &self.primitive
@@ -548,6 +634,7 @@ pub struct PrimitiveInstance {
     pub id: Option<PrimitiveInstanceId>,
     pub node: PrimitiveNode,
     resources: Option<PrimitiveResourceScope>,
+    focus_handle: Option<gpui::FocusHandle>,
 }
 
 impl PrimitiveInstance {
@@ -557,6 +644,16 @@ impl PrimitiveInstance {
     #[must_use]
     pub const fn resources(&self) -> Option<&PrimitiveResourceScope> {
         self.resources.as_ref()
+    }
+
+    /// Return the runtime-owned focus identity for this native control.
+    ///
+    /// A focus-owning primitive must use this handle instead of allocating a
+    /// second identity so its declarative wrapper, automation target, and
+    /// native editor all observe the same focus state.
+    #[must_use]
+    pub const fn focus_handle(&self) -> Option<&gpui::FocusHandle> {
+        self.focus_handle.as_ref()
     }
 }
 
@@ -741,14 +838,157 @@ pub enum PrimitiveResourceError {
 }
 
 #[derive(Clone)]
-pub struct PrimitiveEventEmitter {
+pub struct PrimitiveContext {
+    assets: Option<crate::AssetRegistry>,
     registry: Weak<RefCell<PrimitiveRegistryInner>>,
     primitive: PrimitiveId,
+    event_schemas: BTreeMap<String, EventSchema>,
     callbacks: BTreeMap<String, UiEventHandler>,
     dispatcher: Option<NodeEventDispatcher>,
+    interactions: crate::interaction::WindowInteractionCoordinator,
+    scroll_handles: Vec<gpui::ScrollHandle>,
+    wheel_parents: Vec<crate::scrollbar::ScrollWheelSource>,
+    key_captures: Vec<crate::renderer::KeyCaptureScope>,
+    intrinsic_size: Option<crate::intrinsic::IntrinsicSizeInvalidator>,
+    intrinsic_generation: ScriptGeneration,
+    intrinsic_lease: Option<Weak<RefCell<PrimitiveResourceState>>>,
+    view_id: String,
+    instance: Option<PrimitiveInstanceId>,
+    retained_node: Option<crate::NodeId>,
+    /// The focus handle of the node that hosts the primitive, if it has one.
+    focus_handle: Option<gpui::FocusHandle>,
+    /// Whether the view shows focus indicators this frame.
+    focus_indicators: bool,
 }
 
-impl PrimitiveEventEmitter {
+/// A schema-checked semantic proposal produced by a native primitive policy.
+///
+/// The runtime executes this value at the owning `ScriptView` boundary so
+/// synchronous automation can observe the real callback result.
+pub struct PrimitiveSemanticProposal {
+    pub(crate) event: String,
+    pub(crate) payload: UiValue,
+    pub(crate) handler: Option<UiEventHandler>,
+}
+
+impl PrimitiveContext {
+    /// Invalidate this retained native primitive's enclosing virtual-row size.
+    ///
+    /// Call once after committing an intrinsic size change (for example an
+    /// asynchronous document parse or a width-dependent native layout change),
+    /// using the primitive's current context. Do not call on every render.
+    /// Calls are coalesced and deferred, so calling from native render/update
+    /// cannot reenter a parent entity. Only the current live row is remeasured
+    /// by GPUI; nested virtual rows propagate to their enclosing row in turn.
+    /// No Rhai execution or whole-collection measurement is requested.
+    ///
+    /// Outside a virtual row this is a no-op. Unmounted/replaced primitive or
+    /// row leases and contexts from an older script generation are ignored at
+    /// execution time. Hidden retained rows can become dirty without timers or
+    /// continuous repaint; their measurement is refreshed when presented.
+    pub fn invalidate_intrinsic_size(&self, cx: &mut App) {
+        let (Some(invalidator), Some(instance), Some(lease)) = (
+            self.intrinsic_size.clone(),
+            self.instance.clone(),
+            self.intrinsic_lease.clone(),
+        ) else {
+            return;
+        };
+        let registry = self.registry.clone();
+        let generation = self.intrinsic_generation;
+        // The registry is itself borrowed during PrimitiveHandler::render.
+        // Validate after that operation has committed, never synchronously.
+        invalidator.invalidate_if(cx, move || {
+            let Some(registry) = registry.upgrade() else {
+                return false;
+            };
+            registry.try_borrow().is_ok_and(|inner| {
+                inner.generation == generation
+                    && inner.mounted.get(&instance).is_some_and(|mounted| {
+                        mounted
+                            .resources
+                            .as_ref()
+                            .is_some_and(|resources| lease.ptr_eq(&Rc::downgrade(&resources.inner)))
+                    })
+            })
+        });
+    }
+
+    /// Whether a script capture-phase key handler above the primitive
+    /// (`on_capture("key:…")`) takes the key being dispatched: one ran and
+    /// prevented the default or stopped it. A native editor asks before its
+    /// own key binding acts; outside a key dispatch there is no key to take.
+    pub(crate) fn script_takes_key(&self, window: &mut Window, cx: &mut App) -> bool {
+        if self.key_captures.is_empty() {
+            return false;
+        }
+        crate::app::dispatching_keystroke().is_some_and(|keystroke| {
+            crate::renderer::KeyCaptureScope::take(&self.key_captures, &keystroke, window, cx)
+        })
+    }
+
+    /// Create a themed scrollbar factory owned by this retained primitive.
+    /// Dragging is cancelled on unmount, suspension, disposal, Escape and window
+    /// deactivation by the same private coordinator as built-in controls.
+    #[must_use]
+    pub fn scrollbars(&self, theme: &PrimitiveTheme) -> crate::ScrollbarContext {
+        crate::ScrollbarContext::new(
+            self.interaction_owner("scrollbars"),
+            self.interactions.clone(),
+            theme,
+        )
+        .with_wheel_parents(self.wheel_parents.clone())
+    }
+
+    /// Resolve an explicitly provided, preloaded Host asset without provider
+    /// I/O or decoding on the render path. This never treats a URL as a resource
+    /// locator and grants no network authority to the primitive.
+    ///
+    /// # Errors
+    /// Returns an asset resolution error when unavailable, unknown or not yet
+    /// prepared. Hosts preload during setup or use the existing async decoder.
+    pub fn image_asset(&self, id: &crate::AssetId) -> Result<gpui::ImageSource, crate::AssetError> {
+        let assets = self.assets.clone().unwrap_or_default();
+        let image = assets.cached_image(id)?;
+        assets.image_source(image.opaque())
+    }
+    pub(crate) fn observes(&self, event: &str) -> bool {
+        self.callbacks.contains_key(event)
+    }
+
+    /// Prepare a semantic proposal without dispatching it yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns declaration, schema, or released-registry errors.
+    pub fn prepare_proposal(
+        &self,
+        event: impl Into<String>,
+        payload: UiValue,
+    ) -> Result<PrimitiveSemanticProposal, PrimitiveError> {
+        let event = event.into();
+        let schema =
+            self.event_schemas
+                .get(&event)
+                .ok_or_else(|| PrimitiveError::UnknownEvent {
+                    primitive: self.primitive.clone(),
+                    event: event.clone(),
+                })?;
+        schema
+            .payload
+            .validate_ui_value(&payload)
+            .map_err(|source| PrimitiveError::InvalidEvent {
+                primitive: self.primitive.clone(),
+                event: event.clone(),
+                source,
+            })?;
+        Ok(PrimitiveSemanticProposal {
+            handler: self.callbacks.get(&event).cloned(),
+            event,
+            payload,
+        })
+    }
+
     /// Normalize and dispatch a declared native primitive event.
     ///
     /// # Errors
@@ -773,7 +1013,7 @@ impl PrimitiveEventEmitter {
             match handler {
                 UiEventHandler::Script(callback) => {
                     if let Some(dispatcher) = self.dispatcher.as_ref() {
-                        dispatcher.dispatch(callback.clone(), payload, None, window, cx);
+                        dispatcher.dispatch(callback.clone(), event, payload, None, window, cx);
                     }
                 }
                 UiEventHandler::Host(callback) => {
@@ -796,6 +1036,25 @@ impl PrimitiveEventEmitter {
         Ok(())
     }
 
+    /// Queue one low-frequency semantic proposal after the active native input
+    /// callback returns.
+    ///
+    /// Hot preview remains in native signals; Rhai or Host code observes only
+    /// the final schema-checked proposal.
+    pub fn propose(
+        &self,
+        event: impl Into<String>,
+        payload: UiValue,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let context = self.clone();
+        let event = event.into();
+        window.defer(cx, move |window, cx| {
+            let _ = context.emit(&event, payload, window, cx);
+        });
+    }
+
     /// Write one primitive-owned native signal without invoking Rhai.
     ///
     /// # Errors
@@ -814,6 +1073,175 @@ impl PrimitiveEventEmitter {
         )
     }
 
+    pub(crate) fn read_signal(
+        &self,
+        signal: &crate::NativeSignal,
+        cx: &App,
+    ) -> Result<crate::SignalValue, crate::SignalError> {
+        self.dispatcher.as_ref().map_or_else(
+            || Err(crate::SignalError::Stale(signal.id().clone())),
+            |dispatcher| dispatcher.read_signal(signal, cx),
+        )
+    }
+
+    /// Atomically apply one related native-preview patch and request at most
+    /// one repaint.
+    ///
+    /// # Errors
+    ///
+    /// Returns without changing any signal when a member is stale, duplicated,
+    /// non-finite, or type-incompatible.
+    pub fn write_signals(
+        &self,
+        updates: impl IntoIterator<Item = (crate::NativeSignal, crate::SignalValue)>,
+        cx: &mut App,
+    ) -> Result<bool, crate::SignalError> {
+        let updates = updates.into_iter().collect::<Vec<_>>();
+        let Some(dispatcher) = self.dispatcher.as_ref() else {
+            return updates.first().map_or(Ok(false), |(signal, _)| {
+                Err(crate::SignalError::Stale(signal.id().clone()))
+            });
+        };
+        dispatcher.write_signals(updates, cx)
+    }
+
+    pub(crate) fn interaction_owner(&self, key: &str) -> crate::interaction::InteractionOwner {
+        let owner = crate::interaction::InteractionOwner::new(
+            self.view_id.clone(),
+            format!("{}:{key}", self.primitive.as_str()),
+        );
+        if let Some(node) = self
+            .retained_node
+            .or_else(|| self.instance.as_ref().map(PrimitiveInstanceId::node))
+        {
+            owner.with_retained(node)
+        } else {
+            owner
+        }
+    }
+
+    pub(crate) fn begin_interaction(
+        &self,
+        gesture: crate::interaction::NativeGesture,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.interactions.begin(gesture, window, cx);
+    }
+
+    pub(crate) fn interaction_is_active(
+        &self,
+        owner: &crate::interaction::InteractionOwner,
+    ) -> bool {
+        self.interactions.is_active(owner)
+    }
+
+    pub(crate) fn present_interaction(&self, owner: crate::interaction::InteractionOwner) {
+        self.interactions.present(owner);
+    }
+
+    pub(crate) fn cancel_interaction(
+        &self,
+        owner: &crate::interaction::InteractionOwner,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        self.interactions.cancel_owner(owner, window, cx)
+    }
+
+    pub(crate) fn register_interaction_cancellation(
+        &self,
+        owner: crate::interaction::InteractionOwner,
+        notify: gpui::EntityId,
+        cancel: impl Fn(&mut Window, &mut App) + 'static,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.interactions
+            .register_auxiliary(owner, notify, cancel, window, cx);
+    }
+
+    pub(crate) fn clear_interaction_cancellation(
+        &self,
+        owner: &crate::interaction::InteractionOwner,
+    ) {
+        self.interactions.clear_auxiliary(owner);
+    }
+
+    pub(crate) fn register_drop_target(&self, target: crate::interaction::DropTargetRegistration) {
+        self.interactions.register_drop_target(target);
+    }
+
+    pub(crate) fn drop_target_state(
+        &self,
+        owner: &crate::interaction::InteractionOwner,
+    ) -> crate::interaction::DropTargetState {
+        self.interactions.drop_target_state(owner)
+    }
+
+    // A drag source passes its press, threshold and both endings through unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn begin_application_drag(
+        &self,
+        spec: crate::interaction::ApplicationDragSpec,
+        position: gpui::Point<gpui::Pixels>,
+        threshold: f64,
+        on_end: impl Fn(crate::interaction::ApplicationDropResult, bool, &mut Window, &mut App)
+        + 'static,
+        on_tap: Option<crate::interaction::TapHandler>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let gesture = crate::interaction::application_drag_gesture(
+            self.interactions.clone(),
+            position,
+            spec.notify(),
+            spec,
+            threshold,
+            on_end,
+            on_tap,
+        );
+        self.interactions.begin(gesture, window, cx);
+    }
+
+    pub(crate) fn perform_keyboard_drop(
+        &self,
+        spec: &crate::interaction::ApplicationDragSpec,
+        target_id: &str,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> crate::interaction::ApplicationDropResult {
+        self.interactions
+            .perform_keyboard_drop(spec, target_id, window, cx)
+    }
+
+    pub(crate) fn app_drag_source_active(
+        &self,
+        owner: &crate::interaction::InteractionOwner,
+    ) -> bool {
+        self.interactions.app_drag_source_active(owner)
+    }
+
+    pub(crate) fn ancestor_scroll_handles(&self) -> Vec<gpui::ScrollHandle> {
+        self.scroll_handles.clone()
+    }
+
+    /// Whether the node hosting the primitive has keyboard focus.
+    #[must_use]
+    pub fn is_focused(&self, window: &Window) -> bool {
+        self.focus_handle
+            .as_ref()
+            .is_some_and(|handle| handle.is_focused(window))
+    }
+
+    /// Whether the view shows focus indicators this frame
+    /// (`ScriptViewConfig::focus_indicators`); a primitive that paints its own
+    /// focus state paints it only then.
+    #[must_use]
+    pub const fn focus_indicators(&self) -> bool {
+        self.focus_indicators
+    }
+
     /// Read the last committed layout bounds for a primitive-owned element ref.
     #[must_use]
     pub fn element_bounds(
@@ -824,6 +1252,39 @@ impl PrimitiveEventEmitter {
         self.dispatcher
             .as_ref()
             .and_then(|dispatcher| dispatcher.element_bounds(reference, cx))
+    }
+
+    /// This frame's hitbox of the node holding `reference`: hovered only where
+    /// the node is visible and nothing occluding sits above it.
+    pub(crate) fn element_hitbox(
+        &self,
+        reference: &crate::ElementRef,
+        cx: &App,
+    ) -> Option<gpui::HitboxId> {
+        self.dispatcher
+            .as_ref()
+            .and_then(|dispatcher| dispatcher.element_hitbox(reference, cx))
+    }
+
+    pub(crate) fn canvas_local_point(
+        &self,
+        reference: &crate::ElementRef,
+        point: gpui::Point<gpui::Pixels>,
+        cx: &App,
+    ) -> Option<(f64, f64)> {
+        self.dispatcher.as_ref().and_then(|dispatcher| {
+            dispatcher.canvas_local_point(reference, (f64::from(point.x), f64::from(point.y)), cx)
+        })
+    }
+
+    pub(crate) fn canvas_bounds(
+        &self,
+        reference: &crate::ElementRef,
+        cx: &App,
+    ) -> Option<crate::GeometryBounds> {
+        self.dispatcher
+            .as_ref()
+            .and_then(|dispatcher| dispatcher.canvas_bounds(reference, cx))
     }
 }
 
@@ -843,6 +1304,57 @@ pub trait PrimitiveHandler {
         _cx: &App,
     ) -> Option<PrimitiveAccessibilityProjection> {
         None
+    }
+
+    /// Actions that the native primitive can perform for assistive technology.
+    ///
+    /// The default is intentionally empty: a primitive must not advertise an
+    /// operation merely because its outer Rhai node has a compatible role.
+    fn accessibility_actions(
+        &self,
+        _instance: &PrimitiveInstanceId,
+    ) -> Vec<gpui::AccessibleAction> {
+        Vec::new()
+    }
+
+    /// Whether this primitive owns one primary native focus target.
+    ///
+    /// The runtime allocates and retains that identity before rendering so the
+    /// declarative wrapper and native control share it from their first frame.
+    fn uses_primary_focus(&self) -> bool {
+        false
+    }
+
+    /// Perform one previously advertised accessibility action.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded diagnostic when the instance is stale, disabled, or
+    /// the platform payload is invalid for the action.
+    fn perform_accessibility_action(
+        &mut self,
+        _instance: &PrimitiveInstanceId,
+        _action: gpui::AccessibleAction,
+        _data: Option<&gpui::accesskit::ActionData>,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Result<(), String> {
+        Err("primitive does not support accessibility actions".to_owned())
+    }
+
+    /// Perform a native key semantic for automation using the same policy as
+    /// the real focused control.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded primitive diagnostic when the native semantic cannot
+    /// be evaluated.
+    fn perform_key(
+        &mut self,
+        _instance: &PrimitiveInstanceId,
+        _key: &str,
+    ) -> Result<Option<PrimitiveSemanticProposal>, String> {
+        Ok(None)
     }
 
     /// Called once before the first render of a keyed lifecycle primitive.
@@ -888,7 +1400,7 @@ pub trait PrimitiveHandler {
     fn render(
         &mut self,
         instance: &PrimitiveInstance,
-        events: &PrimitiveEventEmitter,
+        events: &PrimitiveContext,
         theme: &PrimitiveTheme,
         window: &mut Window,
         cx: &mut App,
@@ -913,6 +1425,7 @@ struct PrimitiveEntry {
 struct PrimitiveRegistryInner {
     entries: BTreeMap<PrimitiveId, PrimitiveEntry>,
     mounted: BTreeMap<PrimitiveInstanceId, PrimitiveInstance>,
+    generation: ScriptGeneration,
 }
 
 #[derive(Clone, Default)]
@@ -934,6 +1447,25 @@ impl fmt::Debug for PrimitiveRegistry {
 }
 
 impl PrimitiveRegistry {
+    pub(crate) fn generation(&self) -> ScriptGeneration {
+        self.inner.borrow().generation
+    }
+
+    pub(crate) fn set_generation(&self, generation: ScriptGeneration) {
+        self.inner.borrow_mut().generation = generation;
+    }
+
+    /// The descriptors of every registered primitive, in id order.
+    #[must_use]
+    pub fn descriptors(&self) -> Vec<PrimitiveDescriptor> {
+        self.inner
+            .borrow()
+            .entries
+            .values()
+            .map(|entry| entry.descriptor.clone())
+            .collect()
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -1081,6 +1613,93 @@ impl PrimitiveRegistry {
             .collect()
     }
 
+    pub(crate) fn accessibility_actions(
+        &self,
+        instance: &PrimitiveInstanceId,
+    ) -> Vec<gpui::AccessibleAction> {
+        let Ok(inner) = self.inner.try_borrow() else {
+            return Vec::new();
+        };
+        inner
+            .entries
+            .get(&instance.primitive)
+            .map_or_else(Vec::new, |entry| {
+                entry.handler.accessibility_actions(instance)
+            })
+    }
+
+    /// Registrations so far. A registration is never replaced or removed, so
+    /// anything derived from the registered primitives holds while this does.
+    pub(crate) fn epoch(&self) -> usize {
+        self.inner
+            .try_borrow()
+            .map_or(0, |inner| inner.entries.len())
+    }
+
+    pub(crate) fn uses_primary_focus(&self, primitive: &PrimitiveId) -> bool {
+        self.inner.try_borrow().is_ok_and(|inner| {
+            inner
+                .entries
+                .get(primitive)
+                .is_some_and(|entry| entry.handler.uses_primary_focus())
+        })
+    }
+
+    pub(crate) fn perform_accessibility_action(
+        &self,
+        instance: &PrimitiveInstanceId,
+        action: gpui::AccessibleAction,
+        data: Option<&gpui::accesskit::ActionData>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Result<(), PrimitiveError> {
+        let mut inner = self
+            .inner
+            .try_borrow_mut()
+            .map_err(|_| PrimitiveError::Borrowed)?;
+        if !inner.mounted.contains_key(instance) {
+            return Err(PrimitiveError::MissingInstance(instance.clone()));
+        }
+        let entry = inner
+            .entries
+            .get_mut(&instance.primitive)
+            .ok_or_else(|| PrimitiveError::Unknown(instance.primitive.clone()))?;
+        guard_primitive_panic(&instance.primitive, "accessibility action", || {
+            entry
+                .handler
+                .perform_accessibility_action(instance, action, data, window, cx)
+        })?
+        .map_err(|message| PrimitiveError::Handler {
+            primitive: instance.primitive.clone(),
+            message,
+        })
+    }
+
+    pub(crate) fn perform_key(
+        &self,
+        instance: &PrimitiveInstanceId,
+        key: &str,
+    ) -> Result<Option<PrimitiveSemanticProposal>, PrimitiveError> {
+        let mut inner = self
+            .inner
+            .try_borrow_mut()
+            .map_err(|_| PrimitiveError::Borrowed)?;
+        if !inner.mounted.contains_key(instance) {
+            return Err(PrimitiveError::MissingInstance(instance.clone()));
+        }
+        let entry = inner
+            .entries
+            .get_mut(&instance.primitive)
+            .ok_or_else(|| PrimitiveError::Unknown(instance.primitive.clone()))?;
+        guard_primitive_panic(&instance.primitive, "key semantic", || {
+            entry.handler.perform_key(instance, key)
+        })?
+        .map_err(|message| PrimitiveError::Handler {
+            primitive: instance.primitive.clone(),
+            message,
+        })
+    }
+
     /// Unmount keyed lifecycle instances absent from the successful node tree.
     ///
     /// # Errors
@@ -1199,17 +1818,19 @@ impl PrimitiveRegistry {
     pub(crate) fn element(
         &self,
         node: PrimitiveNode,
-        retained_id: Option<crate::NodeId>,
+        retained: Option<(crate::NodeId, String)>,
+        focus_handle: Option<gpui::FocusHandle>,
         fallback: Option<UiNode>,
-        dispatcher: Option<NodeEventDispatcher>,
+        runtime: PrimitiveWindowContext,
         theme: PrimitiveTheme,
     ) -> AnyElement {
         RegisteredPrimitiveElement {
             registry: self.clone(),
             node,
-            retained_id,
+            retained,
+            focus_handle,
             fallback,
-            dispatcher,
+            runtime,
             theme,
         }
         .into_any_element()
@@ -1219,8 +1840,8 @@ impl PrimitiveRegistry {
     fn render_instance(
         &self,
         node: PrimitiveNode,
-        retained_id: Option<crate::NodeId>,
-        events: &PrimitiveEventEmitter,
+        identity: PrimitiveRenderIdentity,
+        events: &PrimitiveContext,
         theme: &PrimitiveTheme,
         window: &mut Window,
         cx: &mut App,
@@ -1230,16 +1851,18 @@ impl PrimitiveRegistry {
             .try_borrow_mut()
             .map_err(|_| PrimitiveError::Borrowed)?;
         let retained_instance = primitive_is_retained(&inner, &node.primitive)?;
-        if retained_instance && retained_id.is_none() {
+        if retained_instance && identity.retained_id.is_none() {
             return Err(PrimitiveError::MissingRetainedIdentity(node.primitive));
         }
         let instance_id = retained_instance.then(|| PrimitiveInstanceId {
             primitive: node.primitive.clone(),
-            key: node
-                .key
+            key: identity
+                .retained_key
                 .clone()
-                .expect("retained primitive descriptors require a key"),
-            node: retained_id.expect("retained primitive renderer supplies NodeId"),
+                .expect("retained primitive descriptors require a retained key"),
+            node: identity
+                .retained_id
+                .expect("retained primitive renderer supplies NodeId"),
         });
         let previous = instance_id
             .as_ref()
@@ -1263,6 +1886,7 @@ impl PrimitiveRegistry {
             id: instance_id.clone(),
             node,
             resources: resources.clone(),
+            focus_handle: identity.focus_handle,
         };
         let needs_mount = instance_id.is_some() && previous.is_none();
         if needs_mount
@@ -1284,6 +1908,7 @@ impl PrimitiveRegistry {
                 });
             }
         }
+        let intrinsic_generation = inner.generation;
         let entry = inner
             .entries
             .get_mut(&instance.node.primitive)
@@ -1321,8 +1946,16 @@ impl PrimitiveRegistry {
                     message,
                 })?;
             }
+            let mut scoped_events = events.clone();
+            scoped_events.instance.clone_from(&instance_id);
+            scoped_events.intrinsic_generation = intrinsic_generation;
+            scoped_events.intrinsic_lease = resources
+                .as_ref()
+                .map(|resources| Rc::downgrade(&resources.inner));
             guard_primitive_panic(&instance.node.primitive, "render", || {
-                entry.handler.render(&instance, events, theme, window, cx)
+                entry
+                    .handler
+                    .render(&instance, &scoped_events, theme, window, cx)
             })?
             .map_err(|message| PrimitiveError::Handler {
                 primitive: instance.node.primitive.clone(),
@@ -1389,7 +2022,8 @@ fn primitive_is_retained(
 }
 
 fn collect_primitive_instances(tree: &crate::RetainedUiTree) -> BTreeSet<PrimitiveInstanceId> {
-    tree.nodes()
+    tree.host_nodes()
+        .into_iter()
         .filter_map(|node| {
             Some(PrimitiveInstanceId {
                 primitive: node.primitive()?.clone(),
@@ -1415,10 +2049,84 @@ fn guard_primitive_panic<T>(
 struct RegisteredPrimitiveElement {
     registry: PrimitiveRegistry,
     node: PrimitiveNode,
-    retained_id: Option<crate::NodeId>,
+    retained: Option<(crate::NodeId, String)>,
+    focus_handle: Option<gpui::FocusHandle>,
     fallback: Option<UiNode>,
-    dispatcher: Option<NodeEventDispatcher>,
+    runtime: PrimitiveWindowContext,
     theme: PrimitiveTheme,
+}
+
+#[derive(Clone)]
+pub(crate) struct PrimitiveWindowContext {
+    assets: Option<crate::AssetRegistry>,
+    dispatcher: Option<NodeEventDispatcher>,
+    interactions: crate::interaction::WindowInteractionCoordinator,
+    scroll_handles: Vec<gpui::ScrollHandle>,
+    wheel_parents: Vec<crate::scrollbar::ScrollWheelSource>,
+    key_captures: Vec<crate::renderer::KeyCaptureScope>,
+    intrinsic_size: Option<crate::intrinsic::IntrinsicSizeInvalidator>,
+    view_id: String,
+    focus_indicators: bool,
+}
+
+impl PrimitiveWindowContext {
+    pub(crate) fn with_assets(mut self, assets: Option<crate::AssetRegistry>) -> Self {
+        self.assets = assets;
+        self
+    }
+    pub(crate) fn new(
+        dispatcher: Option<NodeEventDispatcher>,
+        interactions: crate::interaction::WindowInteractionCoordinator,
+        scroll_handles: Vec<gpui::ScrollHandle>,
+        view_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            assets: None,
+            dispatcher,
+            interactions,
+            scroll_handles,
+            wheel_parents: Vec::new(),
+            key_captures: Vec::new(),
+            intrinsic_size: None,
+            view_id: view_id.into(),
+            focus_indicators: true,
+        }
+    }
+
+    pub(crate) fn with_focus_indicators(mut self, shown: bool) -> Self {
+        self.focus_indicators = shown;
+        self
+    }
+
+    pub(crate) fn with_wheel_parents(
+        mut self,
+        parents: Vec<crate::scrollbar::ScrollWheelSource>,
+    ) -> Self {
+        self.wheel_parents = parents;
+        self
+    }
+
+    pub(crate) fn with_key_captures(
+        mut self,
+        scopes: Vec<crate::renderer::KeyCaptureScope>,
+    ) -> Self {
+        self.key_captures = scopes;
+        self
+    }
+
+    pub(crate) fn with_intrinsic_size(
+        mut self,
+        invalidator: Option<crate::intrinsic::IntrinsicSizeInvalidator>,
+    ) -> Self {
+        self.intrinsic_size = invalidator;
+        self
+    }
+}
+
+struct PrimitiveRenderIdentity {
+    retained_id: Option<crate::NodeId>,
+    retained_key: Option<String>,
+    focus_handle: Option<gpui::FocusHandle>,
 }
 
 impl RenderOnce for RegisteredPrimitiveElement {
@@ -1437,15 +2145,39 @@ impl RenderOnce for RegisteredPrimitiveElement {
                 })
             })
             .collect();
-        let events = PrimitiveEventEmitter {
+        let events = PrimitiveContext {
+            assets: self.runtime.assets,
             registry: Rc::downgrade(&registry.inner),
             primitive: self.node.primitive.clone(),
+            event_schemas: registry
+                .inner
+                .borrow()
+                .entries
+                .get(&self.node.primitive)
+                .map(|entry| entry.descriptor.events.clone())
+                .unwrap_or_default(),
             callbacks,
-            dispatcher: self.dispatcher,
+            dispatcher: self.runtime.dispatcher,
+            interactions: self.runtime.interactions,
+            scroll_handles: self.runtime.scroll_handles,
+            wheel_parents: self.runtime.wheel_parents,
+            key_captures: self.runtime.key_captures,
+            intrinsic_size: self.runtime.intrinsic_size,
+            intrinsic_generation: ScriptGeneration::default(),
+            intrinsic_lease: None,
+            view_id: self.runtime.view_id,
+            instance: None,
+            retained_node: self.retained.as_ref().map(|(node, _)| *node),
+            focus_handle: self.focus_handle.clone(),
+            focus_indicators: self.runtime.focus_indicators,
         };
         match registry.render_instance(
             self.node,
-            self.retained_id,
+            PrimitiveRenderIdentity {
+                retained_id: self.retained.as_ref().map(|(node, _)| *node),
+                retained_key: self.retained.map(|(_, key)| key),
+                focus_handle: self.focus_handle,
+            },
             &events,
             &self.theme,
             window,
@@ -1657,6 +2389,8 @@ pub enum PrimitiveError {
     MissingKey(PrimitiveId),
     #[error("primitive `{0:?}` requires a retained NodeId renderer")]
     MissingRetainedIdentity(PrimitiveId),
+    #[error("primitive accessibility action targeted stale instance {0:?}")]
+    MissingInstance(PrimitiveInstanceId),
     #[error("primitive event emitter outlived its registry")]
     RegistryReleased,
     #[error("props for primitive `{primitive:?}` are invalid: {source}")]
@@ -1732,34 +2466,36 @@ mod tests {
 
     struct TestTheme;
 
-    impl ColorResolver for TestTheme {
-        fn resolve(&self, color: &ColorValue) -> Option<Rgba8> {
-            match color {
-                ColorValue::Token(token)
-                    if matches!(token.as_str(), "accent" | "selection" | "table.selection") =>
-                {
-                    Some(Rgba8::from_rgba_hex(0x1234_56ff))
-                }
-                _ => None,
-            }
-        }
-
-        fn resolve_length(&self, length: Length) -> Option<Length> {
-            match length {
-                Length::ThemeSpacing(SpacingToken::Xxs) => Some(Length::Pixels(2.0)),
-                Length::ThemeSpacing(SpacingToken::Sm) => Some(Length::Pixels(6.0)),
-                _ => None,
-            }
-        }
-
-        fn resolve_typography(&self, role: &str) -> Option<crate::ResolvedTypography> {
-            (role == "body").then(|| crate::ResolvedTypography {
-                family: Some("JetBrains Mono".to_owned()),
-                fallbacks: vec!["PingFang SC".to_owned()],
-                size: Length::Pixels(12.0),
-                line_height: Length::Pixels(16.0),
-                weight: 400,
+    fn test_tokens() -> std::sync::Arc<crate::ThemeTokens> {
+        static TOKENS: std::sync::OnceLock<std::sync::Arc<crate::ThemeTokens>> =
+            std::sync::OnceLock::new();
+        TOKENS
+            .get_or_init(|| {
+                let engine = crate::RuntimeEngine::new();
+                crate::load_theme_source(
+                    engine.engine(),
+                    "test.rhai",
+                    r#"fn theme() { #{ family: "T", name: "T", mode: "dark", tokens: #{
+                        colors: #{ accent: 0x123456ff, selection: 0x123456ff,
+                            "table.selection": 0x123456ff },
+                        spacing: #{ xxs: px(2), sm: px(6) },
+                        typography: #{ roles: #{ body: #{ size: px(12), line_height: px(16),
+                            weight: 400, family: "JetBrains Mono", fallbacks: ["PingFang SC"] } } },
+                    } } }"#,
+                )
+                .expect("test theme")
+                .tokens
             })
+            .clone()
+    }
+
+    impl ColorResolver for TestTheme {
+        fn resolve_token(&self, token: &str) -> Option<Rgba8> {
+            test_tokens().color(token)
+        }
+
+        fn token_set(&self) -> Option<std::sync::Arc<crate::ThemeTokens>> {
+            Some(test_tokens())
         }
     }
 
@@ -1767,7 +2503,7 @@ mod tests {
         fn render(
             &mut self,
             _: &PrimitiveInstance,
-            _: &PrimitiveEventEmitter,
+            _: &PrimitiveContext,
             _: &PrimitiveTheme,
             _: &mut Window,
             _: &mut App,
@@ -1797,11 +2533,11 @@ mod tests {
             Some(Rgba8::from_rgba_hex(0xaabb_ccdd))
         );
         assert_eq!(
-            theme.resolve_length(Length::ThemeSpacing(SpacingToken::Sm)),
+            theme.resolve_length(Length::theme_spacing("sm").unwrap()),
             Some(Length::Pixels(6.0))
         );
         assert_eq!(
-            theme.resolve_length(Length::ThemeSpacing(SpacingToken::Xxs)),
+            theme.resolve_length(Length::theme_spacing("xxs").unwrap()),
             Some(Length::Pixels(2.0))
         );
         assert_eq!(
@@ -1817,11 +2553,8 @@ mod tests {
         )
         .unwrap();
         let captured = PrimitiveTheme::capture(&loaded);
-        assert_eq!(
-            captured.color("table.selection"),
-            loaded.tokens.color("table.selection")
-        );
-        assert!(captured.color("table.selection").is_some());
+        assert_eq!(captured.color("surface"), loaded.tokens.color("surface"));
+        assert!(captured.color("surface").is_some());
     }
 
     fn descriptor() -> PrimitiveDescriptor {
@@ -1841,6 +2574,7 @@ mod tests {
             events: BTreeMap::from([(
                 "change".to_owned(),
                 EventSchema {
+                    doc: None,
                     payload: ValueSchema::string(),
                 },
             )]),
@@ -1964,7 +2698,7 @@ mod tests {
             fn render(
                 &mut self,
                 _: &PrimitiveInstance,
-                _: &PrimitiveEventEmitter,
+                _: &PrimitiveContext,
                 _: &PrimitiveTheme,
                 _: &mut Window,
                 _: &mut App,
@@ -2006,6 +2740,7 @@ mod tests {
                 id: Some(instance.clone()),
                 node,
                 resources: Some(resources),
+                focus_handle: None,
             },
         );
         tree.reconcile(UiNode::text("removed")).unwrap();
@@ -2049,14 +2784,46 @@ mod tests {
     }
 
     #[test]
-    fn primitive_event_emitter_holds_only_a_weak_registry_reference() {
+    fn primitive_identity_uses_the_presented_retained_key() {
+        let primitive = PrimitiveId::parse("my_app.editor").unwrap();
+        let node = UiNode::custom(PrimitiveNode {
+            primitive,
+            key: Some("constructor-key".to_owned()),
+            props: PrimitiveProps::new(),
+        })
+        .with_key("presented-key");
+        let mut tree = crate::RetainedUiTree::new();
+        tree.reconcile(node).unwrap();
+        let instance = collect_primitive_instances(&tree)
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(instance.key(), "presented-key");
+    }
+
+    #[test]
+    fn primitive_context_holds_only_a_weak_registry_reference() {
         let registry = PrimitiveRegistry::new();
         let weak = Rc::downgrade(&registry.inner);
-        let emitter = PrimitiveEventEmitter {
+        let emitter = PrimitiveContext {
+            assets: None,
             registry: Rc::downgrade(&registry.inner),
             primitive: PrimitiveId::parse("my_app.editor").unwrap(),
+            event_schemas: BTreeMap::new(),
             callbacks: BTreeMap::new(),
             dispatcher: None,
+            interactions: crate::interaction::WindowInteractionCoordinator::default(),
+            scroll_handles: Vec::new(),
+            wheel_parents: Vec::new(),
+            key_captures: Vec::new(),
+            intrinsic_size: None,
+            intrinsic_generation: ScriptGeneration::default(),
+            intrinsic_lease: None,
+            view_id: "test".to_owned(),
+            instance: None,
+            retained_node: None,
+            focus_handle: None,
+            focus_indicators: true,
         };
         assert_eq!(Rc::strong_count(&registry.inner), 1);
         drop(registry);

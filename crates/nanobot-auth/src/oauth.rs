@@ -201,28 +201,14 @@ impl DeviceFlow {
             .send()
             .await
             .map_err(|_| AuthError::Protocol("refresh request failed".into()))?;
-        finish(
-            response,
-            |body| {
-                Some(TokenSet {
-                    access_token: string_field(body, "access_token")?,
-                    refresh_token: string_field(body, "refresh_token"),
-                    expires_at_ms: float_field(body, "expires_in")
-                        .map(|secs| now_ms() + (secs * 1000.0) as u64),
-                    token_type: string_field(body, "token_type"),
-                    id_token: string_field(body, "id_token"),
-                })
-            },
-            "refresh",
-        )
-        .await
+        finish(response, token_set, "refresh").await
     }
 }
 
 /// 2xx → parse with `parse`; otherwise map the OAuth2 `error` field onto the
 /// vocabulary. Shared by `begin` and `refresh` (poll needs the pending
 /// shapes, so it inlines).
-async fn finish<T>(
+pub(crate) async fn finish<T>(
     response: reqwest::Response,
     parse: impl Fn(&Value) -> Option<T>,
     what: &'static str,
@@ -415,3 +401,15 @@ fn tighten_file_mode(path: Option<&std::path::Path>) {
 }
 #[cfg(not(unix))]
 fn tighten_file_mode(_path: Option<&std::path::Path>) {}
+
+/// A token endpoint's success body as a [`TokenSet`]; `None` without an
+/// `access_token`.
+pub(crate) fn token_set(body: &Value) -> Option<TokenSet> {
+    Some(TokenSet {
+        access_token: string_field(body, "access_token")?,
+        refresh_token: string_field(body, "refresh_token"),
+        expires_at_ms: float_field(body, "expires_in").map(|secs| now_ms() + (secs * 1000.0) as u64),
+        token_type: string_field(body, "token_type"),
+        id_token: string_field(body, "id_token"),
+    })
+}

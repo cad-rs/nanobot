@@ -3,229 +3,62 @@
 //! The slot owns the three things that are *independent of what is being
 //! rendered*:
 //!
-//! 1. the process-wide shared wgpu device ([`shared_gpu`]) — taken from gpui's
-//!    own renderer on Windows/Web, created standalone elsewhere;
-//! 2. the offscreen color target ([`gpui_wgpu::WgpuRenderTarget`]) that a
-//!    renderer draws into;
-//! 3. the zero-copy composite ([`paint_surface`]) that blits that target into
-//!    a gpui element's bounds.
+//! 1. the process-wide wgpu device ([`shared_gpu`]) — GPUI's own on the web,
+//!    one of the slot's own on the desktop;
+//! 2. the way a frame reaches the screen, per platform ([`Viewport`]): a
+//!    texture GPUI samples on the web, a swap chain on a DirectComposition
+//!    surface inside GPUI's window on Windows, an offscreen render read back
+//!    into an image elsewhere;
+//! 3. input routing: pointer and wheel input over the viewport, whichever of
+//!    those paths it arrives on, reaches the renderer as [`ViewportInput`].
 //!
 //! The *content* is the product's: `Mesh` / `Camera` / `SceneObjectUpload` /
 //! `WgpuRenderer` live in the CAD renderer, and a plugin cannot build a wgpu
 //! pipeline at all (scripts carry no code). What the product gets is the seam:
 //!
 //! ```text
-//! nanobot_gpu::shared_gpu(window)          // the one device
-//!   -> product renderer builds its pipelines on gpu.device() / gpu.queue()
-//!   -> product renderer draws into its own offscreen target
-//!   -> nanobot_gpu::paint_surface(window, &target, bounds)
+//! impl nanobot_gpu::ViewportContent for ProductRenderer {
+//!     fn input(&mut self, input) -> bool   // move the camera; true = redraw
+//!     fn draw(&mut self, gpu, view, size)  // render into `view`, submit
+//! }
+//! let viewport = Rc::new(RefCell::new(nanobot_gpu::Viewport::new(renderer)));
+//! nanobot_gpu::viewport_element(&viewport) // the gpui element to mount
 //! ```
 //!
-//! Sharing the device is not optional. On Windows/Web `paint_surface` composites
-//! a texture owned by gpui's renderer, so that texture must live on that
-//! renderer's device; a self-built device cannot composite and the view silently
-//! shows the clear color. This is the mechanism behind design 3.2 rule 5: the
-//! shared device is the only wgpu entry point.
+//! Sharing the device is not optional. On the web the frame is a texture GPUI
+//! samples, so it must live on GPUI's device; on Windows the swap chain is made
+//! by the instance and adapter the device came from. A renderer that builds its
+//! own device cannot draw into the view it is handed. This is the mechanism
+//! behind design 3.2 rule 5: the shared device is the only wgpu entry point.
 //!
-//! The shape follows `workbench-ui/src/gpu_view/{mod,gpu}.rs`, with one
-//! deliberate difference: the gpui context handle is stored as an `Option` on
-//! every platform instead of being `cfg`-gated, so a renderer's code path does
-//! not fork per platform.
+//! GPUI itself is gpui-fast, which has no hook for drawing inside its render
+//! pass, so the presentation follows `workbench-ui/src/gpu_view` (the
+//! per-platform detail is in `present.rs`).
 
-use std::cell::RefCell;
-use std::rc::Rc;
+mod gpu;
+mod present;
 
-use gpui::{Bounds, Pixels, Window};
+use gpui::{Bounds, DevicePixels, Pixels};
 
-/// The one wgpu device/queue every renderer in the process draws on.
-///
-/// Product renderers and plugin views obtain this through [`shared_gpu`] and
-/// build their own pipelines, textures and render targets on it.
-pub struct Gpu {
-    pub device: wgpu::Device,
-    pub queue: wgpu::Queue,
-    /// Surface format every offscreen target uses.
-    pub target_format: wgpu::TextureFormat,
-    /// gpui's renderer context (shared-device path). `None` on platforms where
-    /// gpui does not own a wgpu device and the slot created a standalone one.
-    handle: Option<gpui_wgpu::WgpuContextHandle>,
-}
+#[cfg(target_family = "wasm")]
+pub use gpu::set_web_platform;
+pub use gpu::{set_gpu_requirements, shared_gpu, Gpu, GpuRequirements};
+pub use present::{viewport_element, Viewport, ViewportContent};
 
-impl Gpu {
-    /// The gpui renderer context handle, needed to build a
-    /// [`gpui_wgpu::WgpuRenderTarget`]. `None` while the renderer is not up.
-    pub fn context_handle(&self) -> Option<&gpui_wgpu::WgpuContextHandle> {
-        self.handle.as_ref()
-    }
-
-    /// Takes the shared wgpu context from the gpui window.
-    ///
-    /// Returns `None` before the first frame (renderer not ready yet); callers
-    /// retry on the next frame.
-    fn from_window(window: &Window) -> Option<Self> {
-        let handle = gpui_wgpu::WgpuContextHandle::from_window(window)?;
-        // DX12 device errors are dispatched asynchronously; without a callback
-        // they are silently dropped.
-        handle
-            .device()
-            .on_uncaptured_error(std::sync::Arc::new(|error| {
-                eprintln!("wgpu uncaptured error: {error}");
-            }));
-        Some(Self {
-            device: handle.device().clone(),
-            queue: handle.queue().clone(),
-            target_format: handle.texture_format(),
-            handle: Some(handle),
-        })
-    }
-
-    /// Creates a standalone device (platforms where gpui's renderer is not
-    /// wgpu-backed).
-    #[cfg(not(any(target_family = "wasm", target_os = "windows")))]
-    fn new() -> Option<Self> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: None,
-            force_fallback_adapter: false,
-        }))
-        .ok()?;
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("nanobot-gpu-device"),
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
-            experimental_features: wgpu::ExperimentalFeatures::disabled(),
-            memory_hints: Default::default(),
-            trace: wgpu::Trace::Off,
-        }))
-        .ok()?;
-        Some(Self {
-            device,
-            queue,
-            target_format: wgpu::TextureFormat::Bgra8Unorm,
-            handle: None,
-        })
-    }
-}
-
-/// Shared GPU slot. Rendering happens on the gpui thread, so a thread-local is
-/// enough; `Failed` only applies to the standalone-device path, so a device
-/// creation failure does not retry (and block) every frame.
-enum GpuSlot {
-    /// Windows/Web: the renderer is not ready yet, retry on the next frame.
-    NotTried,
-    Ready(Rc<Gpu>),
-    #[cfg(not(any(target_family = "wasm", target_os = "windows")))]
-    Failed,
-}
-
-thread_local! {
-    static SHARED_GPU: RefCell<GpuSlot> = const { RefCell::new(GpuSlot::NotTried) };
-}
-
-/// Acquires the process-wide GPU context, initializing it from `window` on
-/// first use.
-///
-/// A renderer's `Element::paint` calls this and builds its own pipelines,
-/// textures and render targets on the returned device. Returns `None` until
-/// gpui's renderer is ready; callers skip the frame and retry rather than
-/// treating it as an error.
-///
-/// The renderer's own device is preferred wherever gpui's renderer is
-/// wgpu-backed (Windows/Web, and macOS under the opt-in `macos-wgpu` backend):
-/// a standalone device cannot composite into a surface the renderer owns, so
-/// `paint_surface` would silently show the clear color. Everywhere else the
-/// slot creates a standalone device.
-pub fn shared_gpu(window: &Window) -> Option<Rc<Gpu>> {
-    SHARED_GPU.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        if matches!(&*slot, GpuSlot::NotTried) {
-            if let Some(gpu) = context_from_window(window) {
-                *slot = GpuSlot::Ready(Rc::new(gpu));
-            } else {
-                match Gpu::new() {
-                    Some(gpu) => *slot = GpuSlot::Ready(Rc::new(gpu)),
-                    None => {
-                        eprintln!("nanobot-gpu: failed to init the wgpu device");
-                        *slot = GpuSlot::Failed;
-                    }
-                }
-            }
-        }
-        match &*slot {
-            GpuSlot::Ready(gpu) => Some(gpu.clone()),
-            _ => None,
-        }
-    })
-}
-
-/// The renderer's own device, where gpui's renderer is wgpu-backed.
-///
-/// On macOS this needs the opt-in wgpu backend (`gpui_platform/macos-wgpu`)
-/// *and* `custom-gpu`; with the default Metal backend there is no wgpu context
-/// to take, so this returns `None` and the slot falls back to a standalone
-/// device.
-#[cfg(any(
-    target_family = "wasm",
-    target_os = "windows",
-    all(target_os = "macos", feature = "custom-gpu")
-))]
-fn context_from_window(window: &Window) -> Option<Gpu> {
-    Gpu::from_window(window)
-}
-
-/// Nowhere else: the caller creates a standalone device.
-#[cfg(not(any(
-    target_family = "wasm",
-    target_os = "windows",
-    all(target_os = "macos", feature = "custom-gpu")
-)))]
-fn context_from_window(_window: &Window) -> Option<Gpu> {
-    None
-}
-
-/// One frame of zero-copy compositing: draws `target` into `bounds`.
-///
-/// `target` must have been created on the device behind [`shared_gpu`] (see
-/// [`Gpu::context_handle`]); a target from another device composites to the
-/// clear color rather than erroring.
-pub fn paint_surface(
-    window: &mut Window,
-    target: &gpui_wgpu::WgpuRenderTarget,
-    bounds: Bounds<Pixels>,
-) {
-    let source = gpui::SurfaceSource::Texture {
-        texture: target.texture(),
-        size: target.size(),
-    };
-    window.paint_surface(bounds, source);
-}
-
-/// Device requirements the slot needs from the host, on top of gpui's own
-/// baseline.
-///
-/// `extra_limits` carries the renderer's own needs — a CAD renderer's GPU-driven
-/// cull compute binds 5 storage buffers while gpui's device baseline
-/// (`wgpu::Limits::downlevel_defaults()`) allows 4, and an undeclared shortfall
-/// makes every cull pipeline fail validation so the view silently shows the
-/// clear color. The host applies this before the first window opens
-/// (`gpui::App::set_gpu_requirements`).
-pub fn gpu_requirements(
-    extra_limits: Option<wgpu::Limits>,
-) -> gpui_wgpu::WgpuDeviceRequirements {
-    gpui_wgpu::WgpuDeviceRequirements {
-        features: wgpu::Features::empty(),
-        limits: extra_limits,
-    }
-}
-
-/// Device-pixel size of a paint bounds at the window's scale factor, clamped to
-/// a sane maximum. Shared by every offscreen target so a resize is a plain
-/// comparison.
+/// Device-pixel size of a paint bounds at the window's scale factor, at least
+/// 1×1 and clamped to a sane maximum.
 pub fn device_size(bounds: &Bounds<Pixels>, scale_factor: f32) -> (u32, u32) {
-    let width = (f32::from(bounds.size.width) * scale_factor).round().max(1.0) as u32;
-    let height = (f32::from(bounds.size.height) * scale_factor).round().max(1.0) as u32;
-    (width.min(4096), height.min(4096))
+    clamped_device_size(bounds, scale_factor, 4096)
+}
+
+/// Device-pixel size of `bounds`, at least 1×1 and at most `max` per side.
+/// Rounds the way GPUI places the element, so a frame covers it exactly.
+fn clamped_device_size(bounds: &Bounds<Pixels>, scale_factor: f32, max: u32) -> (u32, u32) {
+    let device: Bounds<DevicePixels> = bounds.to_device_pixels(scale_factor);
+    (
+        (device.size.width.0.max(1) as u32).min(max),
+        (device.size.height.0.max(1) as u32).min(max),
+    )
 }
 
 /// Aspect ratio of a device-pixel size, guarded against a zero height.
@@ -235,15 +68,18 @@ pub fn aspect(size: (u32, u32)) -> f32 {
 
 // ---- the viewport slot contract ----
 
-/// One frame of cursor / wheel input to a viewport, in logical pixels.
+/// One pointer or wheel event over a viewport. `mouse_pos` is in window
+/// logical pixels.
 ///
 /// Drag = orbit, Shift+drag = pan, wheel = zoom; the mapping belongs to the
-/// renderer, the shell only forwards the raw input.
+/// renderer, the slot only forwards the raw input.
 #[derive(Default, Clone, Copy, Debug)]
 pub struct ViewportInput {
     pub mouse_pos: Option<gpui::Point<Pixels>>,
+    /// The left button is held.
     pub mouse_down: bool,
     pub shift: bool,
+    /// Wheel travel in pixels (a line counts as 40).
     pub scroll: Option<f32>,
 }
 
@@ -257,33 +93,47 @@ pub enum ViewportProjection {
 
 /// What a renderer provides so the shell can host a viewport region.
 ///
-/// The shell is generic over this: it forwards input, hands over a scene, asks
-/// for the projection and the painted-frame count, and mounts the renderer's
-/// own gpui element. Everything domain-specific (meshes, cameras, pipelines)
-/// stays behind the associated types.
+/// The shell is generic over this: it hands over a scene, asks for the
+/// projection and the painted-frame count, and mounts the renderer's gpui
+/// element. Everything domain-specific (meshes, cameras, pipelines) stays
+/// behind the associated types.
+///
+/// Input is not part of this contract: the element routes it to the renderer's
+/// [`ViewportContent::input`] itself, because over a native surface (Windows)
+/// GPUI's own listeners never see it.
 ///
 /// The methods are associated functions (no `&self`) because a renderer is a
 /// marker type: the state lives in the per-session [`Self::Handle`].
 pub trait ViewportSlot: 'static {
-    /// The renderer's per-session handle (the shell keeps one per session).
+    /// The renderer's per-session handle (the shell keeps one per session);
+    /// typically an `Rc<RefCell<Viewport<_>>>`.
     type Handle: Clone + 'static;
     /// The renderer's scene wire format.
     type Scene: 'static;
 
     fn new_handle() -> Self::Handle;
-    fn feed_input(handle: &Self::Handle, input: ViewportInput);
     fn update_scene(handle: &Self::Handle, scene: &Self::Scene);
     fn projection(handle: &Self::Handle) -> Option<ViewportProjection>;
     fn painted_frames(handle: &Self::Handle) -> u64;
-    /// The renderer's element, which paints through [`shared_gpu`] /
-    /// [`paint_surface`] inside its own `paint`.
+    /// The renderer's element: [`viewport_element`] of the handle's
+    /// [`Viewport`].
     fn element(handle: &Self::Handle) -> gpui::AnyElement;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{DevicePixels, Size, size};
+    use gpui::{px, size};
+
+    fn bounds(width: f32, height: f32) -> Bounds<Pixels> {
+        Bounds {
+            origin: gpui::Point {
+                x: px(0.0),
+                y: px(0.0),
+            },
+            size: size(px(width), px(height)),
+        }
+    }
 
     #[test]
     fn input_defaults_to_idle() {
@@ -304,33 +154,17 @@ mod tests {
 
     #[test]
     fn device_size_scales_and_clamps() {
-        let bounds = Bounds {
-            origin: gpui::Point {
-                x: gpui::px(0.0),
-                y: gpui::px(0.0),
-            },
-            size: size(px(100.0), px(50.0)),
-        };
-        assert_eq!(device_size(&bounds, 1.0), (100, 50));
-        assert_eq!(device_size(&bounds, 2.0), (200, 100));
+        assert_eq!(device_size(&bounds(100.0, 50.0), 1.0), (100, 50));
+        assert_eq!(device_size(&bounds(100.0, 50.0), 2.0), (200, 100));
         // A zero-sized bounds still yields a renderable target.
-        let empty = Bounds {
-            origin: gpui::Point {
-                x: gpui::px(0.0),
-                y: gpui::px(0.0),
-            },
-            size: size(px(0.0), px(0.0)),
-        };
-        assert_eq!(device_size(&empty, 1.0), (1, 1));
+        assert_eq!(device_size(&bounds(0.0, 0.0), 1.0), (1, 1));
         // The clamp keeps a huge HiDPI window from allocating a 16k target.
-        let huge = Bounds {
-            origin: gpui::Point {
-                x: gpui::px(0.0),
-                y: gpui::px(0.0),
-            },
-            size: size(px(4096.0), px(4096.0)),
-        };
-        assert_eq!(device_size(&huge, 8.0), (4096, 4096));
+        assert_eq!(device_size(&bounds(4096.0, 4096.0), 8.0), (4096, 4096));
+        // A device with a smaller texture limit clamps further.
+        assert_eq!(
+            clamped_device_size(&bounds(4096.0, 100.0), 1.0, 2048),
+            (2048, 100)
+        );
     }
 
     #[test]
@@ -338,32 +172,5 @@ mod tests {
         assert_eq!(aspect((100, 50)), 2.0);
         assert_eq!(aspect((100, 0)), 100.0);
         assert_eq!(aspect((0, 0)), 1.0);
-    }
-
-    #[test]
-    fn requirements_carry_the_renderer_limits() {
-        let limits = wgpu::Limits {
-            max_storage_buffers_per_shader_stage: 5,
-            ..Default::default()
-        };
-        let requirements = gpu_requirements(Some(limits));
-        let carried = requirements
-            .limits
-            .expect("the renderer declared limits");
-        assert_eq!(carried.max_storage_buffers_per_shader_stage, 5);
-        // No features are requested by the slot itself.
-        assert_eq!(requirements.features, wgpu::Features::empty());
-    }
-
-    /// The size type the offscreen target is built with, pinned here so a
-    /// gpui signature change surfaces in this crate's tests.
-    #[test]
-    fn target_size_type_is_device_pixels() {
-        let size: Size<DevicePixels> = size(DevicePixels(640), DevicePixels(480));
-        assert_eq!(size.width, DevicePixels(640));
-    }
-
-    fn px(v: f32) -> Pixels {
-        gpui::px(v)
     }
 }

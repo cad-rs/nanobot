@@ -1,6 +1,5 @@
 //! Native hot-lane column resize handle used by the Rhai Table component.
 
-use gpui::AppContext as _;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -8,15 +7,14 @@ use std::rc::Rc;
 use gpui::{
     AnyElement, App, Bounds, CursorStyle, DispatchPhase, Element, ElementId, GlobalElementId,
     Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Style, Window, fill, point, px,
-    relative, rgba, size,
+    Pixels, Point, SharedString, Style, Window, fill, point, px, relative, rgba, size,
 };
 
 use crate::{
-    ComponentStateSchema, EventSchema, Length, ObjectField, PrimitiveDescriptor,
-    PrimitiveEventEmitter, PrimitiveHandler, PrimitiveId, PrimitiveInstance, PrimitiveInstanceId,
-    PrimitiveProps, PrimitiveTheme, PrimitiveValue, Rgba8, SignalId, SignalKind, SignalValue,
-    TextDirection, UiValue, ValueSchema,
+    ComponentStateSchema, EventSchema, Length, ObjectField, PrimitiveContext, PrimitiveDescriptor,
+    PrimitiveHandler, PrimitiveId, PrimitiveInstance, PrimitiveInstanceId, PrimitiveProps,
+    PrimitiveTheme, PrimitiveValue, Rgba8, SignalId, SignalKind, SignalValue, TextDirection,
+    UiValue, ValueSchema,
 };
 
 const DEFAULT_MIN_WIDTH: f64 = 48.0;
@@ -83,11 +81,6 @@ struct ResizeState(Rc<RefCell<ResizeStateInner>>);
 struct ResizeStateInner {
     source: SourceWidth,
     signal: crate::SignalId,
-    hovered: bool,
-    dragging: bool,
-    moved: bool,
-    start_position: Point<Pixels>,
-    start_width: f64,
 }
 
 impl ResizeState {
@@ -95,23 +88,17 @@ impl ResizeState {
         Self(Rc::new(RefCell::new(ResizeStateInner {
             source: config.source.clone(),
             signal: config.signal.id().clone(),
-            hovered: false,
-            dragging: false,
-            moved: false,
-            start_position: point(px(0.0), px(0.0)),
-            start_width: 0.0,
         })))
     }
 }
 
 struct ResizePrepaint {
     hitbox: Hitbox,
-    state: ResizeState,
 }
 
 struct ColumnResizeHandle {
     config: ResizeConfig,
-    events: PrimitiveEventEmitter,
+    events: PrimitiveContext,
     measurements: ColumnMeasurementRegistry,
 }
 
@@ -169,12 +156,11 @@ impl Element for ColumnResizeHandle {
             if changed {
                 inner.source = self.config.source.clone();
                 inner.signal = self.config.signal.id().clone();
-                inner.dragging = false;
-                inner.moved = false;
             }
             changed
         };
-        if reset {
+        let owner = self.events.interaction_owner(&self.config.id);
+        if reset && !self.events.cancel_interaction(&owner, window, cx) {
             let events = self.events.clone();
             let signal = self.config.signal.clone();
             window.defer(cx, move |_, cx| {
@@ -182,7 +168,7 @@ impl Element for ColumnResizeHandle {
             });
         }
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::BlockMouseExceptScroll);
-        ResizePrepaint { hitbox, state }
+        ResizePrepaint { hitbox }
     }
 
     fn paint(
@@ -195,7 +181,9 @@ impl Element for ColumnResizeHandle {
         window: &mut Window,
         _: &mut App,
     ) {
-        let dragged = prepaint.state.0.borrow().dragging;
+        let owner = self.events.interaction_owner(&self.config.id);
+        self.events.present_interaction(owner.clone());
+        let dragged = self.events.interaction_is_active(&owner);
         let hovered = prepaint.hitbox.is_hovered(window);
         let color = if dragged || hovered {
             self.config.active_color
@@ -212,7 +200,7 @@ impl Element for ColumnResizeHandle {
         );
         window.paint_quad(fill(line, rgba(color.as_rgba_hex())));
         window.set_cursor_style(CursorStyle::ResizeColumn, &prepaint.hitbox);
-        register_pointer_listeners(
+        register_pointer_down(
             prepaint,
             self.config.clone(),
             self.events.clone(),
@@ -222,34 +210,15 @@ impl Element for ColumnResizeHandle {
     }
 }
 
-fn register_pointer_listeners(
-    prepaint: &ResizePrepaint,
-    config: ResizeConfig,
-    events: PrimitiveEventEmitter,
-    measurements: ColumnMeasurementRegistry,
-    window: &mut Window,
-) {
-    register_pointer_down(
-        prepaint,
-        config.clone(),
-        events.clone(),
-        measurements,
-        window,
-    );
-    register_pointer_move(prepaint, config.clone(), events.clone(), window);
-    register_pointer_up(prepaint, config, events, window);
-}
-
 fn register_pointer_down(
     prepaint: &ResizePrepaint,
     config: ResizeConfig,
-    events: PrimitiveEventEmitter,
+    events: PrimitiveContext,
     measurements: ColumnMeasurementRegistry,
     window: &mut Window,
 ) {
     let view = window.current_view();
     let hitbox = prepaint.hitbox.clone();
-    let down_state = prepaint.state.clone();
     window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
         if phase != DispatchPhase::Bubble
             || event.button != MouseButton::Left
@@ -261,122 +230,102 @@ fn register_pointer_down(
             return;
         };
         if event.click_count >= 2 {
-            {
-                let mut inner = down_state.0.borrow_mut();
-                inner.dragging = false;
-                inner.moved = false;
-            }
+            let owner = events.interaction_owner(&config.id);
+            events.cancel_interaction(&owner, window, cx);
             let measured = measurements
                 .maximum(config.signal.id())
                 .unwrap_or(bounds.width);
             let width = clamp_width(measured, config.min, config.max);
             let _ =
                 events.write_signal(&config.signal, SignalValue::OptionalFloat(Some(width)), cx);
-            let deferred_events = events.clone();
             let payload = resize_payload(&config.column_key, width);
-            window.defer(cx, move |window, cx| {
-                let _ = deferred_events.emit("resize", payload, window, cx);
-            });
+            events.propose("resize", payload, window, cx);
+            if events.observes("resize") {
+                schedule_preview_clear(&events, &config.signal, window, cx);
+            }
             cx.stop_propagation();
             cx.notify(view);
             return;
         }
         let width = clamp_width(bounds.width, config.min, config.max);
-        {
-            let mut inner = down_state.0.borrow_mut();
-            inner.dragging = true;
-            inner.moved = false;
-            inner.start_position = event.position;
-            inner.start_width = width;
-        }
+        let previous_override = events.read_signal(&config.signal, cx).ok();
+        let update_config = config.clone();
+        let update_events = events.clone();
+        let update = move |gesture: crate::interaction::GestureUpdate,
+                           _: &mut Window,
+                           cx: &mut App| {
+            if gesture.moved() {
+                let delta =
+                    horizontal_delta(gesture.start(), gesture.current(), update_config.direction);
+                let value = clamp_width(width + delta, update_config.min, update_config.max);
+                let _ = update_events.write_signal(
+                    &update_config.signal,
+                    SignalValue::OptionalFloat(Some(value)),
+                    cx,
+                );
+            }
+            crate::interaction::InteractionFlow::Continue
+        };
+        let finish_config = config.clone();
+        let finish_events = events.clone();
+        let finish =
+            move |gesture: crate::interaction::GestureUpdate, window: &mut Window, cx: &mut App| {
+                if !gesture.moved() {
+                    return;
+                }
+                let delta =
+                    horizontal_delta(gesture.start(), gesture.current(), finish_config.direction);
+                let value = clamp_width(width + delta, finish_config.min, finish_config.max);
+                let _ = finish_events.write_signal(
+                    &finish_config.signal,
+                    SignalValue::OptionalFloat(Some(value)),
+                    cx,
+                );
+                finish_events.propose(
+                    "resize",
+                    resize_payload(&finish_config.column_key, value),
+                    window,
+                    cx,
+                );
+                if finish_events.observes("resize") {
+                    schedule_preview_clear(&finish_events, &finish_config.signal, window, cx);
+                }
+            };
+        let cancel_signal = config.signal.clone();
+        let cancel_events = events.clone();
+        let cancel = move |_: &mut Window, cx: &mut App| {
+            let value = previous_override
+                .clone()
+                .unwrap_or(SignalValue::OptionalFloat(None));
+            let _ = cancel_events.write_signal(&cancel_signal, value, cx);
+        };
+        let owner = events.interaction_owner(&config.id);
+        events.begin_interaction(
+            crate::interaction::NativeGesture::new(
+                owner,
+                event.position,
+                view,
+                update,
+                finish,
+                cancel,
+            ),
+            window,
+            cx,
+        );
         cx.stop_propagation();
-        cx.notify(view);
     });
 }
 
-fn register_pointer_move(
-    prepaint: &ResizePrepaint,
-    config: ResizeConfig,
-    events: PrimitiveEventEmitter,
+fn schedule_preview_clear(
+    events: &PrimitiveContext,
+    signal: &crate::NativeSignal,
     window: &mut Window,
+    cx: &mut App,
 ) {
-    let view = window.current_view();
-    let move_state = prepaint.state.clone();
-    let move_hitbox = prepaint.hitbox.clone();
-    window.on_mouse_event(move |event: &MouseMoveEvent, _, window, cx| {
-        let (dragging, start_position, start_width) = {
-            let inner = move_state.0.borrow();
-            (inner.dragging, inner.start_position, inner.start_width)
-        };
-        if !dragging || !event.dragging() {
-            let hovered = move_hitbox.is_hovered(window);
-            let mut inner = move_state.0.borrow_mut();
-            if inner.hovered != hovered {
-                inner.hovered = hovered;
-                cx.notify(view);
-            }
-            return;
-        }
-        let delta = horizontal_delta(start_position, event.position, config.direction);
-        if delta.abs() < f64::EPSILON {
-            return;
-        }
-        move_state.0.borrow_mut().moved = true;
-        let width = clamp_width(start_width + delta, config.min, config.max);
-        let _ = events.write_signal(&config.signal, SignalValue::OptionalFloat(Some(width)), cx);
-        cx.stop_propagation();
-        cx.notify(view);
-    });
-}
-
-fn register_pointer_up(
-    prepaint: &ResizePrepaint,
-    config: ResizeConfig,
-    events: PrimitiveEventEmitter,
-    window: &mut Window,
-) {
-    let view = window.current_view();
-    let up_state = prepaint.state.clone();
-    let up_hitbox = prepaint.hitbox.clone();
-    window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
-        if phase != DispatchPhase::Bubble || event.button != MouseButton::Left {
-            return;
-        }
-        let (dragging, moved, start_position, start_width) = {
-            let inner = up_state.0.borrow();
-            (
-                inner.dragging,
-                inner.moved,
-                inner.start_position,
-                inner.start_width,
-            )
-        };
-        if !dragging {
-            if event.click_count >= 2 && up_hitbox.is_hovered(window) {
-                cx.stop_propagation();
-            }
-            return;
-        }
-        {
-            let mut inner = up_state.0.borrow_mut();
-            inner.dragging = false;
-            inner.moved = false;
-        }
-        if !moved {
-            cx.stop_propagation();
-            cx.notify(view);
-            return;
-        }
-        let delta = horizontal_delta(start_position, event.position, config.direction);
-        let width = clamp_width(start_width + delta, config.min, config.max);
-        let _ = events.write_signal(&config.signal, SignalValue::OptionalFloat(Some(width)), cx);
-        let deferred_events = events.clone();
-        let payload = resize_payload(&config.column_key, width);
-        window.defer(cx, move |window, cx| {
-            let _ = deferred_events.emit("resize", payload, window, cx);
-        });
-        cx.stop_propagation();
-        cx.notify(view);
+    let events = events.clone();
+    let signal = signal.clone();
+    window.defer(cx, move |_, cx| {
+        let _ = events.write_signal(&signal, SignalValue::OptionalFloat(None), cx);
     });
 }
 
@@ -504,7 +453,7 @@ fn absolute_length_pixels(value: Length, window: &Window) -> Option<f64> {
     match value {
         Length::Pixels(value) => Some(value),
         Length::Rems(value) => Some(value * f64::from(window.rem_size())),
-        Length::Relative(_) | Length::ThemeSpacing(_) | Length::ThemeRadius(_) => None,
+        Length::Relative(_) | Length::Token(_) => None,
     }
 }
 
@@ -527,7 +476,7 @@ impl PrimitiveHandler for IntrinsicTextMeasurePrimitiveHandler {
     fn render(
         &mut self,
         instance: &PrimitiveInstance,
-        _: &PrimitiveEventEmitter,
+        _: &PrimitiveContext,
         theme: &PrimitiveTheme,
         _: &mut Window,
         _: &mut App,
@@ -561,9 +510,12 @@ fn parse_measure_config(
     props: &PrimitiveProps,
     theme: &PrimitiveTheme,
 ) -> Result<IntrinsicMeasureConfig, String> {
-    let text = string_prop(props, "text")
+    let text = props
+        .string("text")
+        .map(ToOwned::to_owned)
         .ok_or_else(|| "intrinsic text measurement requires text".to_owned())?;
-    let group = signal_prop(props, "group")
+    let group = props
+        .signal("group")
         .ok_or_else(|| "intrinsic text measurement requires group".to_owned())?;
     if group.id().kind() != SignalKind::OptionalFloat {
         return Err("intrinsic text measurement group must be an optional-float signal".to_owned());
@@ -578,7 +530,7 @@ fn parse_measure_config(
     if !matches!(horizontal_padding, Length::Pixels(_) | Length::Rems(_)) {
         return Err("intrinsic text measurement padding must resolve to pixels or rems".to_owned());
     }
-    let extra_width = number_prop(props, "extra_width").unwrap_or(0.0);
+    let extra_width = props.number("extra_width").unwrap_or(0.0);
     if !extra_width.is_finite() || !(0.0..=MAX_COLUMN_WIDTH).contains(&extra_width) {
         return Err(
             "intrinsic text measurement extra width must be between 0 and 16384".to_owned(),
@@ -607,7 +559,7 @@ impl PrimitiveHandler for ColumnResizePrimitiveHandler {
     fn render(
         &mut self,
         instance: &PrimitiveInstance,
-        events: &PrimitiveEventEmitter,
+        events: &PrimitiveContext,
         theme: &PrimitiveTheme,
         _: &mut Window,
         _: &mut App,
@@ -623,14 +575,19 @@ impl PrimitiveHandler for ColumnResizePrimitiveHandler {
 }
 
 fn parse_config(props: &PrimitiveProps, theme: &PrimitiveTheme) -> Result<ResizeConfig, String> {
-    let column_key = string_prop(props, "column_key")
+    let column_key = props
+        .string("column_key")
+        .map(ToOwned::to_owned)
         .ok_or_else(|| "column resize handle requires column_key".to_owned())?;
-    let source_kind = string_prop(props, "source_kind")
+    let source_kind = props
+        .string("source_kind")
+        .map(ToOwned::to_owned)
         .ok_or_else(|| "column resize handle requires source_kind".to_owned())?;
-    let source_value = number_prop(props, "source_value")
+    let source_value = props
+        .number("source_value")
         .ok_or_else(|| "column resize handle requires source_value".to_owned())?;
-    let min = number_prop(props, "min_width").unwrap_or(DEFAULT_MIN_WIDTH);
-    let max = number_prop(props, "max_width").unwrap_or(MAX_COLUMN_WIDTH);
+    let min = props.number("min_width").unwrap_or(DEFAULT_MIN_WIDTH);
+    let max = props.number("max_width").unwrap_or(MAX_COLUMN_WIDTH);
     if !source_value.is_finite()
         || !min.is_finite()
         || !max.is_finite()
@@ -640,9 +597,16 @@ fn parse_config(props: &PrimitiveProps, theme: &PrimitiveTheme) -> Result<Resize
     {
         return Err("column resize widths must be finite and satisfy 0 < min <= max".to_owned());
     }
-    let signal = signal_prop(props, "signal")
+    let signal = props
+        .signal("signal")
+        .cloned()
         .ok_or_else(|| "column resize handle requires signal".to_owned())?;
-    let reference = ref_prop(props, "column_ref")
+    if signal.id().kind() != SignalKind::OptionalFloat {
+        return Err("column resize signal must be optional_float".to_owned());
+    }
+    let reference = props
+        .element_ref("column_ref")
+        .cloned()
         .ok_or_else(|| "column resize handle requires column_ref".to_owned())?;
     Ok(ResizeConfig {
         id: format!(
@@ -672,35 +636,6 @@ fn parse_config(props: &PrimitiveProps, theme: &PrimitiveTheme) -> Result<Resize
     })
 }
 
-fn number_prop(props: &PrimitiveProps, name: &str) -> Option<f64> {
-    match props.get(name) {
-        Some(PrimitiveValue::Data(UiValue::Float(value))) => Some(*value),
-        Some(PrimitiveValue::Data(UiValue::Integer(value))) => value.to_string().parse().ok(),
-        _ => None,
-    }
-}
-
-fn string_prop(props: &PrimitiveProps, name: &str) -> Option<String> {
-    match props.get(name) {
-        Some(PrimitiveValue::Data(UiValue::String(value))) => Some(value.clone()),
-        _ => None,
-    }
-}
-
-fn signal_prop(props: &PrimitiveProps, name: &str) -> Option<crate::NativeSignal> {
-    match props.get(name) {
-        Some(PrimitiveValue::Signal(signal)) => Some(signal.clone()),
-        _ => None,
-    }
-}
-
-fn ref_prop(props: &PrimitiveProps, name: &str) -> Option<crate::ElementRef> {
-    match props.get(name) {
-        Some(PrimitiveValue::Ref(reference)) => Some(reference.clone()),
-        _ => None,
-    }
-}
-
 const fn resize_bound_schema() -> ValueSchema {
     ValueSchema::Number {
         min: None,
@@ -723,42 +658,63 @@ pub fn column_resize_primitive_descriptor() -> PrimitiveDescriptor {
         props: BTreeMap::from([
             (
                 "column_key".to_owned(),
-                ObjectField::required(ValueSchema::string()),
+                ObjectField::required(ValueSchema::string()).with_doc(
+                    "Key of the column this handle resizes; it is `key` in the `resize` payload.",
+                ),
             ),
             (
                 "source_kind".to_owned(),
                 ObjectField::required(ValueSchema::String {
                     allowed: vec!["fixed".to_owned(), "percent".to_owned(), "flex".to_owned()],
-                }),
+                })
+                .with_doc(
+                    "Kind of the column's controlled width; with `source_value` it identifies the source, and a change cancels a drag.",
+                ),
             ),
             (
                 "source_value".to_owned(),
-                ObjectField::required(ValueSchema::positive_number()),
+                ObjectField::required(ValueSchema::positive_number()).with_doc(
+                    "Value of the column's controlled width; a change cancels a drag and clears the preview.",
+                ),
             ),
             (
                 "min_width".to_owned(),
-                ObjectField::optional(resize_bound_schema()),
+                ObjectField::optional(resize_bound_schema()).with_doc(
+                    "Smallest width a drag or auto-fit may propose, in logical pixels; defaults to 48.",
+                ),
             ),
             (
                 "max_width".to_owned(),
-                ObjectField::optional(resize_bound_schema()),
+                ObjectField::optional(resize_bound_schema()).with_doc(
+                    "Largest width a drag or auto-fit may propose, in logical pixels; defaults to 16,384.",
+                ),
             ),
             (
                 "signal".to_owned(),
-                ObjectField::required(ValueSchema::Signal),
+                ObjectField::required(ValueSchema::Signal).with_doc(
+                    "Optional-float signal for the previewed width, kept after release without `on_resize`; text measured with it as `group` sets auto-fit.",
+                ),
             ),
             (
                 "column_ref".to_owned(),
-                ObjectField::required(ValueSchema::Ref),
+                ObjectField::required(ValueSchema::Ref).with_doc(
+                    "Ref to the column's header cell; a drag starts from its width, and auto-fit uses it when no text was measured.",
+                ),
             ),
             (
                 "on_resize".to_owned(),
-                ObjectField::optional(ValueSchema::optional(ValueSchema::Callback)),
+                ObjectField::optional(ValueSchema::optional(ValueSchema::Callback)).with_doc(
+                    "Called with the proposed fixed width when a drag ends or a double-click auto-fits the column.",
+                ),
             ),
         ]),
         events: BTreeMap::from([(
             "resize".to_owned(),
             EventSchema {
+                doc: Some(
+                    "Emitted when a drag ends or a double-click auto-fits the column; the payload is `key` and a `fixed` `width` in logical pixels."
+                        .to_owned(),
+                ),
                 payload: ValueSchema::object(BTreeMap::from([
                     (
                         "key".to_owned(),
@@ -802,15 +758,21 @@ pub(crate) fn intrinsic_text_measure_primitive_descriptor() -> PrimitiveDescript
         props: BTreeMap::from([
             (
                 "text".to_owned(),
-                ObjectField::required(ValueSchema::string()),
+                ObjectField::required(ValueSchema::string()).with_doc(
+                    "Text measured as one line in the text style inherited here; place it inside the cell it measures.",
+                ),
             ),
             (
                 "group".to_owned(),
-                ObjectField::required(ValueSchema::Signal),
+                ObjectField::required(ValueSchema::Signal).with_doc(
+                    "The column's optional-float signal, shared with its `ColumnResizePrimitive`; auto-fit takes the widest measure.",
+                ),
             ),
             (
                 "horizontal_padding".to_owned(),
-                ObjectField::optional(ValueSchema::Length),
+                ObjectField::optional(ValueSchema::Length).with_doc(
+                    "Padding added on both sides of the text, in pixels or rems, such as the cell's inset; 0 when omitted.",
+                ),
             ),
             (
                 "extra_width".to_owned(),
@@ -819,7 +781,10 @@ pub(crate) fn intrinsic_text_measure_primitive_descriptor() -> PrimitiveDescript
                     max: Some(MAX_COLUMN_WIDTH),
                     exclusive_min: None,
                     exclusive_max: None,
-                }),
+                })
+                .with_doc(
+                    "Logical pixels added once to the measured width, such as room for a sort icon; 0 when omitted.",
+                ),
             ),
         ]),
         events: BTreeMap::new(),
@@ -840,6 +805,41 @@ mod tests {
             SignalKind::OptionalFloat,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn the_preview_signal_must_be_an_optional_float() {
+        let component = crate::ComponentInstancePath::root("Table", "users");
+        let props = |kind| {
+            PrimitiveProps::new()
+                .with(
+                    "column_key",
+                    PrimitiveValue::Data(UiValue::String("name".to_owned())),
+                )
+                .with(
+                    "source_kind",
+                    PrimitiveValue::Data(UiValue::String("fixed".to_owned())),
+                )
+                .with("source_value", PrimitiveValue::Data(UiValue::Float(120.0)))
+                .with(
+                    "signal",
+                    PrimitiveValue::Signal(crate::NativeSignal::new(
+                        SignalId::new(component.clone(), "width", kind).unwrap(),
+                    )),
+                )
+                .with(
+                    "column_ref",
+                    PrimitiveValue::Ref(crate::ElementRef::new(
+                        crate::ElementRefId::new(component.clone(), "header").unwrap(),
+                    )),
+                )
+        };
+        let theme = PrimitiveTheme::default();
+        assert!(parse_config(&props(SignalKind::OptionalFloat), &theme).is_ok());
+        assert_eq!(
+            parse_config(&props(SignalKind::Float), &theme).err(),
+            Some("column resize signal must be optional_float".to_owned())
+        );
     }
 
     #[test]

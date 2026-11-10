@@ -11,7 +11,7 @@
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, App, ClickEvent, ColorExt as _, ElementId, Hsla, SharedString, Window, div, hsla,
+    AnyElement, App, ClickEvent, ElementId, Hsla, SharedString, Window, div, hsla,
     prelude::*, px,
 };
 use gpui_component::Sizable as _;

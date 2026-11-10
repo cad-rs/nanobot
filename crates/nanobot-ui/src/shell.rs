@@ -23,10 +23,9 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use gpui::{
-    div, img, prelude::*, px, AnyElement, App, ColorExt as _, Context, Div, Entity, Hsla, Stateful,
+    div, img, prelude::*, px, AnyElement, App, Context, Div, Entity, Hsla, Stateful,
     IntoElement,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render, ScrollDelta,
-    ScrollWheelEvent, Subscription, Window,
+    MouseButton, MouseDownEvent, Render, Subscription, Window,
 };
 use gpui_component::{
     input::{Input, InputEvent, InputState},
@@ -34,7 +33,7 @@ use gpui_component::{
 };
 use nanobot_boot::account::Account;
 use nanobot_boot::Settings;
-use nanobot_gpu::{ViewportInput, ViewportProjection, ViewportSlot};
+use nanobot_gpu::{ViewportProjection, ViewportSlot};
 
 use crate::model::{
     plan_progress, Block, BlockKind, PlanDecision, PlanPhase, PlanStep, ProjectId,
@@ -1261,10 +1260,9 @@ impl<S: SessionView> HarnessShell<S> {
             )
     }
 
-    /// The viewport region: the product renderer's element, fed by this shell's
-    /// input forwarding (drag = orbit, Shift+drag = pan, wheel = zoom — the
-    /// mapping itself lives in the renderer).
-    fn viewport_panel(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The viewport region: the product renderer's element (drag = orbit,
+    /// Shift+drag = pan, wheel = zoom — the mapping lives in the renderer).
+    fn viewport_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
         div()
             .w(px(VIEWPORT_W))
@@ -1272,10 +1270,10 @@ impl<S: SessionView> HarnessShell<S> {
             .h_full()
             .border_l_1()
             .border_color(p.border)
-            .child(self.viewport_slot(window, cx))
+            .child(self.viewport_slot())
     }
 
-    fn viewport_slot(&self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn viewport_slot(&self) -> impl IntoElement {
         let Some(ws) = self.workspace.as_ref() else {
             return div().size_full().into_any_element();
         };
@@ -1283,76 +1281,13 @@ impl<S: SessionView> HarnessShell<S> {
         let Some(handle) = self.viewports.get(&id).cloned() else {
             return div().size_full().into_any_element();
         };
-        let (down, moved, up, scroll) = (
-            handle.clone(),
-            handle.clone(),
-            handle.clone(),
-            handle.clone(),
-        );
-        let element = S::Viewport::element(&handle);
+        // No input listeners here: the renderer's element routes pointer and
+        // wheel input itself (over a native surface GPUI's listeners never
+        // see it).
         div()
             .id("harness-viewport".to_string())
             .size_full()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |_this, ev: &MouseDownEvent, _w, cx| {
-                    S::Viewport::feed_input(
-                        &down,
-                        ViewportInput {
-                            mouse_pos: Some(ev.position),
-                            mouse_down: true,
-                            shift: ev.modifiers.shift,
-                            scroll: None,
-                        },
-                    );
-                    cx.notify();
-                }),
-            )
-            .on_mouse_move(cx.listener(move |_this, ev: &MouseMoveEvent, _w, cx| {
-                S::Viewport::feed_input(
-                    &moved,
-                    ViewportInput {
-                        mouse_pos: Some(ev.position),
-                        mouse_down: ev.pressed_button == Some(MouseButton::Left),
-                        shift: ev.modifiers.shift,
-                        scroll: None,
-                    },
-                );
-                cx.notify();
-            }))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(move |_this, ev: &MouseUpEvent, _w, cx| {
-                    S::Viewport::feed_input(
-                        &up,
-                        ViewportInput {
-                            mouse_pos: Some(ev.position),
-                            mouse_down: false,
-                            shift: ev.modifiers.shift,
-                            scroll: None,
-                        },
-                    );
-                    cx.notify();
-                }),
-            )
-            .on_scroll_wheel(cx.listener(move |_this, ev: &ScrollWheelEvent, _w, cx| {
-                // Pixels, or lines scaled like a wheel notch.
-                let dy = match ev.delta {
-                    ScrollDelta::Pixels(p) => f32::from(p.y),
-                    ScrollDelta::Lines(l) => l.y * 40.0,
-                };
-                S::Viewport::feed_input(
-                    &scroll,
-                    ViewportInput {
-                        mouse_pos: Some(ev.position),
-                        mouse_down: false,
-                        shift: ev.modifiers.shift,
-                        scroll: Some(dy),
-                    },
-                );
-                cx.notify();
-            }))
-            .child(element)
+            .child(S::Viewport::element(&handle))
             .into_any_element()
     }
 
@@ -2101,7 +2036,7 @@ impl<S: SessionView> Render for HarnessShell<S> {
         let p = palette(cx);
         // The registry is cloned out so the panel factories can be called with
         // an immutable borrow of the shell.
-        let panels = self.panel_host.panels().to_vec();
+        let panels = self.panel_host.visible_panels();
         let left = self.dock_region(PanelArea::Left, &panels, window, cx);
         let right = self.dock_region(PanelArea::Right, &panels, window, cx);
         let top = self.dock_region(PanelArea::Top, &panels, window, cx);
@@ -2110,7 +2045,7 @@ impl<S: SessionView> Render for HarnessShell<S> {
         let body = match self.workspace.as_ref() {
             Some(ws) => {
                 let ai = self.ai_workspace(ws, cx).into_any_element();
-                let viewport = self.viewport_panel(window, cx).into_any_element();
+                let viewport = self.viewport_panel(cx).into_any_element();
                 div()
                     .flex_1()
                     .flex()

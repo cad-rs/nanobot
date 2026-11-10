@@ -17,9 +17,9 @@ members = [
     "crates/nanobot-rhai",
     "crates/nanobot-ui",
 ]
-# The vendored gpui stack is consumed through the [patch.crates-io] table at
-# the end of this file; without the exclusion cargo would absorb the vendor
-# crates as members of THIS workspace (same reason workbench-rs excludes it).
+# .vendor holds the gpui-pre re-export shims and the patched gpui-rhai that the
+# [patch.crates-io] table at the end of this file points at; without the
+# exclusion cargo would absorb them as members of THIS workspace.
 exclude = [".vendor"]
 
 [workspace.package]
@@ -62,34 +62,38 @@ reqwest = { version = "0.12", default-features = false, features = ["stream", "j
 eventsource-stream = { version = "0.2", default-features = false }
 wasm-bindgen-futures = "0.4"
 
-# Shell layer: gpui frontend (vendored gpui-ce fork; features mirror
-# workbench-rs so both workspaces resolve the same crate configuration).
+# Shell layer: gpui frontend on gpui-fast (longbridge/gpui-fast, a performance
+# fork of Zed's GPUI) — the same stack and the same pins as workbench-rs, so a
+# product workspace that consumes both resolves one gpui core.
 #
-# These are **version-only** dependencies on purpose. `[patch.crates-io]` only
-# applies from the workspace root, so the vendor path is supplied by whichever
-# root is building: nanobot's own table (standalone builds) or the consuming
-# workspace's table (rcad-pro points at workbench-rs/.vendor). Giving them a
-# `path` here would pin nanobot's own copy into every build and collide with the
-# consumer's patch source (design NR7).
-gpui = { package = "gpui-ce", version = "=0.2.2", features = [
-    "custom-gpu",
-    "wgpu-surfaces",
-] }
-gpui-wgpu = { package = "gpui_ce_wgpu", version = "=0.1.0", features = [
-    "custom-gpu",
-    "wgpu-surfaces",
-] }
-gpui-platform = { package = "gpui_ce_platform", version = "=0.1.0", features = [
-    "windows-wgpu",
-] }
-gpui-component = { package = "gpui_ce_components", version = "=0.2.0" }
-gpui-rhai = { version = "=0.1.5" }
-# One wgpu for the whole workspace (29.0.3): the renderer's target view, the
-# gpui context handle and any product renderer must agree, or the texture
-# sharing cannot typecheck (that is the point of nanobot-gpu).
-wgpu = "29.0.3"
-# Blocking adapter/device request on the platforms where the slot creates a
-# standalone device (gpui's renderer is not wgpu-backed there).
+# Main, not the crates.io release: the web GPU viewport needs
+# `WebPlatform::wgpu_context` and `WgpuDynamicTexture`, which no release
+# carries yet. Every `rev` below — here, in [patch.crates-io] and in
+# .vendor/gpui-pre-compat — must be the same commit, or Cargo builds two gpui
+# cores whose types don't mix.
+gpui = { git = "https://github.com/longbridge/gpui-fast", rev = "a10f393d8033c5f52f34821d6a25cddadc6174b4" }
+# Web only: GPUI's own wgpu context (`WgpuContext` / `WgpuDynamicTexture`),
+# which the web GPU viewport renders on, and the concrete web platform that
+# hands that context out.
+gpui-wgpu = { package = "gpui_wgpu", git = "https://github.com/longbridge/gpui-fast", rev = "a10f393d8033c5f52f34821d6a25cddadc6174b4" }
+gpui-web = { package = "gpui_web", git = "https://github.com/longbridge/gpui-fast", rev = "a10f393d8033c5f52f34821d6a25cddadc6174b4", default-features = false }
+# GPUI Kit's component layer, from crates.io. It is built on the `gpui-pre`
+# =0.3.11 snapshot, which [patch.crates-io] points at gpui-fast.
+gpui-component = "0.9.0"
+# Rhai script views. Resolves to the vendored copy (see [patch.crates-io]),
+# whose `gpui-pre` pin is moved to =0.3.11. 0.4.2 gates its backends behind
+# features, so `gpui-pre` is named explicitly.
+gpui-rhai = { version = "=0.4.2", default-features = false, features = ["gpui-pre"] }
+# One wgpu for the whole workspace, at the revision gpui-fast pins: on the web
+# the viewport renders on GPUI's own device and into its textures, so the types
+# must be the same (that agreement is the point of nanobot-gpu).
+wgpu = { git = "https://github.com/gfx-rs/wgpu", rev = "cddb2f5d80dc0009b2ef6767635140cacf90a007" }
+# Readback presentation path (offscreen render → CPU readback → paint_image).
+image = { version = "0.25", default-features = false }
+anyhow = "1"
+log = { version = "0.4", features = ["std"] }
+# Blocking adapter/device request on the desktop, where the slot creates its
+# own device (gpui renders with D3D11 / Metal there).
 pollster = "0.4"
 glam = { version = "0.29", features = ["serde"] }
 rhai = { version = "=1.26.0", features = ["internals", "metadata", "serde"] }
@@ -102,7 +106,7 @@ usvg = { version = "=0.45.1", default-features = false, features = [
 
 [profile.dev]
 opt-level = 1
-# Incremental compilation accumulates ~20 GB of cache for the vendored gpui
+# Incremental compilation accumulates ~20 GB of cache for the gpui
 # tree and has filled the build volume more than once. The framework workspace
 # builds the way CI does.
 incremental = false
@@ -116,41 +120,37 @@ lto = "thin"
 codegen-units = 1
 strip = "debuginfo"
 
-# Vendor single source (design NR7 / 10.4 P0-3): this table is the same content
-# as rcad-pro's root [patch.crates-io] (which points at workbench-rs/.vendor)
-# and as workbench-rs/Cargo.toml's own table. [patch] only applies from the
-# workspace root, so any workspace consuming these crates must carry it. The
-# trees are asserted byte-identical by tools/nanobot-vendor-check.py.
+# Single source (design NR7): this table is the same content as
+# workbench-rs/Cargo.toml's own. [patch] only applies from the workspace root,
+# so a product workspace consuming these crates carries the same table,
+# pointing at one copy of .vendor.
 [patch.crates-io]
+# One gpui core for the whole graph. The registry crates that build on GPUI
+# name it through the `gpui-pre-*` snapshot packages; these entries swap each
+# snapshot for a re-export of gpui-fast, so their types are this workspace's.
+#
+# gpui-component 0.9 pins the =0.3.11 snapshot. gpui-fast's own compat crates
+# still carry 0.3.9, so local copies at 0.3.11 stand in (see
+# .vendor/gpui-pre-compat). Drop them once gpui-fast moves its compat crates
+# to the snapshot gpui-component pins.
+gpui-pre = { path = ".vendor/gpui-pre-compat/gpui-pre" }
+gpui-pre-macros = { path = ".vendor/gpui-pre-compat/gpui-pre-macros" }
+gpui-pre-platform = { path = ".vendor/gpui-pre-compat/gpui-pre-platform" }
+gpui-pre-sum-tree = { path = ".vendor/gpui-pre-compat/gpui-pre-sum-tree" }
+# gpui-rhai 0.4.2 still pins the older =0.3.9 snapshot on its default backend,
+# and Cargo admits only one semver-compatible `gpui-pre` per graph. The vendored
+# copy is the published 0.4.2 package with that pin moved to =0.3.11,
+# gpui-fast's keystroke API and wasm32 fixes (listed at the top of its
+# Cargo.toml). Its `gpui-fast` feature is no way out: it pins gpui-fast =0.1.9,
+# whose keystroke API predates the core this workspace builds on. Drop the
+# vendored copy once a release pins the snapshot gpui-component does, matches
+# this core's keystroke API and builds for wasm.
 gpui-rhai = { path = ".vendor/gpui-rhai" }
-gpui-ce = { path = ".vendor/gpui-ce/crates/gpui" }
-gpui-component-story = { path = ".vendor/gpui-component/crates/story" }
-gpui-component-story-web = { path = ".vendor/gpui-component/crates/story-web" }
-gpui_ce_apple = { path = ".vendor/gpui-ce/crates/gpui_apple" }
-gpui_ce_collections = { path = ".vendor/gpui-ce/crates/gpui_collections" }
-gpui_ce_components = { path = ".vendor/gpui-component/crates/ui" }
-gpui_ce_components_assets = { path = ".vendor/gpui-component/crates/assets" }
-gpui_ce_components_base = { path = ".vendor/gpui-component/crates/base" }
-gpui_ce_components_fps = { path = ".vendor/gpui-component/crates/fps" }
-gpui_ce_components_macros = { path = ".vendor/gpui-component/crates/macros" }
-gpui_ce_components_shell = { path = ".vendor/gpui-component/crates/shell" }
-gpui_ce_components_webview = { path = ".vendor/gpui-component/crates/webview" }
-gpui_ce_derive_refineable = { path = ".vendor/gpui-ce/crates/gpui_derive_refineable" }
-gpui_ce_elements = { path = ".vendor/gpui-ce/crates/gpui_elements" }
-gpui_ce_linux = { path = ".vendor/gpui-ce/crates/gpui_linux" }
-gpui_ce_macos = { path = ".vendor/gpui-ce/crates/gpui_macos" }
-gpui_ce_macros = { path = ".vendor/gpui-ce/crates/gpui_macros" }
-gpui_ce_media = { path = ".vendor/gpui-ce/crates/gpui_media" }
-gpui_ce_path = { path = ".vendor/gpui-ce/crates/gpui_path" }
-gpui_ce_platform = { path = ".vendor/gpui-ce/crates/gpui_platform" }
-gpui_ce_refineable = { path = ".vendor/gpui-ce/crates/gpui_refineable" }
-gpui_ce_render = { path = ".vendor/gpui-ce/crates/gpui_render" }
-gpui_ce_scheduler = { path = ".vendor/gpui-ce/crates/gpui_scheduler" }
-gpui_ce_shared_string = { path = ".vendor/gpui-ce/crates/gpui_shared_string" }
-gpui_ce_sum_tree = { path = ".vendor/gpui-ce/crates/gpui_sum_tree" }
-gpui_ce_tokio = { path = ".vendor/gpui-ce/crates/gpui_tokio" }
-gpui_ce_util = { path = ".vendor/gpui-ce/crates/gpui_ce_util" }
-gpui_ce_web = { path = ".vendor/gpui-ce/crates/gpui_web" }
-gpui_ce_wgpu = { path = ".vendor/gpui-ce/crates/gpui_wgpu" }
-gpui_ce_windows = { path = ".vendor/gpui-ce/crates/gpui_windows" }
-gpui_ce_zed_util = { path = ".vendor/gpui-ce/crates/gpui_zed_util" }
+
+# gpui-fast's own workspace patches. Patches don't cross workspaces, so a
+# git dependency on gpui-fast has to repeat them (as its wgpu demo does).
+async-process = { git = "https://github.com/zed-industries/async-process.git", rev = "0b6d6713570af61806e1e5cb40e0f757cb93fd9d" }
+async-task = { git = "https://github.com/zed-industries/async-task.git", rev = "015845a19fc31752c02367567d3b8900a406f9da" }
+windows-capture = { git = "https://github.com/zed-industries/windows-capture.git", rev = "f0d6c1b6691db75461b732f6d5ff56eed002eeb9" }
+calloop = { git = "https://github.com/zed-industries/calloop" }
+khronos-egl = { git = "https://github.com/zed-industries/khronos-egl", rev = "42214b36347b108fd9630ca6254b96dde59e04fe" }

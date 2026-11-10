@@ -74,6 +74,9 @@ pub struct PanelDef<S: SessionView> {
     /// The plugins panel uses it to disable a plugin at runtime (removing
     /// exactly its panels); product panels have none.
     pub source_plugin: Option<String>,
+    /// The capability the current user needs for this panel to show (a name
+    /// the product's account provider answers for); `None` shows it always.
+    pub requires: Option<String>,
 }
 
 impl<S: SessionView> Clone for PanelDef<S> {
@@ -88,6 +91,7 @@ impl<S: SessionView> Clone for PanelDef<S> {
                 PanelSource::Script(path) => PanelSource::Script(path.clone()),
             },
             source_plugin: self.source_plugin.clone(),
+            requires: self.requires.clone(),
         }
     }
 }
@@ -107,6 +111,7 @@ impl<S: SessionView> PanelDef<S> {
             order,
             source: PanelSource::Product(render),
             source_plugin: None,
+            requires: None,
         }
     }
 
@@ -124,6 +129,7 @@ impl<S: SessionView> PanelDef<S> {
             order,
             source: PanelSource::Script(script),
             source_plugin: None,
+            requires: None,
         }
     }
 
@@ -131,6 +137,13 @@ impl<S: SessionView> PanelDef<S> {
     /// removes exactly these).
     pub fn with_plugin(mut self, plugin: impl Into<String>) -> Self {
         self.source_plugin = Some(plugin.into());
+        self
+    }
+
+    /// Shows the panel only while the current user has `capability` (see
+    /// [`PanelHost::set_entitlements`]).
+    pub fn with_requires(mut self, capability: impl Into<String>) -> Self {
+        self.requires = Some(capability.into());
         self
     }
 }
@@ -216,10 +229,15 @@ fn error_box(message: String) -> AnyElement {
         .into_any_element()
 }
 
+/// The product's answer to "may the current user use this capability".
+pub type Entitlements = Rc<dyn Fn(&str) -> bool>;
+
 /// The registry of product and script panels, plus the script runtime.
 pub struct PanelHost<S: SessionView> {
     panels: Vec<PanelDef<S>>,
     scripts: Rc<RefCell<ScriptRuntime>>,
+    /// Decides panels that name a capability; `None` allows everything.
+    entitlements: Option<Entitlements>,
 }
 
 impl<S: SessionView> Default for PanelHost<S> {
@@ -227,6 +245,7 @@ impl<S: SessionView> Default for PanelHost<S> {
         Self {
             panels: Vec::new(),
             scripts: Rc::new(RefCell::new(ScriptRuntime::default())),
+            entitlements: None,
         }
     }
 }
@@ -236,12 +255,29 @@ impl<S: SessionView> PanelHost<S> {
         self.panels.push(panel);
     }
 
-    /// Panels of one region, in registration order.
+    /// Injects what decides panels with a [`PanelDef::requires`]: typically
+    /// `|capability| harness.check_entitlement(capability).is_allowed()`. It
+    /// is asked on every frame, so a capability gained (an activation) shows
+    /// its panels and one lost hides them without a restart. With nothing
+    /// injected every panel shows.
+    pub fn set_entitlements(&mut self, entitlements: Entitlements) {
+        self.entitlements = Some(entitlements);
+    }
+
+    /// Whether the current user may see `panel`.
+    pub fn allows(&self, panel: &PanelDef<S>) -> bool {
+        match (&panel.requires, &self.entitlements) {
+            (Some(capability), Some(entitlements)) => entitlements(capability),
+            _ => true,
+        }
+    }
+
+    /// Panels of one region the current user may see, in registration order.
     pub fn panels_in(&self, area: PanelArea) -> Vec<&PanelDef<S>> {
         let mut found: Vec<&PanelDef<S>> = self
             .panels
             .iter()
-            .filter(|p| p.area == area)
+            .filter(|p| p.area == area && self.allows(p))
             .collect();
         found.sort_by_key(|p| p.order);
         found
@@ -249,6 +285,15 @@ impl<S: SessionView> PanelHost<S> {
 
     pub fn panels(&self) -> &[PanelDef<S>] {
         &self.panels
+    }
+
+    /// Every panel the current user may see (what the shell renders).
+    pub fn visible_panels(&self) -> Vec<PanelDef<S>> {
+        self.panels
+            .iter()
+            .filter(|panel| self.allows(panel))
+            .cloned()
+            .collect()
     }
 
     /// The number of registered panels (selfcheck / smoke reporting).

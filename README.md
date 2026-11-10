@@ -20,13 +20,13 @@ Extraction is incremental. See the migration path in the design doc:
 |---|---|
 | `nanobot-cordis` | **landed** — plugin kernel (moved from `ocad-cordis`, zero deps) |
 | `nanobot-llm` | **landed** — LLM adapter seam (moved from `ocad-llm`) |
-| `nanobot-session` | **landed** — event log + seq + projection + JSONL + fork; base vocabulary + `Extension` for product events; `hydrate()` for build-time log recovery |
+| `nanobot-session` | **landed** — event log + seq + projection + JSONL + fork; base vocabulary + `Extension` for product events; `hydrate()` for build-time log recovery; atomic snapshot writes (`atomic::write`) |
 | `nanobot-tools` | **landed** — ToolRegistry + three waterfalls + ApprovalPolicy + generalized ToolContract |
 | `nanobot-agent` | **landed** — turn/step loop, plan state machine, PlanVerifier seam |
 | `nanobot-skills` | **landed** — skill runner (manifest -> listeners), ships no skills |
-| `nanobot-boot` | **landed** — `Harness`/`HarnessBuilder` assembly, `harness.toml` identity, CLI modes (`--selfcheck` / `--selfcheck-crash` / `--agent-smoke` / `--agent-run` / `--smoke`), probe-style selfcheck with the three-phase crash-recovery probe, generic project container (`ProjectPaths` / `Manifest` / `Project`) |
-| `nanobot-gpu` | **landed** — the wgpu↔gpui render slot: process-wide shared device (`shared_gpu`), offscreen targets, zero-copy compositing (`paint_surface`), and the `ViewportSlot` contract the product's renderer implements |
-| `nanobot-rhai` | **landed** — Rhai script plugin host: `plugin.toml` manifest plus an entry point that declares panels / views / commands / toolbar items; loading is isolated, so a bad plugin never stops the others |
+| `nanobot-boot` | **landed** — `Harness`/`HarnessBuilder` assembly, `harness.toml` identity, CLI modes (`--selfcheck` / `--selfcheck-crash` / `--agent-smoke` / `--agent-run` / `--smoke`), probe-style selfcheck with the three-phase crash-recovery probe, generic project container (`ProjectPaths` / `Manifest` / `Project`); atomic settings and manifest saves; `diagnostics` (rolling log file, panic crash reports, plain-text export, opt-in `CrashReporter`); `RefreshSchedule` + `SessionGrace` (when to re-check entitlements, and a lapse never closing what is in use) |
+| `nanobot-gpu` | **landed** — the wgpu↔gpui render slot: process-wide shared device (`shared_gpu`), per-platform presentation and input routing (`Viewport` / `ViewportContent` / `viewport_element`), and the `ViewportSlot` contract the product's renderer implements |
+| `nanobot-rhai` | **landed** — Rhai script plugin host: `plugin.toml` manifest plus an entry point that declares panels / views / commands / toolbar items; loading is isolated, so a bad plugin never stops the others; a manifest's `requires` gates a plugin on the user's capabilities before its script runs |
 | `nanobot-ui` | **landed** — gpui workbench shell: session list, session workspace (conversation + plan review + approval / clarify bars + composer), viewport region, and the panel dock that hosts product and script-plugin panels. Generic over `SessionView` |
 
 ## Layout
@@ -40,10 +40,10 @@ crates/
   nanobot-agent/    turn/step loop + plan state machine
   nanobot-skills/   skill runner (manifest -> listeners)
   nanobot-boot/     Harness assembly + harness.toml + CLI/selfcheck + project container
-  nanobot-gpu/      render slot: shared device + offscreen target + zero copy
+  nanobot-gpu/      render slot: shared device + per-platform presentation + input
   nanobot-rhai/     Rhai script plugin host (manifest -> panels/views/commands)
   nanobot-ui/       gpui workbench shell + panel dock
-.vendor/            gpui-ce / gpui-component / gpui-rhai (see .vendor/README.md)
+.vendor/            gpui-pre shims + patched gpui-rhai (see .vendor/README.md)
 ```
 
 The kernel crates are **GUI-free**: no `gpui`, no `wgpu`, no `rcad-*`, no `ocad-*`.
@@ -52,12 +52,14 @@ and it is what lets the kernel serve a CLI, a test, or an MCP server without
 dragging a UI along. The shell layer (`nanobot-gpu` / `nanobot-rhai` /
 `nanobot-ui`) is the only place gpui and wgpu appear.
 
-The vendored gpui stack in `.vendor/` is a copy of `cad-rs/workbench-rs`'s, kept
-byte-identical so a single `gpui-ce` serves both workspaces — see
-`.vendor/README.md`. nanobot's own `[patch.crates-io]` table supplies the vendor
-path for standalone builds; a consuming workspace supplies its own (rcad-pro
-points at `workbench-rs/.vendor`), which is why the dependency entries in this
-workspace carry a version rather than a path.
+The gpui stack is [gpui-fast](https://github.com/longbridge/gpui-fast) at a
+pinned commit, `gpui-component` 0.9 from crates.io and `gpui-rhai` 0.4.2 — the
+same stack and the same pins as `cad-rs/workbench-rs`, so one gpui core serves
+both workspaces. `.vendor/` holds only what makes that resolve: the `gpui-pre`
+re-export shims and the patched `gpui-rhai`, a copy of workbench-rs's — see
+`.vendor/README.md`. nanobot's own `[patch.crates-io]` table supplies them for
+standalone builds; a consuming workspace carries the same table. gpui-fast and
+wgpu are git dependencies, fetched with the git CLI (`.cargo/config.toml`).
 
 ## Develop
 
@@ -81,8 +83,8 @@ boundary is what makes the model work: anyone can build and ship a design
 harness on the framework, and the proprietary value lives in the plugin
 packages a vendor sells.
 
-Vendored third-party code under `.vendor/` keeps its own licenses (the gpui
-stack is Apache-2.0 / MIT — both permissive and compatible with MIT); see
+Vendored third-party code under `.vendor/` keeps its own licenses (`gpui-rhai`
+is MIT OR Apache-2.0 — both permissive and compatible with MIT); see
 [.vendor/README.md](.vendor/README.md). Nothing in the vendor tree is covered
 by this license.
 

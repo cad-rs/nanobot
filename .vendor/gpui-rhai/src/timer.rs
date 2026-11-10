@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 use thiserror::Error;
 
@@ -50,6 +51,8 @@ pub struct TimerDescriptor {
     id: TimerId,
     delay: Duration,
     paused: bool,
+    /// Fires every `delay` rather than once.
+    repeat: bool,
     callback: ScriptCallback,
     payload: UiValue,
 }
@@ -74,9 +77,26 @@ impl TimerDescriptor {
             id,
             delay,
             paused,
+            repeat: false,
             callback,
             payload,
         })
+    }
+
+    /// The declaration as an interval: it fires every `delay` until it is
+    /// removed, changed or cancelled. A tick that comes late is not made up:
+    /// the next one is due a period after it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TimerError::IntervalTooShort`] for a period under 16ms, one
+    /// frame at 60Hz.
+    pub fn repeating(mut self) -> Result<Self, TimerError> {
+        if self.delay < MIN_INTERVAL {
+            return Err(TimerError::IntervalTooShort(self.delay));
+        }
+        self.repeat = true;
+        Ok(self)
     }
 
     #[must_use]
@@ -93,11 +113,20 @@ impl TimerDescriptor {
     pub const fn paused(&self) -> bool {
         self.paused
     }
+
+    #[must_use]
+    pub const fn repeats(&self) -> bool {
+        self.repeat
+    }
 }
+
+/// The shortest interval period.
+const MIN_INTERVAL: Duration = Duration::from_millis(16);
 
 #[derive(Clone, Debug, PartialEq)]
 struct TimerSignature {
     delay: Duration,
+    repeat: bool,
     callback: ScriptCallback,
     payload: UiValue,
 }
@@ -106,6 +135,7 @@ impl From<&TimerDescriptor> for TimerSignature {
     fn from(descriptor: &TimerDescriptor) -> Self {
         Self {
             delay: descriptor.delay,
+            repeat: descriptor.repeat,
             callback: descriptor.callback.clone(),
             payload: descriptor.payload.clone(),
         }
@@ -115,6 +145,8 @@ impl From<&TimerDescriptor> for TimerSignature {
 #[derive(Clone, Debug)]
 struct TimerEntry {
     descriptor: TimerDescriptor,
+    /// The root origin of the invocation that scheduled the timer.
+    started_by: crate::InvocationOrigin,
     signature: TimerSignature,
     deadline: Instant,
     remaining: Option<Duration>,
@@ -136,13 +168,14 @@ pub struct TimerSnapshot {
 }
 
 impl TimerEntry {
-    fn new(descriptor: TimerDescriptor, now: Instant) -> Self {
+    fn new(descriptor: TimerDescriptor, now: Instant, started_by: crate::InvocationOrigin) -> Self {
         let signature = TimerSignature::from(&descriptor);
         let declaration_paused = descriptor.paused;
         let remaining = descriptor.paused.then_some(descriptor.delay);
         Self {
             deadline: now + descriptor.delay,
             descriptor,
+            started_by,
             signature,
             remaining,
             declaration_paused,
@@ -175,12 +208,19 @@ impl TimerEntry {
 pub struct TimerRegistry {
     entries: BTreeMap<TimerId, TimerEntry>,
     completed: BTreeMap<TimerId, TimerSignature>,
+    /// The root origin of the current invocation, recorded on timers it
+    /// schedules.
+    origin_root: crate::InvocationOrigin,
 }
 
 impl TimerRegistry {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn set_origin_root(&mut self, origin: &crate::InvocationOrigin) {
+        self.origin_root = origin.root().clone();
     }
 
     /// Reconcile one component subtree's timer declarations atomically.
@@ -202,9 +242,12 @@ impl TimerRegistry {
             self.completed.remove(&id);
             match self.entries.get_mut(&id) {
                 Some(entry) if entry.signature == signature => entry.synchronize(descriptor, now),
-                Some(entry) => *entry = TimerEntry::new(descriptor, now),
+                Some(entry) => {
+                    *entry = TimerEntry::new(descriptor, now, self.origin_root.clone());
+                }
                 None => {
-                    self.entries.insert(id, TimerEntry::new(descriptor, now));
+                    let entry = TimerEntry::new(descriptor, now, self.origin_root.clone());
+                    self.entries.insert(id, entry);
                 }
             }
         }
@@ -251,12 +294,27 @@ impl TimerRegistry {
             .collect::<Vec<_>>();
         due.into_iter()
             .filter_map(|id| {
-                let entry = self.entries.remove(&id)?;
-                self.completed.insert(id, entry.signature);
+                let entry = if self.entries.get(&id)?.descriptor.repeat {
+                    let entry = self.entries.get_mut(&id)?;
+                    // Late ticks merge into one: the next is a period after
+                    // the due one, or after now when that has passed too.
+                    entry.deadline += entry.descriptor.delay;
+                    if entry.deadline <= now {
+                        entry.deadline = now + entry.descriptor.delay;
+                    }
+                    entry.clone()
+                } else {
+                    let entry = self.entries.remove(&id)?;
+                    self.completed.insert(id, entry.signature.clone());
+                    entry
+                };
                 (entry.descriptor.callback.generation() == generation).then(|| AsyncDelivery {
                     callback: entry.descriptor.callback,
                     payload: entry.descriptor.payload,
                     scope: AsyncScope::Component(entry.descriptor.id.component),
+                    origin: crate::InvocationOrigin::Timer {
+                        started_by: Box::new(entry.started_by),
+                    },
                 })
             })
             .collect()
@@ -320,6 +378,8 @@ pub enum TimerError {
     InvalidKey(String),
     #[error("timer delay must be between 1ms and 24h, got {0:?}")]
     InvalidDelay(Duration),
+    #[error("interval period must be at least 16ms, got {0:?}")]
+    IntervalTooShort(Duration),
 }
 
 #[cfg(test)]
@@ -388,6 +448,52 @@ mod tests {
             timers.active_count(),
             0,
             "completed declaration stays one-shot"
+        );
+    }
+
+    #[test]
+    fn an_interval_repeats_merges_late_ticks_and_stops_when_cancelled() {
+        let root = ComponentInstancePath::root("App", "root");
+        let now = Instant::now();
+        let ms = Duration::from_millis;
+        let generation = ScriptGeneration::initial();
+        let mut timers = TimerRegistry::new();
+        let tick = descriptor(&root, "tick", ms(100), false)
+            .repeating()
+            .unwrap();
+        assert!(tick.repeats());
+        let declare = |timers: &mut TimerRegistry, at: Instant| {
+            timers.reconcile(&root, BTreeMap::from([(tick.id.clone(), tick.clone())]), at);
+        };
+        declare(&mut timers, now);
+        assert!(timers.drain(now + ms(99), generation).is_empty());
+        assert_eq!(timers.drain(now + ms(100), generation).len(), 1);
+        // The render the tick causes declares the interval again; it keeps
+        // its schedule rather than restarting or stopping as a one-shot does.
+        declare(&mut timers, now + ms(100));
+        assert!(timers.drain(now + ms(199), generation).is_empty());
+        assert_eq!(timers.drain(now + ms(200), generation).len(), 1);
+        // Three periods late is one tick, and the next is a period later.
+        assert_eq!(timers.drain(now + ms(550), generation).len(), 1);
+        assert!(timers.drain(now + ms(649), generation).is_empty());
+        assert_eq!(timers.drain(now + ms(650), generation).len(), 1);
+
+        assert!(timers.pause(tick.id(), now + ms(700)));
+        assert!(timers.drain(now + ms(2_000), generation).is_empty());
+        assert!(timers.resume(tick.id(), now + ms(2_000)));
+        assert_eq!(timers.drain(now + ms(2_050), generation).len(), 1);
+
+        assert!(timers.cancel(tick.id()));
+        declare(&mut timers, now + ms(2_100));
+        assert_eq!(
+            timers.active_count(),
+            0,
+            "a cancelled interval stays stopped"
+        );
+
+        assert_eq!(
+            descriptor(&root, "fast", ms(15), false).repeating(),
+            Err(TimerError::IntervalTooShort(ms(15)))
         );
     }
 
