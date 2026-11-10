@@ -212,11 +212,7 @@ impl<S: SessionView> HarnessShell<S> {
     /// settings store when one is shared (`ui.reduce_motion`).
     pub fn set_reduce_motion(&mut self, reduce: bool) {
         self.reduce_motion = reduce;
-        if let Some(store) = &self.settings {
-            if let Ok(mut store) = store.lock() {
-                let _ = store.set(REDUCE_MOTION_KEY, serde_json::json!(reduce));
-            }
-        }
+        self.save_setting(REDUCE_MOTION_KEY, serde_json::json!(reduce));
     }
 
     /// Whether the marks are drawn still: the shell's switch, or the

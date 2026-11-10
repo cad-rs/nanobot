@@ -14,20 +14,23 @@
 //! [`StreamState`] applies it to the list. Those three are plain data and are
 //! tested without a window; the drawing is at the end of the file.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::rc::Rc;
 
 use gpui::{
     div, list, prelude::*, px, AnyElement, Context, Entity, FollowMode, Hsla, ListAlignment,
-    ListState, MouseButton, MouseDownEvent, SharedString, Window,
+    ListState, MouseButton, MouseDownEvent, SharedString,
 };
 use gpui_component::text::{TextView, TextViewState};
 use gpui_component::ActiveTheme as _;
 
 use crate::i18n::Locale;
 use crate::icons::{icon, Icon};
-use crate::model::{PlanStep, SessionId, SessionView, StepStatus};
+use crate::model::{PlanStep, SessionId, SessionView};
 use crate::motion::{self, Mark};
+use crate::activity::step_color;
 use crate::shell::{badge, palette, HarnessShell, Palette};
 use crate::transcript::{Entry, EntryKind, ToolCall, ToolKind, ToolStatus};
 
@@ -247,7 +250,7 @@ pub struct StreamState {
     expanded: HashSet<RowKey>,
     /// Whether the list was following its end at the last scroll: the shell
     /// redraws when that flips, to show or hide the way back to the end.
-    following_seen: std::rc::Rc<std::cell::Cell<bool>>,
+    following_seen: Rc<Cell<bool>>,
 }
 
 impl Default for StreamState {
@@ -260,7 +263,7 @@ impl Default for StreamState {
             list,
             cells: HashMap::new(),
             expanded: HashSet::new(),
-            following_seen: std::rc::Rc::new(std::cell::Cell::new(true)),
+            following_seen: Rc::new(Cell::new(true)),
         }
     }
 }
@@ -507,14 +510,6 @@ fn tool_color(status: ToolStatus, p: Palette) -> Hsla {
     }
 }
 
-fn step_color(status: StepStatus, p: Palette) -> Hsla {
-    match status {
-        StepStatus::Pending => p.muted,
-        StepStatus::InProgress => p.info,
-        StepStatus::Done => p.success,
-    }
-}
-
 impl<S: SessionView> HarnessShell<S> {
     /// What pointing at an object does: the session, and the object's name
     /// as the entry gave it. With this set, the chip under an entry is a
@@ -583,8 +578,8 @@ impl<S: SessionView> HarnessShell<S> {
         });
         let stream = list(
             self.stream.list.clone(),
-            cx.processor(|this: &mut Self, ix: usize, window, cx| {
-                this.render_row(ix, window, cx)
+            cx.processor(|this: &mut Self, ix: usize, _window, cx| {
+                this.render_row(ix, cx)
             }),
         )
         .size_full();
@@ -640,7 +635,7 @@ impl<S: SessionView> HarnessShell<S> {
             })
     }
 
-    fn render_row(&mut self, ix: usize, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_row(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
         let Some(row) = self.stream.rows().get(ix).cloned() else {
             return div().into_any_element();
         };
@@ -815,7 +810,6 @@ impl<S: SessionView> HarnessShell<S> {
                                             div()
                                                 .flex()
                                                 .flex_row()
-                                                .flex_row()
                                                 .items_center()
                                                 .text_color(p.muted)
                                                 .child(icon(Icon::tool(call.kind), p.muted))
@@ -851,15 +845,15 @@ impl<S: SessionView> HarnessShell<S> {
                     call.status,
                     ToolStatus::Failed | ToolStatus::Cancelled | ToolStatus::Rejected
                 );
-                let output = call.output.clone().unwrap_or_default();
+                let output = call.output.as_deref().unwrap_or("");
                 let (tail, hidden) = if open {
-                    (output.as_str(), 0)
+                    (output, 0)
                 } else {
-                    output_tail(&output, OUTPUT_TAIL_LINES)
+                    output_tail(output, OUTPUT_TAIL_LINES)
                 };
                 let tail = tail.trim_end().to_string();
-                let diff_text = call.diff.clone().unwrap_or_default();
-                let (diff, added, removed) = diff_lines(&diff_text);
+                let diff_text = call.diff.as_deref().unwrap_or("");
+                let (diff, added, removed) = diff_lines(diff_text);
                 let diff_hidden = if open { 0 } else { diff.len().saturating_sub(DIFF_HEAD_LINES) };
                 let has_more = hidden > 0 || diff_hidden > 0 || call.input.is_some();
                 div()
@@ -957,11 +951,7 @@ impl<S: SessionView> HarnessShell<S> {
                                         .flex_row()
                                         .gap_2()
                                         .when(tint > 0., |d| d.bg(color.opacity(tint)))
-                                        .text_color(if *kind == DiffLineKind::Context {
-                                            p.fg
-                                        } else {
-                                            color
-                                        })
+                                        .text_color(color)
                                         .child(div().flex_none().w(px(8.)).child(mark))
                                         .child(div().flex_1().min_w_0().child(text.to_string()))
                                 }))
@@ -1052,9 +1042,9 @@ impl<S: SessionView> HarnessShell<S> {
                     .gap_1()
                     .child(
                         div()
+                            .flex()
                             .flex_row()
                             .items_center()
-                            .flex_row()
                             .gap_2()
                             .text_xs()
                             .when(foldable, |d| {

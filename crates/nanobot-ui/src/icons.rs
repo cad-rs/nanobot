@@ -60,9 +60,6 @@ icons! {
     // chrome
     Sidebar => "sidebar",
     Dock => "dock",
-    Viewport => "viewport",
-    Chat => "chat",
-    Account => "account",
     Settings => "settings",
     Close => "close",
     Plus => "plus",
@@ -104,7 +101,6 @@ icons! {
     Queue => "queue",
     Stop => "stop",
     Mention => "mention",
-    Attach => "attach",
 }
 
 impl Icon {

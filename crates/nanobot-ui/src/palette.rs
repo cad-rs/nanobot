@@ -131,8 +131,8 @@ impl<S: SessionView> HarnessShell<S> {
     }
 
     /// Runs the command `command`. `window_width` is for the ones that fold
-    /// the layout; theme changes need a window and are left to the caller
-    /// (`true` is returned and `wants_theme_toggle` is set). False when the
+    /// the layout. Changing the theme needs a window, so here it only answers
+    /// true: [`run_command_in`](Self::run_command_in) does it. False when the
     /// command is unknown or cannot run now.
     pub fn run_command(&mut self, command: &str, window_width: f32) -> bool {
         match command {
@@ -142,7 +142,7 @@ impl<S: SessionView> HarnessShell<S> {
             id::JUMP_TO_END => self.stream().follow(),
             id::TOGGLE_TOOLS => return self.stream.toggle_tools(),
             id::STOP_TURN => return self.stop_turn(),
-            id::TOGGLE_THEME => self.wants_theme_toggle = true,
+            id::TOGGLE_THEME => {}
             id::OPEN_SETTINGS => self.open_settings(),
             id::TOGGLE_MOTION => self.set_reduce_motion(!self.reduce_motion()),
             id::NEW_SESSION => match self.on_new_session.clone() {
@@ -424,7 +424,7 @@ impl<S: SessionView> HarnessShell<S> {
     ) {
         let width = f32::from(window.viewport_size().width);
         self.run_command(command, width);
-        if std::mem::take(&mut self.wants_theme_toggle) {
+        if command == id::TOGGLE_THEME {
             let next = self.theme().toggled();
             self.switch_theme(next, window, cx);
         }

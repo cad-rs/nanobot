@@ -50,7 +50,7 @@ pub use model::{
 pub use panels::{Entitlements, PanelArea, PanelDef, PanelHost, PanelSource, ScriptRuntime};
 pub use poll::poll_periodically;
 pub use transcript::{
-    Change, ComposerAction, Conversation, Entry, EntryKind, SessionBadge, ToolCall, ToolKind,
+    ComposerAction, Conversation, Entry, EntryKind, SessionBadge, ToolCall, ToolKind,
     ToolStatus, Transcript, TurnPhase,
 };
 pub use layout::{Divider, Fold, Layout, LayoutState, Regions, Stacked};
