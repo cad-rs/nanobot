@@ -43,6 +43,8 @@ pub enum Submitted {
     /// It answered the tool call that was waiting: a refusal, with the text
     /// as what to do instead.
     Refused,
+    /// It replaced the message being rewound to.
+    Rewound,
 }
 
 impl<S: SessionView> HarnessShell<S> {
@@ -59,6 +61,12 @@ impl<S: SessionView> HarnessShell<S> {
         let id = self.active_session_id()?.clone();
         if text.is_empty() {
             return None;
+        }
+        // A message is being rewound to: what is submitted is its new text.
+        if self.rewinding.is_some() {
+            return self
+                .rewind(crate::commands::RewindMode::Conversation, text)
+                .then_some(Submitted::Rewound);
         }
         // A tool call is waiting: what the user types instead of pressing a
         // button is a refusal that says what to do instead.

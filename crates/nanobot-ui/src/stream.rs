@@ -452,6 +452,19 @@ impl<S: SessionView> HarnessShell<S> {
             .flex_1()
             .min_h_0()
             .child(stream)
+            .when(self.stream.rows().is_empty(), |d| {
+                d.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_sm()
+                        .text_color(p.muted)
+                        .child(self.tr("stream.empty")),
+                )
+            })
             .when(!following && !self.stream.rows().is_empty(), |d| {
                 d.child(
                     div()
@@ -497,9 +510,11 @@ impl<S: SessionView> HarnessShell<S> {
             cx.notify();
         });
         let mono = cx.theme().mono_font_family.clone();
+        let rewindable = self.on_rewind.is_some();
 
         let body = match row.kind {
             RowKind::User { text } => div()
+                .id(("user-message", ix))
                 .px_2()
                 .py_3()
                 .rounded(px(6.))
@@ -508,6 +523,17 @@ impl<S: SessionView> HarnessShell<S> {
                 .bg(cx.theme().secondary)
                 .font_family(mono)
                 .text_xs()
+                // A click takes the message back into the composer, to go
+                // back to it and say it differently.
+                .when(rewindable, |d| {
+                    d.cursor_pointer().on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this: &mut Self, _ev: &MouseDownEvent, window, cx| {
+                            this.begin_rewind_in(key.seq, window, cx);
+                        }),
+                    )
+                })
+                .when(self.rewinding == Some(key.seq), |d| d.border_color(p.info))
                 .child(text)
                 .into_any_element(),
             RowKind::Markdown { text, .. } => {
@@ -862,6 +888,7 @@ impl<S: SessionView> HarnessShell<S> {
 
         // Every row: its own spacing, and the chip that points at the object
         // its entry is about.
+        let after_rewind = self.rewinding.is_some_and(|seq| key.seq > seq);
         let chip: Option<SharedString> = row.anchor.map(Into::into);
         div()
             .w_full()
@@ -869,6 +896,8 @@ impl<S: SessionView> HarnessShell<S> {
             .flex()
             .flex_col()
             .gap_1()
+            // What a rewind would drop is shown as already going.
+            .when(after_rewind, |d| d.opacity(0.4))
             .child(body)
             .when_some(chip, |d, anchor| {
                 d.child(

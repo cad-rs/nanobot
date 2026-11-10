@@ -234,6 +234,11 @@ pub trait WorkspaceView: Clone + 'static {
     fn context_usage(&self) -> Option<f32> {
         None
     }
+    /// Whether the product can put its own state back as it was at an earlier
+    /// message. Without it a rewind offers only the conversation and a fork.
+    fn can_restore_state(&self) -> bool {
+        false
+    }
     /// Where the turn stands. A product whose agent reports its own phase
     /// overrides this; the default reads it off the plan phase and the status,
     /// which cannot tell a pending approval from a pending question.

@@ -23,6 +23,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use gpui::{
+    Focusable as _,
     actions, FocusHandle, KeyBinding, MouseMoveEvent, MouseUpEvent,
     div, prelude::*, px, AnyElement, App, Context, Div, Entity, Hsla, Stateful,
     IntoElement,
@@ -41,7 +42,9 @@ use crate::model::{
     SessionId, SessionStatus, SessionStore, SessionView, WorkspaceView,
 };
 use crate::panels::{PanelArea, PanelDef, PanelHost};
+use crate::commands::{Candidate, Command, RewindMode};
 use crate::composer::{ApprovalDecision, Delivery, MessageQueue, PermissionMode};
+use crate::palette::{Completion, PaletteState};
 use crate::i18n::Locale;
 use crate::icons::{self, sized, Icon};
 use crate::layout::{Divider, Fold, Layout, LayoutState, Stacked};
@@ -77,11 +80,31 @@ actions!(
         CyclePermissionMode,
         /// Stops the turn in progress.
         StopTurn,
+        /// Opens the command palette.
+        OpenPalette,
+        /// Starts a new session.
+        NewSession,
+        /// Goes to the next session in the sidebar.
+        NextSession,
+        /// Goes to the previous session in the sidebar.
+        PreviousSession,
+        /// Scrolls the conversation to its end and follows it.
+        JumpToEnd,
+        /// Puts the keyboard in the composer.
+        FocusComposer,
+        /// Moves up in the palette.
+        PaletteUp,
+        /// Moves down in the palette.
+        PaletteDown,
+        /// Closes the palette.
+        PaletteClose,
     ]
 );
 
 /// The key context the shell's bindings live in.
 pub const KEY_CONTEXT: &str = "HarnessShell";
+/// The key context of the open command palette.
+pub const PALETTE_CONTEXT: &str = "HarnessPalette";
 
 /// Installs the shell's default key bindings. The product calls this once at
 /// startup (after `gpui_component::init`); bindings it adds afterwards win.
@@ -91,6 +114,15 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-alt-b", ToggleDock, Some(KEY_CONTEXT)),
         KeyBinding::new("shift-tab", CyclePermissionMode, Some(KEY_CONTEXT)),
         KeyBinding::new("escape", StopTurn, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-k", OpenPalette, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-n", NewSession, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-tab", NextSession, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-shift-tab", PreviousSession, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-end", JumpToEnd, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-l", FocusComposer, Some(KEY_CONTEXT)),
+        KeyBinding::new("up", PaletteUp, Some(PALETTE_CONTEXT)),
+        KeyBinding::new("down", PaletteDown, Some(PALETTE_CONTEXT)),
+        KeyBinding::new("escape", PaletteClose, Some(PALETTE_CONTEXT)),
     ]);
 }
 
@@ -107,6 +139,16 @@ type ApprovalCallback = Rc<RefCell<dyn Fn(&SessionId, u64, ApprovalDecision)>>;
 
 /// Told when the user turns the permission dial.
 type PermissionModeCallback = Rc<RefCell<dyn Fn(PermissionMode)>>;
+
+/// A command of the product's in the palette, with what running it does.
+type ProductCommand = (Command, Rc<dyn Fn()>);
+
+/// Where the composer's candidates come from: the sigil and the query in.
+type CompletionSource = Rc<dyn Fn(char, &str) -> Vec<Candidate>>;
+
+/// Told to rewind: the session, the user message's event sequence, how far
+/// back, and what the message says now.
+type RewindCallback = Rc<dyn Fn(&SessionId, u64, RewindMode, &str)>;
 
 /// A contingent-plan decision callback.
 type PlanDecisionCallback = Rc<RefCell<dyn Fn(&SessionId, PlanDecision)>>;
@@ -148,6 +190,18 @@ pub struct HarnessShell<S: SessionView> {
     pub(crate) queue_open: bool,
     /// "Always allow" was pressed and is asking how far it should reach.
     pub(crate) always_scope_open: bool,
+    /// The command palette, while it is open.
+    pub(crate) palette: Option<PaletteState>,
+    pub(crate) product_commands: Vec<ProductCommand>,
+    pub(crate) on_new_session: Option<Rc<dyn Fn()>>,
+    /// A command asked for the theme to flip; done where a window is to hand.
+    pub(crate) wants_theme_toggle: bool,
+    /// The composer's candidate list and where its rows come from.
+    pub(crate) completion_source: Option<CompletionSource>,
+    pub(crate) completion: Option<Completion>,
+    /// The user message being rewound to, by its event sequence.
+    pub(crate) rewinding: Option<u64>,
+    pub(crate) on_rewind: Option<RewindCallback>,
     /// Callback invoked when the user decides a contingent plan.
     pub(crate) on_plan_decision: Option<PlanDecisionCallback>,
     /// Undo/redo and container save/load/import: the app layer forwards them to
@@ -162,6 +216,8 @@ pub struct HarnessShell<S: SessionView> {
     on_import: Option<SessionCallback>,
     /// Keeps the composer's submit subscription alive.
     _composer_sub: Option<Subscription>,
+    /// Keeps the candidate list's hold on its keys alive.
+    _completion_keys: Option<Subscription>,
     /// The currently selected entity (three-way linking with the conversation).
     selected_entity: Option<String>,
     /// The currently selected conversation block event sequence.
@@ -239,6 +295,14 @@ impl<S: SessionView> HarnessShell<S> {
             plan_open: false,
             queue_open: true,
             always_scope_open: false,
+            palette: None,
+            product_commands: Vec::new(),
+            on_new_session: None,
+            wants_theme_toggle: false,
+            completion_source: None,
+            completion: None,
+            rewinding: None,
+            on_rewind: None,
             on_message_sent: None,
             on_plan_decision: None,
             sidebar_projection: None,
@@ -248,6 +312,7 @@ impl<S: SessionView> HarnessShell<S> {
             on_load: None,
             on_import: None,
             _composer_sub: None,
+            _completion_keys: None,
             selected_entity: None,
             selected_block: None,
             panel_host: PanelHost::default(),
@@ -313,11 +378,40 @@ impl<S: SessionView> HarnessShell<S> {
                 InputEvent::PressEnter {
                     secondary,
                     shift: false,
-                } => shell.submit_composer(*secondary, window, cx),
-                // The button changes with whether there is anything to send.
+                } => {
+                    // Enter belongs to whatever is open over the composer.
+                    if shell.completion.is_some() {
+                        shell.apply_completion(window, cx);
+                    } else if shell.rewinding.is_some() {
+                        shell.rewind_in(RewindMode::Conversation, window, cx);
+                    } else {
+                        shell.submit_composer(*secondary, window, cx);
+                    }
+                }
                 InputEvent::Change => {
-                    let has_text = !input.read(cx).value().trim().is_empty();
-                    if shell.composer_has_text != has_text {
+                    let (text, caret, in_token) = {
+                        let state = input.read(cx);
+                        let caret = state.cursor();
+                        // A reference already made is not one in the making.
+                        let in_token = state.tokens().iter().any(|span| {
+                            let range = span.range();
+                            range.start < caret && caret <= range.end
+                        });
+                        (state.value().to_string(), caret, in_token)
+                    };
+                    // The candidate list follows what is typed at the caret,
+                    // and the button whether there is anything to send.
+                    let was_open = shell.completion.is_some();
+                    if in_token {
+                        shell.close_completion();
+                    } else {
+                        shell.update_completion(&text, caret);
+                    }
+                    let has_text = !text.trim().is_empty();
+                    if shell.composer_has_text != has_text
+                        || was_open
+                        || shell.completion.is_some()
+                    {
                         shell.composer_has_text = has_text;
                         cx.notify();
                     }
@@ -326,10 +420,58 @@ impl<S: SessionView> HarnessShell<S> {
             },
         );
 
+        // While the candidate list is open, the arrows, Tab, Enter and Escape
+        // are its.
+        // The text area has bindings of its own for them and sits deeper in
+        // the focus path, so a key context here would lose to it: the keys are
+        // taken before any binding is looked up.
+        let weak = cx.weak_entity();
+        let keys = cx.intercept_keystrokes(move |event, window, cx| {
+            if event.keystroke.modifiers.modified() {
+                return;
+            }
+            let key = event.keystroke.key.clone();
+            if !matches!(key.as_str(), "up" | "down" | "tab" | "enter" | "escape") {
+                return;
+            }
+            let Some(shell) = weak.upgrade() else {
+                return;
+            };
+            let taken = shell.update(cx, |shell, cx| {
+                let typing = shell
+                    .composer
+                    .as_ref()
+                    .is_some_and(|composer| composer.focus_handle(cx).is_focused(window));
+                if shell.completion.is_none() || !typing {
+                    return false;
+                }
+                match key.as_str() {
+                    "up" => {
+                        shell.step_completion(-1);
+                    }
+                    "down" => {
+                        shell.step_completion(1);
+                    }
+                    "tab" | "enter" => {
+                        shell.apply_completion(window, cx);
+                    }
+                    _ => {
+                        shell.close_completion();
+                    }
+                }
+                cx.notify();
+                true
+            });
+            if taken {
+                cx.stop_propagation();
+            }
+        });
+
         let mut shell = Self::new(store);
         shell.locale = locale;
         shell.composer = Some(composer);
         shell._composer_sub = Some(subscription);
+        shell._completion_keys = Some(keys);
         shell
     }
 
@@ -554,7 +696,12 @@ impl<S: SessionView> HarnessShell<S> {
     /// Switches the theme: remembers it on the shell, persists it through
     /// the settings store when one is shared, and applies it to every themed
     /// surface (the global theme change refreshes the window).
-    fn switch_theme(&mut self, kind: ThemeKind, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn switch_theme(
+        &mut self,
+        kind: ThemeKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.theme = kind;
         match &self.settings {
             Some(store) => crate::theme::set_theme(store, kind, Some(window), cx),
@@ -1120,6 +1267,25 @@ impl<S: SessionView> HarnessShell<S> {
             .when_some(status, |d, status| {
                 d.child(badge(status.label(self.locale), session_color(status, p)))
             })
+            .when(self.on_new_session.is_some(), |d| {
+                d.child(
+                    toolbar_button("harness-new-session", Icon::Plus, p.muted).on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this: &mut Self, _ev: &MouseDownEvent, window, cx| {
+                            this.run_command_in(crate::palette::id::NEW_SESSION, window, cx);
+                        }),
+                    ),
+                )
+            })
+            // Everything else the shell can do is in the palette.
+            .child(
+                toolbar_button("harness-open-palette", Icon::More, p.muted).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this: &mut Self, _ev: &MouseDownEvent, window, cx| {
+                        this.open_palette(window, cx);
+                    }),
+                ),
+            )
             .when(fold == Fold::Stacked, |d| {
                 // Too narrow for both: the one way to reach the viewport.
                 d.child(
@@ -1642,6 +1808,8 @@ impl<S: SessionView> HarnessShell<S> {
             .flex_col()
             .child(self.render_stream(cx))
             .child(self.activity_bar(ws, cx))
+            .children(self.rewind_section(cx))
+            .children(self.completion_list(cx))
             .child(self.composer_area(ws, cx))
     }
 
@@ -2228,6 +2396,35 @@ impl<S: SessionView> Render for HarnessShell<S> {
                     cx.propagate();
                 }
             }))
+            .on_action(cx.listener(|this: &mut Self, _: &OpenPalette, window, cx| {
+                this.open_palette(window, cx);
+            }))
+            .on_action(cx.listener(|this: &mut Self, _: &NewSession, window, cx| {
+                this.run_command_in(crate::palette::id::NEW_SESSION, window, cx);
+            }))
+            .on_action(cx.listener(|this: &mut Self, _: &NextSession, window, cx| {
+                this.run_command_in(crate::palette::id::NEXT_SESSION, window, cx);
+            }))
+            .on_action(cx.listener(|this: &mut Self, _: &PreviousSession, window, cx| {
+                this.run_command_in(crate::palette::id::PREVIOUS_SESSION, window, cx);
+            }))
+            .on_action(cx.listener(|this: &mut Self, _: &JumpToEnd, window, cx| {
+                this.run_command_in(crate::palette::id::JUMP_TO_END, window, cx);
+            }))
+            .on_action(cx.listener(|this: &mut Self, _: &FocusComposer, window, cx| {
+                if let Some(composer) = this.composer.clone() {
+                    composer.update(cx, |state, cx| state.focus(window, cx));
+                }
+            }))
+            .on_action(cx.listener(|this: &mut Self, _: &PaletteUp, _window, cx| {
+                this.step_palette(-1, cx);
+            }))
+            .on_action(cx.listener(|this: &mut Self, _: &PaletteDown, _window, cx| {
+                this.step_palette(1, cx);
+            }))
+            .on_action(cx.listener(|this: &mut Self, _: &PaletteClose, window, cx| {
+                this.close_palette(window, cx);
+            }))
             // A divider drag is followed here, at the root, so it keeps going
             // wherever the pointer is.
             .on_mouse_move(cx.listener(|this: &mut Self, ev: &MouseMoveEvent, window, cx| {
@@ -2268,6 +2465,7 @@ impl<S: SessionView> Render for HarnessShell<S> {
             .child(top)
             .child(body)
             .child(bottom)
+            .children(self.palette_overlay(cx))
     }
 }
 

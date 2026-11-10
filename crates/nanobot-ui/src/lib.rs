@@ -24,10 +24,12 @@
 
 pub mod activity;
 pub mod composer;
+pub mod commands;
 pub mod i18n;
 pub mod icons;
 pub mod layout;
 pub mod model;
+pub mod palette;
 pub mod panels;
 pub mod poll;
 pub mod shell;
@@ -49,7 +51,8 @@ pub use transcript::{
 };
 pub use layout::{Divider, Fold, Layout, LayoutState, Regions, Stacked};
 pub use shell::{
-    init, CyclePermissionMode, HarnessShell, StopTurn, ToggleDock, ToggleSidebar, KEY_CONTEXT,
+    init, CyclePermissionMode, HarnessShell, OpenPalette, StopTurn, ToggleDock, ToggleSidebar,
+    KEY_CONTEXT, PALETTE_CONTEXT,
 };
 pub use stream::{Row, RowKey, RowKind, StreamState};
 pub use activity::{Submitted, PERMISSION_MODE_KEY};
@@ -57,7 +60,9 @@ pub use composer::{
     Approval, ApprovalDecision, ApprovalScope, ContextLevel, Delivery, MessageQueue, PermissionMode,
     Queued, Submit,
 };
+pub use commands::{Candidate, Command, RewindMode, Selection, Trigger};
 pub use i18n::{t, t_replace, Locale};
+pub use palette::Completion;
 pub use icons::{Assets, Icon};
 pub use theme::{
     apply, apply_font, apply_from_settings, set_theme, ThemeKind, FONT_FAMILY_KEY,
@@ -1105,6 +1110,291 @@ mod tests {
         let mut next = HarnessShell::new(two_project_store());
         next.set_settings(Some(settings));
         assert_eq!(next.permission_mode(), PermissionMode::PlanOnly, "restored at launch");
+    }
+
+    // ---- commands, candidates and rewinding ----
+
+    #[test]
+    fn the_palette_lists_what_can_run_now() {
+        let mut shell = HarnessShell::new(one_project(vec![
+            TestSession::new("s1"),
+            TestSession::new("s2"),
+            TestSession {
+                archived: true,
+                ..TestSession::new("s3")
+            },
+        ]));
+        let ids = |shell: &HarnessShell<TestSession>| -> Vec<String> {
+            shell.commands().into_iter().map(|c| c.id).collect()
+        };
+        let listed = ids(&shell);
+        assert!(listed.contains(&palette::id::TOGGLE_SIDEBAR.to_string()));
+        assert!(listed.contains(&"shell.switch_session:s2".to_string()));
+        assert!(!listed.contains(&"shell.switch_session:s1".to_string()), "already there");
+        assert!(!listed.contains(&"shell.switch_session:s3".to_string()), "archived");
+        assert!(!listed.contains(&palette::id::NEW_SESSION.to_string()), "no way to make one");
+        assert!(!listed.contains(&palette::id::STOP_TURN.to_string()), "nothing running");
+
+        shell.set_on_new_session(|| {});
+        shell.add_command(Command::new("acme.export", "Export STEP"), || {});
+        let listed = ids(&shell);
+        assert_eq!(listed[0], palette::id::NEW_SESSION);
+        assert!(listed.contains(&"acme.export".to_string()));
+    }
+
+    #[test]
+    fn commands_run() {
+        let ran = Rc::new(RefCell::new(Vec::new()));
+        let mut shell = HarnessShell::new(one_project(vec![
+            TestSession::new("s1"),
+            TestSession::new("s2"),
+            TestSession::new("s3"),
+        ]));
+        let log = ran.clone();
+        shell.add_command(Command::new("acme.export", "Export STEP"), move || {
+            log.borrow_mut().push("export");
+        });
+        let log = ran.clone();
+        shell.set_on_new_session(move || log.borrow_mut().push("new"));
+
+        assert!(shell.run_command("acme.export", 1600.));
+        assert!(shell.run_command(palette::id::NEW_SESSION, 1600.));
+        assert_eq!(*ran.borrow(), ["export", "new"]);
+        assert!(!shell.run_command("no.such", 1600.));
+
+        assert!(shell.run_command(palette::id::TOGGLE_SIDEBAR, 1600.));
+        assert!(!shell.sidebar_shown(1600.));
+
+        // Round the sessions and back, and straight to one.
+        let on_screen = |shell: &HarnessShell<TestSession>| shell.active_session_id().unwrap().to_string();
+        assert!(shell.run_command(palette::id::NEXT_SESSION, 1600.));
+        assert_eq!(on_screen(&shell), "s2");
+        assert!(shell.run_command(palette::id::PREVIOUS_SESSION, 1600.));
+        assert!(shell.run_command(palette::id::PREVIOUS_SESSION, 1600.));
+        assert_eq!(on_screen(&shell), "s3", "it wraps");
+        assert!(shell.run_command("shell.switch_session:s1", 1600.));
+        assert_eq!(on_screen(&shell), "s1");
+
+        assert_eq!(shell.permission_mode(), PermissionMode::Ask);
+        shell.run_command(palette::id::CYCLE_PERMISSION_MODE, 1600.);
+        assert_eq!(shell.permission_mode(), PermissionMode::AcceptLowRisk);
+        assert!(!shell.run_command(palette::id::STOP_TURN, 1600.), "nothing to stop");
+    }
+
+    /// Candidates a product might offer.
+    fn candidates(sigil: char, query: &str) -> Vec<Candidate> {
+        let all: &[(&str, &str)] = match sigil {
+            '@' => &[("feature:body1", "Body1"), ("feature:body2", "Body2"), ("face:top", "TopFace")],
+            _ => &[("clear", "clear"), ("compact", "compact")],
+        };
+        all.iter()
+            .filter(|(_, label)| label.to_lowercase().starts_with(&query.to_lowercase()))
+            .map(|(id, label)| Candidate::new(*id, *label))
+            .collect()
+    }
+
+    #[test]
+    fn candidates_follow_what_is_typed_at_the_caret() {
+        let mut shell = HarnessShell::new(one_project(vec![TestSession::new("s1")]));
+        shell.update_completion("cut @Bo", 7);
+        assert!(shell.completion().is_none(), "no source, no list");
+
+        shell.set_completions(candidates);
+        shell.update_completion("cut @Bo", 7);
+        let labels = |shell: &HarnessShell<TestSession>| -> Vec<String> {
+            shell
+                .completion()
+                .map(|open| open.candidates.iter().map(|c| c.label.clone()).collect())
+                .unwrap_or_default()
+        };
+        assert_eq!(labels(&shell), ["Body1", "Body2"]);
+
+        // The selection moves, and survives another letter of the same mention.
+        assert!(shell.step_completion(1));
+        shell.update_completion("cut @Bod", 8);
+        let open = shell.completion().unwrap();
+        assert_eq!(open.selection.index(open.candidates.len()), Some(1));
+
+        // Accepting hands back what to replace and what with.
+        let (trigger, candidate) = shell.accept_completion().expect("one is selected");
+        assert_eq!(trigger.range, 4..8);
+        assert_eq!((candidate.id.as_str(), candidate.label.as_str()), ("feature:body2", "Body2"));
+        assert!(shell.completion().is_none(), "the list closes");
+
+        // Nothing matches, or the caret left the mention: no list.
+        shell.update_completion("cut @Zz", 7);
+        assert!(shell.completion().is_none());
+        shell.update_completion("cut @Bo then", 12);
+        assert!(shell.completion().is_none());
+        assert!(!shell.step_completion(1));
+
+        // A command at the start of the message.
+        shell.update_completion("/c", 2);
+        assert_eq!(labels(&shell), ["clear", "compact"]);
+        assert!(shell.close_completion());
+    }
+
+    type Rewinds = Rc<RefCell<Vec<(u64, RewindMode, String)>>>;
+
+    fn rewinding_shell(session: TestSession) -> (HarnessShell<TestSession>, Sent, Rewinds) {
+        let (mut shell, sent) = recording_shell(vec![session]);
+        let rewinds: Rewinds = Rc::new(RefCell::new(Vec::new()));
+        let log = rewinds.clone();
+        shell.set_on_rewind(move |_, seq, mode, text| {
+            log.borrow_mut().push((seq, mode, text.to_string()));
+        });
+        (shell, sent, rewinds)
+    }
+
+    fn talked() -> TestSession {
+        TestSession {
+            conversation: Conversation::from_entries(vec![
+                Entry::user(1, "cut four holes"),
+                Entry::assistant(2, "Done."),
+                Entry::user(3, "now chamfer them"),
+                Entry::assistant(4, "Done."),
+            ]),
+            ..TestSession::new("s1")
+        }
+    }
+
+    #[test]
+    fn rewinding_goes_back_to_a_user_message_with_new_words() {
+        let (mut shell, sent, rewinds) = rewinding_shell(talked());
+        assert_eq!(shell.begin_rewind(2), None, "an answer is not somewhere to go back to");
+        assert_eq!(shell.begin_rewind(99), None);
+        assert_eq!(shell.rewinding(), None);
+
+        assert_eq!(shell.begin_rewind(1).as_deref(), Some("cut four holes"));
+        assert_eq!(shell.rewinding(), Some(1));
+        // The product cannot restore its state: that way back is not offered.
+        assert_eq!(shell.rewind_modes(), [RewindMode::Conversation, RewindMode::Fork]);
+        assert!(!shell.rewind(RewindMode::ConversationAndState, "cut six holes"));
+        assert!(!shell.rewind(RewindMode::Conversation, "   "), "it needs words");
+        assert_eq!(shell.rewinding(), Some(1), "still going back");
+
+        // Submitting while going back is the rewind, not a new message.
+        assert_eq!(shell.submit_message("cut six holes", false), Some(Submitted::Rewound));
+        assert!(sent.borrow().is_empty());
+        assert_eq!(
+            *rewinds.borrow(),
+            [(1, RewindMode::Conversation, "cut six holes".to_string())]
+        );
+        assert_eq!(shell.rewinding(), None);
+
+        // A fork leaves this session alone; cancelling does nothing at all.
+        shell.begin_rewind(3);
+        assert!(shell.rewind(RewindMode::Fork, "now fillet them"));
+        assert_eq!(rewinds.borrow()[1], (3, RewindMode::Fork, "now fillet them".to_string()));
+        shell.begin_rewind(3);
+        assert!(shell.cancel_rewind());
+        assert!(!shell.rewind(RewindMode::Conversation, "x"), "nothing is being rewound");
+        assert_eq!(rewinds.borrow().len(), 2);
+    }
+
+    #[test]
+    fn without_a_way_to_rewind_messages_cannot_be_gone_back_to() {
+        let (mut shell, _) = recording_shell(vec![talked()]);
+        assert_eq!(shell.begin_rewind(1), None);
+        assert_eq!(shell.rewinding(), None);
+    }
+
+    // ---- the keyboard, in a window ----
+
+    /// A shell with a composer in a (headless) window, the keyboard in the
+    /// composer, and the shell's bindings installed.
+    fn typing_shell(
+        cx: &mut gpui::TestAppContext,
+    ) -> (gpui::Entity<HarnessShell<TestSession>>, &mut gpui::VisualTestContext) {
+        cx.update(gpui_component::init);
+        cx.update(crate::init);
+        let (shell, cx) = cx.add_window_view(|window, cx| {
+            let mut shell = HarnessShell::with_composer(
+                one_project(vec![TestSession::new("s1"), TestSession::new("s2")]),
+                Locale::En,
+                window,
+                cx,
+            );
+            shell.set_completions(candidates);
+            shell
+        });
+        redraw(&shell, cx);
+        cx.simulate_keystrokes("ctrl-l");
+        redraw(&shell, cx);
+        (shell, cx)
+    }
+
+    fn composed(shell: &gpui::Entity<HarnessShell<TestSession>>, cx: &mut gpui::VisualTestContext) -> String {
+        shell.read_with(cx, |shell, cx| shell.composer_text(cx))
+    }
+
+    #[gpui::test]
+    fn a_mention_is_picked_with_the_keyboard(cx: &mut gpui::TestAppContext) {
+        let (shell, cx) = typing_shell(cx);
+        cx.simulate_input("cut @Bo");
+        redraw(&shell, cx);
+        shell.read_with(cx, |shell, _| {
+            let open = shell.completion().expect("the list opened as the mention was typed");
+            assert_eq!(open.candidates.len(), 2);
+        });
+
+        // Down moves in the list, not the caret; Enter takes the row.
+        cx.simulate_keystrokes("down");
+        redraw(&shell, cx);
+        shell.read_with(cx, |shell, _| {
+            let open = shell.completion().unwrap();
+            assert_eq!(open.selection.index(2), Some(1));
+        });
+        cx.simulate_keystrokes("enter");
+        redraw(&shell, cx);
+        assert_eq!(composed(&shell, cx), "cut @Body2");
+        shell.read_with(cx, |shell, cx| {
+            assert!(shell.completion().is_none());
+            let tokens = shell.composer_tokens(cx);
+            assert_eq!(tokens, ["feature:body2"], "it is a reference, not just text");
+        });
+
+        // Escape closes the list and keeps what was typed.
+        cx.simulate_input(" and @To");
+        redraw(&shell, cx);
+        assert!(shell.read_with(cx, |shell, _| shell.completion().is_some()));
+        cx.simulate_keystrokes("escape");
+        redraw(&shell, cx);
+        assert!(shell.read_with(cx, |shell, _| shell.completion().is_none()));
+        assert_eq!(composed(&shell, cx), "cut @Body2 and @To");
+    }
+
+    #[gpui::test]
+    fn the_palette_opens_filters_and_runs_from_the_keyboard(cx: &mut gpui::TestAppContext) {
+        let (shell, cx) = typing_shell(cx);
+        cx.simulate_keystrokes("ctrl-k");
+        redraw(&shell, cx);
+        assert!(shell.read_with(cx, |shell, _| shell.palette_is_open()));
+
+        // Typing goes to the palette, not the composer.
+        cx.simulate_input("sess");
+        redraw(&shell, cx);
+        assert_eq!(composed(&shell, cx), "");
+        let offered = shell.read_with(cx, |shell, _| shell.palette_matches());
+        assert!(offered.len() >= 3 && offered.iter().all(|title| title.to_lowercase().contains("sess")), "{offered:?}");
+
+        // Escape closes it without running anything.
+        cx.simulate_keystrokes("escape");
+        redraw(&shell, cx);
+        assert!(!shell.read_with(cx, |shell, _| shell.palette_is_open()));
+        assert_eq!(shell.read_with(cx, |shell, _| shell.active_session_id().unwrap().to_string()), "s1");
+
+        // Open, narrow down to the other session, move, and run.
+        cx.simulate_keystrokes("ctrl-k");
+        redraw(&shell, cx);
+        cx.simulate_input("go to");
+        redraw(&shell, cx);
+        cx.simulate_keystrokes("down up enter");
+        redraw(&shell, cx);
+        shell.read_with(cx, |shell, _| {
+            assert!(!shell.palette_is_open());
+            assert_eq!(shell.active_session_id().unwrap().as_str(), "s2");
+        });
     }
 
     // ---- panel host ----

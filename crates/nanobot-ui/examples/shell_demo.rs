@@ -25,6 +25,16 @@
 //! - Shift+Tab (or a click on the mode under the composer) turns the
 //!   permission dial; Shift+Enter breaks a line.
 //!
+//! The keyboard and going back:
+//! - Ctrl+K opens the command palette: type to filter, arrows and Enter to
+//!   run, Escape to close; the toolbar's last button opens it too;
+//! - type @ or (at the start) / in the composer for candidates: arrows, then
+//!   Enter or Tab; a picked @ becomes one chip;
+//! - click one of your own messages to go back to it: its text returns to the
+//!   composer, what would be dropped dims, and the bar offers the ways back;
+//! - Ctrl+Tab / Ctrl+Shift+Tab change session, Ctrl+N starts one, Ctrl+L puts
+//!   the keyboard in the composer, Ctrl+End jumps to the end.
+//!
 //! The layout is saved in `shell_demo/settings.json` under the user's config
 //! directory; delete it to start over.
 
@@ -292,6 +302,9 @@ impl WorkspaceView for Demo {
     fn progress(&self) -> Option<(u32, u32)> {
         None
     }
+    fn can_restore_state(&self) -> bool {
+        true
+    }
     fn model_label(&self) -> Option<String> {
         Some("demo-model".to_string())
     }
@@ -441,6 +454,46 @@ fn main() {
                     {
                         let seq = talk.last_seq() + 1;
                         talk.entries.push(Entry::user(seq, feedback));
+                    }
+                });
+                shell.set_on_new_session(|| log::info!("new session"));
+                shell.add_command(
+                    nanobot_ui::Command::new("demo.export", "导出 STEP（演示命令）"),
+                    || log::info!("export"),
+                );
+                // The product's vocabulary: its objects for @, its commands for /.
+                shell.set_completions(|sigil, query| {
+                    let all: &[(&str, &str, &str)] = match sigil {
+                        '@' => &[
+                            ("feature:body1", "Body1", "实体"),
+                            ("feature:body2", "Body2", "实体"),
+                            ("face:top", "TopFace", "Body1 的顶面"),
+                            ("feature:hole3", "Hole3", "孔"),
+                        ],
+                        _ => &[
+                            ("clear", "clear", "清空对话"),
+                            ("compact", "compact", "压缩上下文"),
+                            ("export", "export", "导出当前设计"),
+                        ],
+                    };
+                    let query = query.to_lowercase();
+                    all.iter()
+                        .filter(|(_, label, _)| label.to_lowercase().contains(&query))
+                        .map(|(id, label, detail)| {
+                            nanobot_ui::Candidate::new(*id, *label).with_detail(*detail)
+                        })
+                        .collect()
+                });
+                let talks = conversations.clone();
+                shell.set_on_rewind(move |id, seq, mode, text| {
+                    log::info!("rewind {id} to #{seq} ({mode:?}): {text}");
+                    if mode == nanobot_ui::RewindMode::Fork {
+                        return;
+                    }
+                    if let Some(talk) = talks.get(id.as_str()) {
+                        let mut talk = talk.borrow_mut();
+                        talk.entries.retain(|entry| entry.seq < seq);
+                        talk.entries.push(Entry::user(seq, text));
                     }
                 });
                 shell.set_on_stop(|id| log::info!("stop {id}"));
