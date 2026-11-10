@@ -17,6 +17,14 @@
 //!   [`Manifest`] contract, and [`Project`] (open / create / save / session
 //!   index with canonical-CRC32 sealing). The manifest type is the
 //!   product's; the container is the framework's.
+//! - [`settings`] — the user-scoped settings store (`ui.theme` and friends:
+//!   flat dotted keys, write-through, never fatal to load). Settings belong
+//!   to the user, not the project, so they survive a project switch.
+//! - [`account`] — the account concept: [`AccountProvider`] is the product's
+//!   authentication seam (cloud sign-in, license seat, OS identity — the
+//!   framework never authenticates), [`Account`] the identity snapshot,
+//!   [`Harness::check_entitlement`] the gated-capability question whose
+//!   denials land on the session log as auditable `CheckResult`s.
 //!
 //! Provenance: the assembly was lifted from the ocad design harness
 //! (`apps/ocad/src/agent_host.rs::assemble`), the container from the ocad
@@ -25,20 +33,40 @@
 //! Discipline: this crate stays GUI-free — no `gpui*`, no `wgpu`, no rcad /
 //! ocad dependencies — so CLI, tests, and MCP servers can consume the kernel.
 
+pub mod account;
 pub mod canonical;
 pub mod cli;
 pub mod container;
+pub mod diagnostics;
+pub mod entitlement_refresh;
 pub mod error;
 pub mod harness;
 pub mod harness_toml;
 pub mod selfcheck;
+pub mod settings;
 
+pub use account::{
+    denial_events, Account, AccountProvider, AnonymousProvider, EntitlementDecision,
+    SharedAccountProvider, StaticProvider, TURN_CAPABILITY,
+};
 pub use cli::{Cli, CliMode};
 pub use container::{
-    validate_relative_path, ChecksumState, Manifest, PackageRef, PackageSelection, Project,
+    validate_relative_path, ChecksumState, Manifest, Project,
     ProjectInfo, ProjectPaths, SessionEntry, SessionIndex, SessionStatus, STATE_DIR,
     MANIFEST_FILE,
 };
 pub use error::BootError;
 pub use harness::{run_one_turn, Harness, HarnessBuilder, CLEAN_MARKER};
 pub use harness_toml::{ApprovalMode, HarnessProfile, ProviderConfig, HARNESS_TOML};
+pub use settings::{Settings, SETTINGS_FILE};
+pub use entitlement_refresh::{RefreshSchedule, SessionGrace};
+
+/// Writes a whole durable file (settings, the project manifest): all or
+/// nothing on native targets, where a crash mid-write must not destroy the
+/// previous content.
+pub(crate) fn write_whole(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(not(target_family = "wasm"))]
+    return nanobot_session::atomic::write(path, bytes);
+    #[cfg(target_family = "wasm")]
+    return std::fs::write(path, bytes);
+}

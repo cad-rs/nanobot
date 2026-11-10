@@ -93,10 +93,6 @@ impl ProjectPaths {
         self.root.join(&self.state_dir)
     }
 
-    /// The state directory name this layout was configured with.
-    pub fn state_dir_name(&self) -> &str {
-        &self.state_dir
-    }
 
     /// `conversations/` — one directory per design session.
     pub fn conversations(&self) -> PathBuf {
@@ -113,10 +109,6 @@ impl ProjectPaths {
         self.state_dir().join("audit")
     }
 
-    /// `refs/` — external source files referenced by member documents.
-    pub fn refs(&self) -> PathBuf {
-        self.root.join("refs")
-    }
 
     /// Resolves a manifest-relative path, rejecting anything that would leave
     /// the project root (the manifest invariant, enforced again at use time).
@@ -197,23 +189,6 @@ impl ProjectInfo {
             revision: 0,
         }
     }
-}
-
-/// A package reference with an optional version constraint (skill / knowledge
-/// package selection — the manifest's profile-patch layer).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PackageRef {
-    pub id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub version: Option<String>,
-}
-
-/// Skill / knowledge package selection.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct PackageSelection {
-    pub skills: Vec<PackageRef>,
-    pub knowledge: Vec<PackageRef>,
 }
 
 /// Lifecycle status of a session, as the manifest records it (matches the
@@ -444,7 +419,8 @@ impl<M: Manifest> Project<M> {
         self.manifest.seal()?;
         let text = self.manifest.to_toml_string()?;
         let path = self.paths.manifest();
-        std::fs::write(&path, text).map_err(|source| BootError::Io { path, source })?;
+        crate::write_whole(&path, text.as_bytes())
+            .map_err(|source| BootError::Io { path, source })?;
         self.checksum = ChecksumState::Verified;
         Ok(())
     }
@@ -468,29 +444,6 @@ impl<M: Manifest> Project<M> {
             source,
         })?;
         Ok(dir)
-    }
-
-    /// The conversation directories actually present on disk (sorted). The
-    /// session index is authoritative; this is what reconciles against it.
-    pub fn conversation_dir_ids(&self) -> Result<Vec<String>, BootError> {
-        let root = self.paths.conversations();
-        let entries = match std::fs::read_dir(&root) {
-            Ok(entries) => entries,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(source) => return Err(BootError::Io { path: root, source }),
-        };
-        let mut ids = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(|source| BootError::Io {
-                path: root.clone(),
-                source,
-            })?;
-            if entry.path().is_dir() {
-                ids.push(entry.file_name().to_string_lossy().into_owned());
-            }
-        }
-        ids.sort();
-        Ok(ids)
     }
 
     /// Records a session the project should list (create-or-replace by id) and
@@ -537,8 +490,6 @@ mod tests {
         #[serde(default, rename = "document")]
         pub documents: Vec<TestDocument>,
         #[serde(default)]
-        pub packages: PackageSelection,
-        #[serde(default)]
         pub sessions: SessionIndex,
     }
 
@@ -556,7 +507,6 @@ mod tests {
                 checksum: None,
                 project: ProjectInfo::new(name),
                 documents: Vec::new(),
-                packages: PackageSelection::default(),
                 sessions: SessionIndex::default(),
             }
         }
@@ -662,7 +612,6 @@ mod tests {
             named.manifest(),
             std::path::Path::new("C:/projects/bracket").join("project.ocad.toml")
         );
-        assert_eq!(named.state_dir_name(), ".ocad");
     }
 
     #[test]

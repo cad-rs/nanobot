@@ -8,11 +8,18 @@ description = "nanobot-boot: harness assembly + harness.toml identity + CLI/self
 [lib]
 crate-type = ["rlib"]
 
+[features]
+default = ["nanobot-llm-providers"]
+# The HTTP provider adapter from `harness.toml [provider]`. Off, boot builds
+# network-free and a `[provider]` entry falls back to the scripted adapter.
+nanobot-llm-providers = ["nanobot-llm/providers"]
+
 [dependencies]
 nanobot-cordis = { workspace = true }
 nanobot-llm = { workspace = true }
 nanobot-session = { workspace = true }
 nanobot-skills = { workspace = true }
+nanobot-telemetry = { workspace = true }
 nanobot-tools = { workspace = true }
 nanobot-agent = { workspace = true }
 serde = { workspace = true }
@@ -21,6 +28,10 @@ thiserror = { workspace = true }
 toml = { workspace = true }
 uuid = { workspace = true }
 crc32fast = { workspace = true }
+# The facade the diagnostics log file listens on (and gpui logs through).
+log = { workspace = true }
+# StaticProvider reads the clock; web-time keeps wasm builds working.
+web-time = { workspace = true }
 # The selfcheck and the CLI smoke modes drive the agent loop headlessly
 # (futures_executor::block_on); the async runtime stays the host's.
 futures-executor = { workspace = true }
@@ -33,3 +44,5 @@ uuid = { version = "1.0", features = ["v4", "serde", "js"] }
 
 [dev-dependencies]
 uuid = { workspace = true }
+# The end-to-end session tests drive a scripted `LlmAdapter` stream.
+futures-util = { workspace = true }

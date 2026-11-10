@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 use rhai::{
     Array, CustomType, Dynamic, Engine, EvalAltResult, FLOAT, FnPtr, FuncRegistration, INT,
@@ -70,14 +71,36 @@ impl MotionProperty {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// An easing curve. Scripts and themes spell it as a string: a named curve, or
+/// `cubic_bezier(x1, y1, x2, y2)`, which `cubic_bezier(...)` in Rhai returns.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub enum MotionEasing {
     Linear,
     EaseIn,
     EaseOut,
     EaseInOut,
+    /// A CSS cubic Bézier from (0, 0) to (1, 1) through the control points
+    /// (`x1`, `y1`) and (`x2`, `y2`); `x1` and `x2` lie in [0, 1], and `y`
+    /// may leave it to overshoot.
+    CubicBezier {
+        x1: f64,
+        y1: f64,
+        x2: f64,
+        y2: f64,
+    },
 }
+
+impl PartialEq for MotionEasing {
+    fn eq(&self, other: &Self) -> bool {
+        std::mem::discriminant(self) == std::mem::discriminant(other)
+            && self.control_bits() == other.control_bits()
+    }
+}
+
+// The control points are finite (`cubic_bezier` rejects anything else), so
+// bitwise equality is an equivalence.
+impl Eq for MotionEasing {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -99,21 +122,64 @@ impl MotionIntent {
 }
 
 impl MotionEasing {
-    /// Parse the stable script spelling of an easing.
+    /// Parse the stable script spelling of an easing: a name, or
+    /// `cubic_bezier(x1, y1, x2, y2)`.
     ///
     /// # Errors
     ///
-    /// Returns [`MotionError::UnknownEasing`] for an unsupported name.
+    /// Returns [`MotionError::UnknownEasing`] for an unsupported name or a
+    /// malformed curve, and [`MotionError::InvalidSpec`] for control points
+    /// that are not finite or whose `x` leaves [0, 1].
     pub fn parse(value: &str) -> Result<Self, MotionError> {
         match value {
             "linear" => Ok(Self::Linear),
             "ease_in" => Ok(Self::EaseIn),
             "ease_out" => Ok(Self::EaseOut),
             "ease_in_out" => Ok(Self::EaseInOut),
-            _ => Err(MotionError::UnknownEasing(value.to_owned())),
+            _ => {
+                let unknown = || MotionError::UnknownEasing(value.to_owned());
+                let arguments = value
+                    .trim()
+                    .strip_prefix("cubic_bezier(")
+                    .and_then(|rest| rest.strip_suffix(')'))
+                    .ok_or_else(unknown)?;
+                let points = arguments
+                    .split(',')
+                    .map(|number| number.trim().parse::<f64>())
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| unknown())?;
+                let [x1, y1, x2, y2] = points[..] else {
+                    return Err(unknown());
+                };
+                Self::cubic_bezier(x1, y1, x2, y2)
+            }
         }
     }
 
+    /// A cubic Bézier easing from its control points.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MotionError::InvalidSpec`] for a point that is not finite or
+    /// an `x` outside [0, 1], which would not be a function of time.
+    pub fn cubic_bezier(x1: f64, y1: f64, x2: f64, y2: f64) -> Result<Self, MotionError> {
+        let finite = [x1, y1, x2, y2].iter().all(|value| value.is_finite());
+        if !finite || !(0.0..=1.0).contains(&x1) || !(0.0..=1.0).contains(&x2) {
+            return Err(MotionError::InvalidSpec);
+        }
+        Ok(Self::CubicBezier { x1, y1, x2, y2 })
+    }
+
+    /// A Bézier's control points as bits, for equality.
+    fn control_bits(self) -> Option<[u64; 4]> {
+        match self {
+            Self::CubicBezier { x1, y1, x2, y2 } => Some([x1, y1, x2, y2].map(f64::to_bits)),
+            _ => None,
+        }
+    }
+
+    /// The curve's name; `cubic_bezier` for any Bézier, whose full spelling
+    /// is its `Display`.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -121,6 +187,7 @@ impl MotionEasing {
             Self::EaseIn => "ease_in",
             Self::EaseOut => "ease_out",
             Self::EaseInOut => "ease_in_out",
+            Self::CubicBezier { .. } => "cubic_bezier",
         }
     }
 
@@ -134,8 +201,79 @@ impl MotionEasing {
             Self::EaseOut => 1.0 - (1.0 - progress) * (1.0 - progress),
             Self::EaseInOut if progress < 0.5 => 2.0 * progress * progress,
             Self::EaseInOut => 1.0 - (-2.0 * progress + 2.0).powi(2) / 2.0,
+            Self::CubicBezier { x1, y1, x2, y2 } => {
+                let t = bezier_parameter_for_x(x1, x2, progress);
+                bezier_coordinate(y1, y2, t)
+            }
         }
     }
+}
+
+impl std::fmt::Display for MotionEasing {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CubicBezier { x1, y1, x2, y2 } => {
+                write!(formatter, "cubic_bezier({x1}, {y1}, {x2}, {y2})")
+            }
+            named => formatter.write_str(named.as_str()),
+        }
+    }
+}
+
+impl TryFrom<String> for MotionEasing {
+    type Error = MotionError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::parse(&value)
+    }
+}
+
+impl From<MotionEasing> for String {
+    fn from(easing: MotionEasing) -> Self {
+        easing.to_string()
+    }
+}
+
+/// One coordinate of the Bézier from 0 to 1 through `first` and `second` at `t`.
+fn bezier_coordinate(first: f64, second: f64, t: f64) -> f64 {
+    let inverse = 1.0 - t;
+    3.0 * inverse * inverse * t * first + 3.0 * inverse * t * t * second + t * t * t
+}
+
+/// The parameter `t` at which the curve's `x` reaches `x`: Newton steps from
+/// `x`, then bisection, which always converges because `x(t)` is monotonic
+/// when both control `x` values lie in [0, 1].
+fn bezier_parameter_for_x(x1: f64, x2: f64, x: f64) -> f64 {
+    const EPSILON: f64 = 1e-7;
+    let mut t = x;
+    for _ in 0..8 {
+        let error = bezier_coordinate(x1, x2, t) - x;
+        if error.abs() < EPSILON {
+            return t;
+        }
+        let inverse = 1.0 - t;
+        let slope =
+            3.0 * inverse * inverse * x1 + 6.0 * inverse * t * (x2 - x1) + 3.0 * t * t * (1.0 - x2);
+        if slope.abs() < EPSILON {
+            break;
+        }
+        t -= error / slope;
+    }
+    let (mut low, mut high) = (0.0, 1.0);
+    t = x;
+    for _ in 0..64 {
+        let current = bezier_coordinate(x1, x2, t);
+        if (current - x).abs() < EPSILON {
+            break;
+        }
+        if current < x {
+            low = t;
+        } else {
+            high = t;
+        }
+        t = f64::midpoint(low, high);
+    }
+    t
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -576,12 +714,21 @@ pub enum MotionProgressDriver {
     Hover,
     Press,
     Focus,
+    Signal,
+}
+
+/// A native string-state predicate. Sampling never calls a script callback.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MotionSignalTrigger {
+    pub signal: crate::NativeSignal,
+    pub active_states: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MotionProgressBinding {
     pub driver: MotionProgressDriver,
     pub source: MotionSource,
+    pub signal_trigger: Option<MotionSignalTrigger>,
 }
 
 impl MotionProgressBinding {
@@ -592,7 +739,63 @@ impl MotionProgressBinding {
     /// Only transition and keyframe mappings are valid progress sources.
     pub fn new(driver: MotionProgressDriver, source: MotionSource) -> Result<Self, MotionError> {
         validate_progress_source(&source)?;
-        Ok(Self { driver, source })
+        if driver == MotionProgressDriver::Signal {
+            return Err(MotionError::InvalidProgressSource(
+                "a signal driver requires a string signal and active states".to_owned(),
+            ));
+        }
+        Ok(Self {
+            driver,
+            source,
+            signal_trigger: None,
+        })
+    }
+
+    /// Animate forward while `signal` names an active state, and back otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Requires a string signal, 1–64 distinct nonempty state names and a valid
+    /// transition/keyframe source. Native lifetime is validated at view commit.
+    pub fn from_signal(
+        signal: crate::NativeSignal,
+        active_states: BTreeSet<String>,
+        source: MotionSource,
+    ) -> Result<Self, MotionError> {
+        let binding = Self {
+            driver: MotionProgressDriver::Signal,
+            source,
+            signal_trigger: Some(MotionSignalTrigger {
+                signal,
+                active_states,
+            }),
+        };
+        binding.validate()?;
+        Ok(binding)
+    }
+
+    fn validate(&self) -> Result<(), MotionError> {
+        validate_progress_source(&self.source)?;
+        match (self.driver, &self.signal_trigger) {
+            (MotionProgressDriver::Signal, Some(trigger))
+                if trigger.signal.id().kind() == crate::SignalKind::String
+                    && !trigger.active_states.is_empty()
+                    && trigger.active_states.len() <= 64
+                    && trigger
+                        .active_states
+                        .iter()
+                        .all(|state| !state.is_empty() && state.len() <= 128) =>
+            {
+                Ok(())
+            }
+            (MotionProgressDriver::Signal, _) | (_, Some(_)) => {
+                Err(MotionError::InvalidProgressSource(
+                    "motion_signal requires a string signal and 1–64 nonempty state names"
+                        .to_owned(),
+                ))
+            }
+            (_, None) => Ok(()),
+        }
     }
 
     #[must_use]
@@ -1437,6 +1640,18 @@ impl MotionRuntime {
         }
     }
 
+    /// Whether `domain` holds no live motion and no timeline, which a commit
+    /// that declares none would cancel.
+    pub(crate) fn live_scope_idle(&self, domain: &str) -> bool {
+        let live = |retention: &MotionRetention| matches!(retention, MotionRetention::Live(owner) if owner == domain);
+        !self.active.values().any(|motion| live(&motion.retention))
+            && !self.settled_retention.values().any(live)
+            && !self
+                .timelines
+                .keys()
+                .any(|handle| handle.in_node_scope(domain))
+    }
+
     pub(crate) fn set_active_limit(&mut self, limit: usize) {
         self.active_limit = limit;
     }
@@ -1644,34 +1859,61 @@ impl MotionRuntime {
             .any(|scope| handle.in_node_scope(scope))
     }
 
+    /// Add an idempotent scope reason. Overlapping reasons do not resample
+    /// already frozen active time; page hiding and view suspension compose.
     pub fn suspend_node_scope(&mut self, path: &str, now: Instant) {
-        if !self.suspended_scopes.insert(path.to_owned()) {
+        if self.suspended_scopes.contains(path) {
             return;
         }
         for (key, motion) in &mut self.active {
-            if !key.in_node_scope(path) {
+            if !key.in_node_scope(path)
+                || self
+                    .suspended_scopes
+                    .iter()
+                    .any(|scope| key.in_node_scope(scope))
+            {
                 continue;
             }
             motion.elapsed_before_play = motion_elapsed(motion, now);
         }
         for (handle, timeline) in &mut self.timelines {
-            if handle.in_node_scope(path) && timeline.state == MotionPlaybackState::Playing {
+            if handle.in_node_scope(path)
+                && timeline.state == MotionPlaybackState::Playing
+                && !self
+                    .suspended_scopes
+                    .iter()
+                    .any(|scope| handle.in_node_scope(scope))
+            {
                 timeline.elapsed_before_play = timeline_position(timeline, now);
             }
         }
+        self.suspended_scopes.insert(path.to_owned());
     }
 
+    /// Remove one scope reason. Re-anchor only when the last applicable reason
+    /// disappears, keeping one authoritative elapsed-time owner.
     pub fn resume_node_scope(&mut self, path: &str, now: Instant) {
         if !self.suspended_scopes.remove(path) {
             return;
         }
         for (key, motion) in &mut self.active {
-            if key.in_node_scope(path) {
+            if key.in_node_scope(path)
+                && !self
+                    .suspended_scopes
+                    .iter()
+                    .any(|scope| key.in_node_scope(scope))
+            {
                 motion.started = now;
             }
         }
         for (handle, timeline) in &mut self.timelines {
-            if handle.in_node_scope(path) && timeline.state == MotionPlaybackState::Playing {
+            if handle.in_node_scope(path)
+                && timeline.state == MotionPlaybackState::Playing
+                && !self
+                    .suspended_scopes
+                    .iter()
+                    .any(|scope| handle.in_node_scope(scope))
+            {
                 timeline.started = now;
             }
         }
@@ -1724,13 +1966,13 @@ impl MotionRuntime {
                     MotionSource::Transition(spec) => (
                         "transition",
                         Some(spec.duration_ms),
-                        spec.iterations.is_none() || spec.iterations.is_some_and(|count| count > 1),
+                        spec.iterations.is_none_or(|count| count > 1),
                     ),
                     MotionSource::Spring(_) => ("spring", None, false),
                     MotionSource::Keyframes(spec) => (
                         "keyframes",
                         Some(spec.duration_ms),
-                        spec.iterations.is_none() || spec.iterations.is_some_and(|count| count > 1),
+                        spec.iterations.is_none_or(|count| count > 1),
                     ),
                     MotionSource::Inertia(_) => ("inertia", None, false),
                 };
@@ -2543,6 +2785,18 @@ pub(crate) fn reconcile_node_motion_scoped_owned(
     Ok(values)
 }
 
+/// A node's shared-layout group as one window-wide name: the group scoped by
+/// the component instance that declared it, when it has one.
+pub(crate) fn scoped_shared_layout_group(node: &UiNode) -> Option<String> {
+    let crate::UiValue::String(group) = node.attributes().get("shared_layout_group")? else {
+        return None;
+    };
+    Some(match node.attributes().get("shared_layout_scope") {
+        Some(crate::UiValue::String(scope)) => format!("{scope}::{group}"),
+        _ => group.clone(),
+    })
+}
+
 fn validate_shared_layout_ids(root: &UiNode) -> Result<(), MotionError> {
     shared_layout_ids(root).map(|_| ())
 }
@@ -2558,9 +2812,10 @@ pub(crate) fn shared_layout_ids(root: &UiNode) -> Result<BTreeSet<(String, Strin
                         "shared layout group and id must be non-empty".to_owned(),
                     ));
                 }
-                if !seen.insert((group.clone(), id.clone())) {
+                let scoped = scoped_shared_layout_group(node).unwrap_or_else(|| group.clone());
+                if !seen.insert((scoped.clone(), id.clone())) {
                     return Err(MotionError::DuplicateSharedLayout {
-                        group: group.clone(),
+                        group: scoped,
                         id: id.clone(),
                     });
                 }
@@ -2950,7 +3205,7 @@ fn collect_node_motion(
         validate_node_property(node, source.property(), path)?;
     }
     for binding in node.progress_motions() {
-        validate_progress_source(&binding.source)?;
+        binding.validate()?;
         validate_node_property(node, binding.property(), path)?;
         if node
             .motions()
@@ -3189,12 +3444,27 @@ fn collect_non_timeline_owners(
     for (property, _) in node.signal_bindings() {
         let property = match property {
             crate::SignalProperty::Opacity => Some(MotionProperty::Opacity),
-            crate::SignalProperty::TranslateX => Some(MotionProperty::TranslateX),
-            crate::SignalProperty::TranslateY => Some(MotionProperty::TranslateY),
+            crate::SignalProperty::TranslateX | crate::SignalProperty::TranslateXOverride => {
+                Some(MotionProperty::TranslateX)
+            }
+            crate::SignalProperty::TranslateY | crate::SignalProperty::TranslateYOverride => {
+                Some(MotionProperty::TranslateY)
+            }
+            crate::SignalProperty::Rotate | crate::SignalProperty::RotateOverride => {
+                Some(MotionProperty::Rotate)
+            }
+            crate::SignalProperty::ScaleX | crate::SignalProperty::ScaleXOverride => {
+                Some(MotionProperty::ScaleX)
+            }
+            crate::SignalProperty::ScaleY | crate::SignalProperty::ScaleYOverride => {
+                Some(MotionProperty::ScaleY)
+            }
             crate::SignalProperty::Width | crate::SignalProperty::WidthOverride => {
                 Some(MotionProperty::Width)
             }
-            crate::SignalProperty::Height => Some(MotionProperty::Height),
+            crate::SignalProperty::Height | crate::SignalProperty::HeightOverride => {
+                Some(MotionProperty::Height)
+            }
             crate::SignalProperty::Background
             | crate::SignalProperty::TextColor
             | crate::SignalProperty::BorderColor => None,
@@ -3322,6 +3592,38 @@ fn validate_node_property(
     } else {
         Ok(())
     }
+}
+
+/// Whether a commit's motion phase reads anything of `node` beyond its
+/// place in the tree: a motion, timeline or progress binding, a layout,
+/// shared-layout or other motion attribute, a native signal binding (which
+/// claims its property), a keyed or animated span, or a collection whose
+/// realized items do not each have a key of their own. A tree with none of
+/// them declares no motion, and validates as one.
+pub(crate) fn node_takes_motion(node: &UiNode) -> bool {
+    !node.motions().is_empty()
+        || !node.exit_motions().is_empty()
+        || !node.progress_motions().is_empty()
+        || !node.timelines().is_empty()
+        || node.signal_bindings().next().is_some()
+        || node.attributes().keys().any(|key| {
+            key.starts_with("motion")
+                || key.starts_with("layout_motion")
+                || key.starts_with("shared_layout")
+        })
+        || match node.kind() {
+            UiNodeKind::RichText { spans, .. } => spans
+                .iter()
+                .any(|span| span.key().is_some() || !span.motions().is_empty()),
+            UiNodeKind::VirtualCollection { spec } => {
+                let mut keys = BTreeSet::new();
+                !spec.realized.keys().all(|index| {
+                    crate::virtual_list_element::collection_item_key(spec, *index)
+                        .is_some_and(|key| keys.insert(key))
+                })
+            }
+            _ => false,
+        }
 }
 
 pub(crate) fn child_path(path: &str, index: usize, child: &UiNode) -> String {
@@ -3647,6 +3949,7 @@ pub(crate) fn register_motion_api(engine: &mut Engine) {
     FuncRegistration::new("motion_inertia")
         .in_global_namespace()
         .register_into_engine(engine, motion_inertia_from_script);
+    register_mixed_number_motion_api(engine);
     FuncRegistration::new("motion_path_follow")
         .in_global_namespace()
         .register_into_engine(engine, motion_path_follow_from_script);
@@ -3665,6 +3968,28 @@ pub(crate) fn register_motion_api(engine: &mut Engine) {
     FuncRegistration::new("motion_scroll")
         .in_global_namespace()
         .register_into_engine(engine, motion_scroll_from_script);
+    FuncRegistration::new("motion_signal")
+        .in_global_namespace()
+        .register_into_engine(
+            engine,
+            |signal: crate::NativeSignal, states: Array, source: MotionSource| {
+                let states = states
+                    .into_iter()
+                    .map(|value| {
+                        value
+                            .try_cast::<ImmutableString>()
+                            .map(|value| value.to_string())
+                            .ok_or_else(|| {
+                                script_boxed_error(MotionError::InvalidProgressSource(
+                                    "motion_signal states must be strings".to_owned(),
+                                ))
+                            })
+                    })
+                    .collect::<Result<BTreeSet<_>, _>>()?;
+                MotionProgressBinding::from_signal(signal, states, source)
+                    .map_err(script_boxed_error)
+            },
+        );
     for (name, driver) in [
         ("motion_hover", MotionProgressDriver::Hover),
         ("motion_press", MotionProgressDriver::Press),
@@ -3702,6 +4027,93 @@ pub(crate) fn register_motion_api(engine: &mut Engine) {
     FuncRegistration::new("motion_timeline")
         .in_global_namespace()
         .register_into_engine(engine, motion_timeline_from_script);
+}
+
+/// Overloads that take `from`, `to` and `velocity` as an integer or a float,
+/// so `motion_transition("opacity", 0, 1, #{})` works; an all-float call still
+/// resolves to the typed function.
+fn register_mixed_number_motion_api(engine: &mut Engine) {
+    // `easing: cubic_bezier(0.2, 0.0, 0.0, 1.0)`: the validated curve in the
+    // string spelling every `easing` field and theme token accepts.
+    FuncRegistration::new("cubic_bezier")
+        .in_global_namespace()
+        .register_into_engine(
+            engine,
+            |x1: Dynamic,
+             y1: Dynamic,
+             x2: Dynamic,
+             y2: Dynamic|
+             -> Result<ImmutableString, Box<EvalAltResult>> {
+                MotionEasing::cubic_bezier(
+                    motion_number("x1", &x1)?,
+                    motion_number("y1", &y1)?,
+                    motion_number("x2", &x2)?,
+                    motion_number("y2", &y2)?,
+                )
+                .map(|easing| easing.to_string().into())
+                .map_err(script_boxed_error)
+            },
+        );
+    FuncRegistration::new("motion_transition")
+        .in_global_namespace()
+        .register_into_engine(
+            engine,
+            |property: &str,
+             from: Dynamic,
+             to: Dynamic,
+             config: Map|
+             -> Result<MotionSource, Box<EvalAltResult>> {
+                motion_transition_from_script(
+                    property,
+                    motion_number("from", &from)?,
+                    motion_number("to", &to)?,
+                    config,
+                )
+            },
+        );
+    FuncRegistration::new("motion_spring")
+        .in_global_namespace()
+        .register_into_engine(
+            engine,
+            |property: &str,
+             from: Dynamic,
+             to: Dynamic,
+             config: Map|
+             -> Result<MotionSource, Box<EvalAltResult>> {
+                motion_spring_from_script(
+                    property,
+                    motion_number("from", &from)?,
+                    motion_number("to", &to)?,
+                    config,
+                )
+            },
+        );
+    FuncRegistration::new("motion_inertia")
+        .in_global_namespace()
+        .register_into_engine(
+            engine,
+            |property: &str,
+             from: Dynamic,
+             velocity: Dynamic,
+             config: Map|
+             -> Result<MotionSource, Box<EvalAltResult>> {
+                motion_inertia_from_script(
+                    property,
+                    motion_number("from", &from)?,
+                    motion_number("velocity", &velocity)?,
+                    config,
+                )
+            },
+        );
+}
+
+fn motion_number(name: &str, value: &Dynamic) -> Result<f64, Box<EvalAltResult>> {
+    crate::value::script_number(value).ok_or_else(|| {
+        script_boxed_error(format!(
+            "motion `{name}` must be a number, got {}",
+            value.type_name()
+        ))
+    })
 }
 
 fn motion_text_spans_from_script(text: &str, mut config: Map) -> Result<Array, Box<EvalAltResult>> {
@@ -3882,8 +4294,9 @@ fn take_callback(
     })?;
     let mut callback = ScriptCallback::try_from_fn_ptr(function, ScriptGeneration::default())
         .map_err(script_boxed_error)?;
-    callback
-        .bind_native_context_if_unset(crate::invocation::ScriptInvocationContext::capture(call));
+    callback.bind_native_context_if_unset(
+        crate::invocation::ScriptInvocationContext::capture_retained(call),
+    );
     Ok(Some(callback))
 }
 
@@ -4204,6 +4617,58 @@ mod tests {
         ComponentInstancePath::root("Accordion", "settings")
     }
 
+    #[test]
+    fn overlapping_suspension_reasons_preserve_transition_and_timeline_active_time() {
+        for timeline in [false, true] {
+            for remove_parent_first in [false, true] {
+                let start = Instant::now();
+                let mut runtime = MotionRuntime::new(MotionPreference::Normal);
+                let path = "window:w/root/card";
+                let scope = ComponentInstancePath::root("UiNode", path);
+                let source = transition(MotionProperty::Opacity, 0.0, 1.0, 1_000);
+                if timeline {
+                    runtime
+                        .start_timeline(
+                            scope,
+                            MotionTimeline::new(
+                                "probe",
+                                MotionTimelineStep::Track(MotionTrack {
+                                    target: ".".to_owned(),
+                                    source,
+                                }),
+                            ),
+                            start,
+                        )
+                        .unwrap();
+                } else {
+                    runtime.start(scope, source, start).unwrap();
+                }
+                let key = MotionKey::for_node(path, MotionProperty::Opacity);
+                runtime.suspend_node_scope(path, start + Duration::from_millis(250));
+                runtime.suspend_node_scope("window:w/root", start + Duration::from_millis(500));
+                let (first, last) = if remove_parent_first {
+                    ("window:w/root", path)
+                } else {
+                    (path, "window:w/root")
+                };
+                runtime.resume_node_scope(first, start + Duration::from_secs(1));
+                let frame = runtime.tick(start + Duration::from_secs(2));
+                assert!(!frame.needs_frame);
+                assert!(
+                    (frame.values[&key] - 0.25).abs() < 0.001,
+                    "timeline={timeline}, parent-first={remove_parent_first}: first removal must remain frozen"
+                );
+                runtime.resume_node_scope(last, start + Duration::from_secs(3));
+                let frame = runtime.tick(start + Duration::from_millis(3_100));
+                assert!(frame.needs_frame);
+                assert!(
+                    (frame.values[&key] - 0.35).abs() < 0.001,
+                    "timeline={timeline}, parent-first={remove_parent_first}: resume excludes every hidden interval"
+                );
+            }
+        }
+    }
+
     fn transition(property: MotionProperty, from: f64, to: f64, duration_ms: u64) -> MotionSource {
         let mut spec = MotionTransition::new(property, from, to, duration_ms);
         spec.easing = MotionEasing::Linear;
@@ -4221,6 +4686,153 @@ mod tests {
         };
         spec.iterations = None;
         MotionSource::Transition(spec)
+    }
+
+    #[test]
+    fn cubic_bezier_easing_parses_displays_and_rejects_bad_curves() {
+        let easing = MotionEasing::parse(" cubic_bezier(0.2, 0, 0, 1.25) ").unwrap();
+        assert_eq!(
+            easing,
+            MotionEasing::CubicBezier {
+                x1: 0.2,
+                y1: 0.0,
+                x2: 0.0,
+                y2: 1.25,
+            }
+        );
+        assert_eq!(easing.to_string(), "cubic_bezier(0.2, 0, 0, 1.25)");
+        assert_eq!(MotionEasing::parse(&easing.to_string()), Ok(easing));
+        assert_eq!(easing.as_str(), "cubic_bezier");
+        assert_eq!(MotionEasing::EaseOut.to_string(), "ease_out");
+        for malformed in [
+            "cubic_bezier(0.2, 0, 0)",
+            "cubic_bezier(a, 0, 0, 1)",
+            "bezier(0, 0, 1, 1)",
+        ] {
+            assert!(
+                matches!(
+                    MotionEasing::parse(malformed),
+                    Err(MotionError::UnknownEasing(_))
+                ),
+                "{malformed}"
+            );
+        }
+        for invalid in [
+            "cubic_bezier(1.5, 0, 0, 1)",
+            "cubic_bezier(0, 0, -0.1, 1)",
+            "cubic_bezier(0, NaN, 0, 1)",
+        ] {
+            assert_eq!(
+                MotionEasing::parse(invalid),
+                Err(MotionError::InvalidSpec),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn cubic_bezier_easing_samples_the_css_curve() {
+        let linear = MotionEasing::cubic_bezier(0.0, 0.0, 1.0, 1.0).unwrap();
+        // CSS's approximation of an ease-out cubic, 1 - (1 - t)^3.
+        let ease_out_cubic = MotionEasing::cubic_bezier(0.33, 1.0, 0.68, 1.0).unwrap();
+        let overshoot = MotionEasing::cubic_bezier(0.34, 1.56, 0.64, 1.0).unwrap();
+        for easing in [linear, ease_out_cubic, overshoot] {
+            assert!(easing.sample(0.0).abs() < 1e-6);
+            assert!((easing.sample(1.0) - 1.0).abs() < 1e-6);
+        }
+        for step in 0..=20 {
+            let t = f64::from(step) / 20.0;
+            assert!((linear.sample(t) - t).abs() < 1e-5, "linear at {t}");
+            let expected = 1.0 - (1.0 - t).powi(3);
+            assert!(
+                (ease_out_cubic.sample(t) - expected).abs() < 0.02,
+                "ease-out cubic at {t}: {}",
+                ease_out_cubic.sample(t)
+            );
+        }
+        assert!(
+            (0..=20).any(|step| overshoot.sample(f64::from(step) / 20.0) > 1.0),
+            "y beyond 1 overshoots"
+        );
+    }
+
+    #[test]
+    fn cubic_bezier_is_one_easing_spelling_for_scripts_and_themes() {
+        let runtime = crate::RuntimeEngine::new();
+        let spelled = runtime
+            .engine()
+            .eval::<ImmutableString>("cubic_bezier(0.2, 0, 0, 1)")
+            .unwrap();
+        assert_eq!(spelled.as_str(), "cubic_bezier(0.2, 0, 0, 1)");
+        let source = runtime
+            .engine()
+            .eval::<MotionSource>(
+                r#"motion_transition("opacity", 0, 1, #{ easing: cubic_bezier(0.2, 0, 0, 1) })"#,
+            )
+            .unwrap();
+        let MotionSource::Transition(transition) = source else {
+            panic!("unexpected source: {source:?}");
+        };
+        assert_eq!(transition.easing, MotionEasing::parse(&spelled).unwrap());
+        let error = runtime
+            .engine()
+            .eval::<ImmutableString>("cubic_bezier(2, 0, 0, 1)")
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("finite and physically valid"),
+            "{error}"
+        );
+        // Themes decode easing tokens through serde: the same string.
+        let decoded: MotionEasing =
+            rhai::serde::from_dynamic(&Dynamic::from(spelled.clone())).unwrap();
+        assert_eq!(decoded, transition.easing);
+        let named: MotionEasing = rhai::serde::from_dynamic(&Dynamic::from("ease_out")).unwrap();
+        assert_eq!(named, MotionEasing::EaseOut);
+        assert_eq!(
+            rhai::serde::to_dynamic(MotionEasing::EaseInOut)
+                .unwrap()
+                .into_string()
+                .unwrap(),
+            "ease_in_out"
+        );
+    }
+
+    #[test]
+    fn source_constructors_take_integer_and_mixed_numbers() {
+        let runtime = crate::RuntimeEngine::new();
+        let sources = runtime
+            .engine()
+            .eval::<Array>(
+                r#"[
+                    motion_transition("opacity", 0, 1, #{}),
+                    motion_spring("translate_y", 12, 0.5, #{}),
+                    motion_inertia("translate_x", 0.0, 40, #{}),
+                ]"#,
+            )
+            .unwrap()
+            .into_iter()
+            .map(Dynamic::cast::<MotionSource>)
+            .collect::<Vec<_>>();
+        let [
+            MotionSource::Transition(transition),
+            MotionSource::Spring(spring),
+            MotionSource::Inertia(inertia),
+        ] = sources.as_slice()
+        else {
+            panic!("unexpected sources: {sources:?}");
+        };
+        assert!((transition.to - 1.0).abs() < f64::EPSILON);
+        assert!((spring.from - 12.0).abs() < f64::EPSILON);
+        assert!((spring.to - 0.5).abs() < f64::EPSILON);
+        assert!((inertia.velocity - 40.0).abs() < f64::EPSILON);
+        let error = runtime
+            .engine()
+            .eval::<MotionSource>(r#"motion_transition("opacity", "0", 1, #{})"#)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("motion `from` must be a number"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -4843,8 +5455,8 @@ mod tests {
             assert!((velocity - expected_velocity).abs() < 1.0e-9);
         }
         let before_cap = sample_inertia_at(&spec, Duration::from_millis(9_999)).0;
-        let at_cap = sample_inertia_at(&spec, Duration::from_millis(10_000)).0;
-        let after_cap = sample_inertia_at(&spec, Duration::from_millis(11_000)).0;
+        let at_cap = sample_inertia_at(&spec, Duration::from_secs(10)).0;
+        let after_cap = sample_inertia_at(&spec, Duration::from_secs(11)).0;
         assert!((at_cap - before_cap).abs() < 0.1);
         assert!((after_cap - at_cap).abs() < f64::EPSILON);
     }
@@ -4952,7 +5564,10 @@ mod tests {
             1
         );
         runtime.discard_timeline_events_in_scope("window:b");
-        assert!(runtime.drain_timeline_events().is_empty());
+        assert_eq!(
+            runtime.drain_timeline_events(),
+            [] as [crate::motion::MotionTimelineEvent; 0]
+        );
     }
 
     #[test]

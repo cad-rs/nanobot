@@ -14,6 +14,8 @@ use std::fmt;
 
 use nanobot_gpu::ViewportSlot;
 
+use crate::transcript::{Conversation, TurnPhase};
+
 /// Identity of a project — stable across renames and moves.
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct ProjectId(String);
@@ -66,27 +68,55 @@ impl From<&str> for SessionId {
     }
 }
 
-/// Lifecycle status of a session.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// Where a session stands, as its product reports it.
+///
+/// "Being looked at" is not a status — that is the shell's selection — and
+/// neither is "finished but not yet seen", which only the shell can know; see
+/// [`SessionBadge`](crate::transcript::SessionBadge) for the mark the sidebar
+/// makes of the two together. Archiving is a separate flag
+/// ([`SessionView::archived`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
 pub enum SessionStatus {
-    /// The session the workspace currently shows.
-    Active,
-    /// Background session still executing.
+    /// Nothing running, nothing wanted from the user.
+    #[default]
+    Idle,
+    /// A turn is in progress.
     Running,
-    /// Waiting for the user's review — the decision bar belongs here.
-    AwaitingReview,
-    Archived,
+    /// Stopped until the user answers: an approval, a question, a plan to
+    /// decide.
+    AwaitingUser,
+    /// The last turn ended in an error.
+    Error,
 }
 
 impl SessionStatus {
-    pub fn label(self) -> &'static str {
+    pub fn label(self, locale: crate::i18n::Locale) -> &'static str {
         match self {
-            SessionStatus::Active => "活动",
-            SessionStatus::Running => "运行中",
-            SessionStatus::AwaitingReview => "等待审查",
-            SessionStatus::Archived => "已归档",
+            SessionStatus::Idle => crate::i18n::t(locale, "status.idle"),
+            SessionStatus::Running => crate::i18n::t(locale, "status.running"),
+            SessionStatus::AwaitingUser => crate::i18n::t(locale, "status.awaiting_user"),
+            SessionStatus::Error => crate::i18n::t(locale, "status.error"),
         }
     }
+}
+
+/// The container's session status as the shell's. The container's `Archived`
+/// is not a status here: read it with [`is_archived`] into
+/// [`SessionView::archived`].
+impl From<nanobot_boot::container::SessionStatus> for SessionStatus {
+    fn from(status: nanobot_boot::container::SessionStatus) -> Self {
+        match status {
+            nanobot_boot::container::SessionStatus::Running => Self::Running,
+            nanobot_boot::container::SessionStatus::AwaitingReview => Self::AwaitingUser,
+            nanobot_boot::container::SessionStatus::Active
+            | nanobot_boot::container::SessionStatus::Archived => Self::Idle,
+        }
+    }
+}
+
+/// Whether the container marks a session archived.
+pub fn is_archived(status: nanobot_boot::container::SessionStatus) -> bool {
+    status == nanobot_boot::container::SessionStatus::Archived
 }
 
 /// One step of a session's plan.
@@ -104,11 +134,11 @@ pub enum StepStatus {
 }
 
 impl StepStatus {
-    pub fn label(self) -> &'static str {
+    pub fn label(self, locale: crate::i18n::Locale) -> &'static str {
         match self {
-            StepStatus::Pending => "待办",
-            StepStatus::InProgress => "进行中",
-            StepStatus::Done => "完成",
+            StepStatus::Pending => crate::i18n::t(locale, "step.pending"),
+            StepStatus::InProgress => crate::i18n::t(locale, "step.in_progress"),
+            StepStatus::Done => crate::i18n::t(locale, "step.done"),
         }
     }
 }
@@ -141,16 +171,16 @@ impl PlanPhase {
         matches!(self, PlanPhase::Contingent | PlanPhase::Clarify)
     }
 
-    pub fn label(self) -> &'static str {
+    pub fn label(self, locale: crate::i18n::Locale) -> &'static str {
         match self {
-            PlanPhase::None => "无",
-            PlanPhase::Proposed => "已提议",
-            PlanPhase::Executing => "执行中",
-            PlanPhase::Verifying => "验证中",
-            PlanPhase::Settled => "已接受",
-            PlanPhase::Contingent => "待审查",
-            PlanPhase::Rejected => "已回滚",
-            PlanPhase::Clarify => "待补充",
+            PlanPhase::None => crate::i18n::t(locale, "plan.none"),
+            PlanPhase::Proposed => crate::i18n::t(locale, "plan.proposed"),
+            PlanPhase::Executing => crate::i18n::t(locale, "plan.executing"),
+            PlanPhase::Verifying => crate::i18n::t(locale, "plan.verifying"),
+            PlanPhase::Settled => crate::i18n::t(locale, "plan.settled"),
+            PlanPhase::Contingent => crate::i18n::t(locale, "plan.contingent"),
+            PlanPhase::Rejected => crate::i18n::t(locale, "plan.rejected"),
+            PlanPhase::Clarify => crate::i18n::t(locale, "plan.clarify"),
         }
     }
 }
@@ -164,122 +194,6 @@ pub enum PlanDecision {
     Reject,
     /// Send the plan back for revision.
     Modify,
-}
-
-/// The kind of a conversation block.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum BlockKind {
-    User,
-    Assistant,
-    Tool,
-    Plan,
-    Check,
-}
-
-impl BlockKind {
-    pub fn label(self) -> &'static str {
-        match self {
-            BlockKind::User => "你",
-            BlockKind::Assistant => "AI",
-            BlockKind::Tool => "工具",
-            BlockKind::Plan => "计划",
-            BlockKind::Check => "检查",
-        }
-    }
-}
-
-/// Execution state of a tool block.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ToolState {
-    Running,
-    Done,
-    Failed,
-}
-
-impl ToolState {
-    pub fn label(self) -> &'static str {
-        match self {
-            ToolState::Running => "运行中",
-            ToolState::Done => "完成",
-            ToolState::Failed => "失败",
-        }
-    }
-}
-
-/// One block of the conversation stream, anchored to an event sequence.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Block {
-    pub kind: BlockKind,
-    pub text: String,
-    pub event_seq: u64,
-    pub tool_state: Option<ToolState>,
-    /// Optional spatial anchor (a selection reference) rendered as a chip.
-    pub selection_ref: Option<String>,
-}
-
-impl Block {
-    pub fn new(kind: BlockKind, event_seq: u64, text: impl Into<String>) -> Self {
-        Self {
-            kind,
-            text: text.into(),
-            event_seq,
-            tool_state: None,
-            selection_ref: None,
-        }
-    }
-
-    pub fn user(event_seq: u64, text: impl Into<String>) -> Self {
-        Self::new(BlockKind::User, event_seq, text)
-    }
-
-    pub fn assistant(event_seq: u64, text: impl Into<String>) -> Self {
-        Self::new(BlockKind::Assistant, event_seq, text)
-    }
-
-    pub fn tool(event_seq: u64, text: impl Into<String>, state: ToolState) -> Self {
-        Self::new(BlockKind::Tool, event_seq, text).with_tool_state(state)
-    }
-
-    pub fn plan(event_seq: u64, text: impl Into<String>) -> Self {
-        Self::new(BlockKind::Plan, event_seq, text)
-    }
-
-    pub fn check(event_seq: u64, text: impl Into<String>) -> Self {
-        Self::new(BlockKind::Check, event_seq, text)
-    }
-
-    pub fn with_tool_state(mut self, state: ToolState) -> Self {
-        self.tool_state = Some(state);
-        self
-    }
-
-    pub fn with_selection(mut self, selection_ref: impl Into<String>) -> Self {
-        self.selection_ref = Some(selection_ref.into());
-        self
-    }
-}
-
-/// The conversation stream of a session.
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
-pub struct Conversation {
-    pub blocks: Vec<Block>,
-}
-
-impl Conversation {
-    pub fn from_blocks(blocks: Vec<Block>) -> Self {
-        Self { blocks }
-    }
-
-    pub fn last_seq(&self) -> u64 {
-        self.blocks.last().map(|b| b.event_seq).unwrap_or(0)
-    }
-
-    /// Blocks must anchor to strictly increasing event sequences.
-    pub fn anchors_are_monotonic(&self) -> bool {
-        self.blocks
-            .windows(2)
-            .all(|pair| pair[0].event_seq < pair[1].event_seq)
-    }
 }
 
 /// Fork relationship to a parent session.
@@ -312,6 +226,32 @@ pub trait WorkspaceView: Clone + 'static {
     fn settlement_items(&self) -> Vec<(String, bool)> {
         Vec::new()
     }
+    /// The model the session runs on, as the line under the composer names it.
+    fn model_label(&self) -> Option<String> {
+        None
+    }
+    /// The share of the context window in use, 0 to 1, when the product knows.
+    fn context_usage(&self) -> Option<f32> {
+        None
+    }
+    /// Whether the product can put its own state back as it was at an earlier
+    /// message. Without it a rewind offers only the conversation and a fork.
+    fn can_restore_state(&self) -> bool {
+        false
+    }
+    /// Where the turn stands. A product whose agent reports its own phase
+    /// overrides this; the default reads it off the plan phase and the status,
+    /// which cannot tell a pending approval from a pending question.
+    fn turn_phase(&self) -> TurnPhase {
+        match (self.plan_phase(), self.status()) {
+            (PlanPhase::Clarify, _) => TurnPhase::AwaitingClarification,
+            (PlanPhase::Contingent, _) => TurnPhase::AwaitingDecision,
+            (_, SessionStatus::Running) => TurnPhase::Generating,
+            (_, SessionStatus::AwaitingUser) => TurnPhase::AwaitingApproval,
+            (_, SessionStatus::Error) => TurnPhase::Error,
+            (_, SessionStatus::Idle) => TurnPhase::Idle,
+        }
+    }
 }
 
 /// A session as the shell sees it. The product implements this over its own
@@ -333,11 +273,92 @@ pub trait SessionView: Clone + 'static {
     fn plan_phase(&self) -> PlanPhase;
     fn clarify_questions(&self) -> Vec<String>;
     fn branch_marker(&self) -> Option<BranchMarker>;
+    /// When the session was last active, in ms since the unix epoch: what the
+    /// sidebar orders by and shows as an age. `None` when the product does
+    /// not track it.
+    fn last_active_ms(&self) -> Option<u64> {
+        None
+    }
+    /// Whether the session is archived: kept, but out of the sidebar's list.
+    fn archived(&self) -> bool {
+        false
+    }
 
     /// Builds the whole workspace for this session, owning a fresh viewport
     /// handle. Called on every activation, so switching back and forth gives
     /// each session its own viewport state.
     fn build_workspace(&self, viewport: <Self::Viewport as ViewportSlot>::Handle) -> Self::Workspace;
+}
+
+/// One sidebar group of a product-supplied projection.
+#[derive(Clone, Debug)]
+pub struct SidebarGroup {
+    /// The group's heading, rendered when a projection is active.
+    pub label: String,
+    /// The sessions in the group, in render order.
+    pub sessions: Vec<SessionId>,
+}
+
+impl SidebarGroup {
+    pub fn new(label: impl Into<String>, sessions: Vec<SessionId>) -> Self {
+        Self {
+            label: label.into(),
+            sessions,
+        }
+    }
+}
+
+/// An alternative sidebar arrangement ("one sidebar, two roots" — the design
+/// harness's design-rooted vs session-rooted view of the same project graph).
+///
+/// The product owns grouping and labels; the framework owns rendering and
+/// selection (a click still switches sessions, and sessions the projection
+/// never named stay reachable under a trailing group — a projection is a
+/// view, not a strainer). `resolve_sidebar_groups` is the contract: one flat
+/// group when no projection is set, the product's groups otherwise.
+pub trait SidebarProjection<S: SessionView> {
+    fn groups(&self, store: &SessionStore<S>) -> Vec<SidebarGroup>;
+}
+
+/// The sidebar's groups: the projection's when one is supplied, otherwise one
+/// flat group of the open project's sessions in order (the default view).
+pub fn resolve_sidebar_groups<S: SessionView>(
+    store: &SessionStore<S>,
+    projection: Option<&dyn SidebarProjection<S>>,
+) -> Vec<(String, Vec<S>)> {
+    // Archived sessions are kept, but not listed.
+    let sessions: Vec<S> = store
+        .open_project_sessions()
+        .iter()
+        .filter(|session| !session.archived())
+        .cloned()
+        .collect();
+    let Some(projection) = projection else {
+        return vec![(store.open_project().name.clone(), sessions)];
+    };
+    let mut groups: Vec<(String, Vec<S>)> = Vec::new();
+    let mut listed: Vec<SessionId> = Vec::new();
+    for group in projection.groups(store) {
+        let members: Vec<S> = group
+            .sessions
+            .iter()
+            .filter_map(|id| store.session(id).cloned())
+            .filter(|session| !session.archived())
+            .collect();
+        if members.is_empty() {
+            continue;
+        }
+        listed.extend(members.iter().map(|s| s.id().clone()));
+        groups.push((group.label, members));
+    }
+    let rest: Vec<S> = sessions
+        .into_iter()
+        .filter(|s| !listed.contains(s.id()))
+        .collect();
+    if !rest.is_empty() {
+        groups.push((String::from("\u{5176}\u{4ed6}"), rest));
+    }
+    groups
 }
 
 /// One project: the unit that groups sessions.
@@ -438,5 +459,51 @@ impl<S: SessionView> SessionStore<S> {
         };
         *existing = session;
         true
+    }
+
+    /// Build the store from a boot container's manifest: one project, its
+    /// session index loaded through `loader`.
+    ///
+    /// The bridge a product shell needs on startup: the framework owns the
+    /// manifest, the paths and the session index (the container); the product
+    /// knows how to turn one [`nanobot_boot::container::SessionEntry`] plus
+    /// the project paths into its own session (usually by loading that
+    /// session's event log under `paths`). Entry order is the index's; the
+    /// index's active session, when present, becomes the project's session
+    /// index. A project with an empty index still opens — the shell shows it
+    /// empty.
+    pub fn from_manifest<M, F>(
+        manifest: &M,
+        paths: &nanobot_boot::container::ProjectPaths,
+        loader: F,
+    ) -> Self
+    where
+        M: nanobot_boot::container::Manifest,
+        F: Fn(&nanobot_boot::container::SessionEntry, &nanobot_boot::container::ProjectPaths) -> S,
+    {
+        let info = manifest.project_info();
+        let index = manifest.sessions();
+        let sessions: Vec<S> = index
+            .entries
+            .iter()
+            .map(|entry| loader(entry, paths))
+            .collect();
+        let session_index = index.active.as_ref().and_then(|id| {
+            let want = SessionId::new(id.clone());
+            sessions
+                .iter()
+                .find(|session| session.id() == &want)
+                .map(|_| want)
+        });
+        let project_id = ProjectId::new(info.uuid.clone());
+        Self::new(
+            vec![Project {
+                id: project_id.clone(),
+                name: info.name.clone(),
+                sessions,
+                session_index,
+            }],
+            project_id,
+        )
     }
 }

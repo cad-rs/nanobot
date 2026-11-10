@@ -9,7 +9,7 @@
 //! domain word.
 //!
 //! ```text
-//! header (identity · undo/redo · file ops · status)
+//! header (identity · undo/redo · file ops)
 //! ┌──────────┬───────────────────────┬──────────┬──────────┐
 //! │ session  │ session workspace     │ viewport │ right    │
 //! │ list     │ conversation + plan   │ (product │ dock     │
@@ -18,32 +18,183 @@
 //! ```
 
 use std::cell::{Ref, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use gpui::{
-    div, img, prelude::*, px, AnyElement, App, ColorExt as _, Context, Div, Entity, Hsla, Stateful,
+    Focusable as _,
+    actions, FocusHandle, KeyBinding, MouseMoveEvent, MouseUpEvent,
+    div, prelude::*, px, AnyElement, App, Context, Div, Entity, Hsla, Stateful,
     IntoElement,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render, ScrollDelta,
-    ScrollWheelEvent, Subscription, Window,
+    MouseButton, MouseDownEvent, Render, Subscription, Window,
 };
 use gpui_component::{
-    input::{Input, InputEvent, InputState},
+    input::{InputEvent, InputState, TextareaState},
     ActiveTheme as _, StyledExt as _,
 };
-use nanobot_gpu::{ViewportInput, ViewportProjection, ViewportSlot};
+use nanobot_boot::account::Account;
+use nanobot_boot::Settings;
+use nanobot_gpu::{ViewportProjection, ViewportSlot};
 
 use crate::model::{
-    plan_progress, Block, BlockKind, PlanDecision, PlanPhase, PlanStep, ProjectId,
-    SessionId, SessionStatus, SessionStore, SessionView, StepStatus, ToolState, WorkspaceView,
+    PlanDecision, ProjectId,
+    SessionId, SessionStatus, SessionStore, SessionView, WorkspaceView,
 };
 use crate::panels::{PanelArea, PanelDef, PanelHost};
+use crate::commands::{Candidate, Command, RewindMode};
+use crate::composer::{ApprovalDecision, Delivery, MessageQueue, PermissionMode};
+use crate::palette::{Completion, PaletteState};
+use crate::sidebar::Renaming;
+use crate::i18n::Locale;
+use crate::icons::{self, sized, Icon};
+use crate::layout::{Divider, Fold, Layout, LayoutState, Stacked};
+use crate::stream::StreamState;
+use crate::theme::ThemeKind;
+use crate::transcript::{Conversation, SessionBadge, Transcript, TurnPhase};
 
-/// Pane widths: the workspace is the primary surface (flex), the viewport is the
-/// secondary panel, and the dock hosts the auxiliary panels.
-const SIDEBAR_W: f32 = 240.0;
-const VIEWPORT_W: f32 = 520.0;
-const DOCK_W: f32 = 280.0;
+
+/// A divider drag in progress: which divider, where the pointer was when it
+/// began, and how wide the divider's region was then.
+#[derive(Clone, Copy, Debug)]
+struct DividerDrag {
+    divider: Divider,
+    start_x: f32,
+    start_width: f32,
+}
+
+/// Height of the session column's toolbar.
+const TOOLBAR_H: f32 = 36.0;
+/// Width of the strip a divider is grabbed by.
+const DIVIDER_W: f32 = 5.0;
+
+actions!(
+    nanobot_ui,
+    [
+        /// Shows or hides the session sidebar.
+        ToggleSidebar,
+        /// Shows or hides the right dock.
+        ToggleDock,
+        /// Turns the permission dial one step.
+        CyclePermissionMode,
+        /// Stops the turn in progress.
+        StopTurn,
+        /// Opens the command palette.
+        OpenPalette,
+        /// Opens the settings dialog.
+        OpenSettings,
+        /// Starts a new session.
+        NewSession,
+        /// Goes to the next session in the sidebar.
+        NextSession,
+        /// Goes to the previous session in the sidebar.
+        PreviousSession,
+        /// Scrolls the conversation to its end and follows it.
+        JumpToEnd,
+        ToggleTools,
+        PreviousUserMessage,
+        NextUserMessage,
+        /// Puts the keyboard in the composer.
+        FocusComposer,
+        /// Moves up in the palette.
+        PaletteUp,
+        /// Moves down in the palette.
+        PaletteDown,
+        /// Closes the palette.
+        PaletteClose,
+        /// Puts the keyboard in the sidebar.
+        FocusSidebar,
+        /// Moves up in the sidebar.
+        SidebarUp,
+        /// Moves down in the sidebar.
+        SidebarDown,
+        /// Opens the session, or folds or unfolds the heading, the keyboard is on.
+        SidebarOpen,
+        /// Folds the heading the keyboard is on.
+        SidebarFold,
+        /// Unfolds the heading the keyboard is on.
+        SidebarUnfold,
+        /// Renames the session the keyboard is on.
+        SidebarRename,
+        /// Archives the session the keyboard is on.
+        SidebarArchive,
+        /// Puts the keyboard in the sidebar's filter.
+        SidebarFilter,
+    ]
+);
+
+/// The key context the shell's bindings live in.
+pub const KEY_CONTEXT: &str = "HarnessShell";
+/// The key context of the open command palette.
+pub const PALETTE_CONTEXT: &str = "HarnessPalette";
+/// The key context of the session sidebar.
+pub const SIDEBAR_CONTEXT: &str = "HarnessSidebar";
+
+/// Installs the shell's default key bindings. The product calls this once at
+/// startup (after `gpui_component::init`); bindings it adds afterwards win.
+pub fn init(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("ctrl-alt-j", ToggleSidebar, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-alt-b", ToggleDock, Some(KEY_CONTEXT)),
+        KeyBinding::new("shift-tab", CyclePermissionMode, Some(KEY_CONTEXT)),
+        KeyBinding::new("escape", StopTurn, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-k", OpenPalette, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-,", OpenSettings, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-n", NewSession, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-tab", NextSession, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-shift-tab", PreviousSession, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-end", JumpToEnd, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-o", ToggleTools, Some(KEY_CONTEXT)),
+        KeyBinding::new("shift-pageup", PreviousUserMessage, Some(KEY_CONTEXT)),
+        KeyBinding::new("shift-pagedown", NextUserMessage, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-l", FocusComposer, Some(KEY_CONTEXT)),
+        KeyBinding::new("up", PaletteUp, Some(PALETTE_CONTEXT)),
+        KeyBinding::new("down", PaletteDown, Some(PALETTE_CONTEXT)),
+        KeyBinding::new("escape", PaletteClose, Some(PALETTE_CONTEXT)),
+        KeyBinding::new("ctrl-alt-;", FocusSidebar, Some(KEY_CONTEXT)),
+        KeyBinding::new("up", SidebarUp, Some(SIDEBAR_CONTEXT)),
+        KeyBinding::new("down", SidebarDown, Some(SIDEBAR_CONTEXT)),
+        KeyBinding::new("enter", SidebarOpen, Some(SIDEBAR_CONTEXT)),
+        KeyBinding::new("left", SidebarFold, Some(SIDEBAR_CONTEXT)),
+        KeyBinding::new("right", SidebarUnfold, Some(SIDEBAR_CONTEXT)),
+        KeyBinding::new("f2", SidebarRename, Some(SIDEBAR_CONTEXT)),
+        KeyBinding::new("shift-backspace", SidebarArchive, Some(SIDEBAR_CONTEXT)),
+        KeyBinding::new("ctrl-f", SidebarFilter, Some(SIDEBAR_CONTEXT)),
+    ]);
+}
+
+/// A shell callback keyed by session (activate, stop, undo, redo, save, load,
+/// import, archive, fork and delete all share the shape).
+pub(crate) type SessionCallback = Rc<dyn Fn(&SessionId)>;
+
+/// The composer's submit callback.
+type MessageCallback = Rc<dyn Fn(&SessionId, &str, Delivery)>;
+
+/// The answer to a tool call waiting for approval: the session, the call's
+/// event sequence and the decision.
+type ApprovalCallback = Rc<dyn Fn(&SessionId, u64, ApprovalDecision)>;
+
+/// Told when the user turns the permission dial.
+type PermissionModeCallback = Rc<dyn Fn(PermissionMode)>;
+
+/// A command of the product's in the palette, with what running it does.
+type ProductCommand = (Command, Rc<dyn Fn()>);
+
+/// Where the composer's candidates come from: the sigil and the query in.
+type CompletionSource = Rc<dyn Fn(char, &str) -> Vec<Candidate>>;
+
+/// Told to rewind: the session, the user message's event sequence, how far
+/// back, and what the message says now.
+type RewindCallback = Rc<dyn Fn(&SessionId, u64, RewindMode, &str)>;
+
+/// A session and a text about it: its new title, or the object to show.
+pub(crate) type SessionTextCallback = Rc<dyn Fn(&SessionId, &str)>;
+
+/// Told to try again: the session and the error entry's sequence.
+pub(crate) type RetryCallback = Rc<dyn Fn(&SessionId, u64)>;
+
+/// A contingent-plan decision callback.
+type PlanDecisionCallback = Rc<dyn Fn(&SessionId, PlanDecision)>;
 
 /// The harness shell: the session list plus the active session's workspace.
 pub struct HarnessShell<S: SessionView> {
@@ -59,29 +210,133 @@ pub struct HarnessShell<S: SessionView> {
     product_name: String,
     /// Callback invoked when a session is activated (switched to). The app layer
     /// uses this to bind an agent to the session.
-    on_session_activated: Option<Rc<RefCell<dyn Fn(&SessionId)>>>,
+    on_session_activated: Option<SessionCallback>,
     /// The message composer. `None` in headless mode, where no window exists to
     /// host the input entity.
-    composer: Option<Entity<InputState>>,
+    pub(crate) composer: Option<Entity<TextareaState>>,
+    /// Whether the composer holds anything to send: what its button shows.
+    pub(crate) composer_has_text: bool,
     /// Callback invoked when the user submits the composer.
-    on_message_sent: Option<Rc<RefCell<dyn Fn(&SessionId, &str)>>>,
+    pub(crate) on_message_sent: Option<MessageCallback>,
+    /// Callback invoked when the user stops the turn in progress.
+    pub(crate) on_stop: Option<SessionCallback>,
+    /// Callback invoked when the user answers a tool call waiting for approval.
+    pub(crate) on_approval: Option<ApprovalCallback>,
+    /// Callback invoked when the user turns the permission dial.
+    pub(crate) on_permission_mode: Option<PermissionModeCallback>,
+    /// How much the agent may do unasked.
+    pub(crate) permission_mode: PermissionMode,
+    /// The shell's own "reduce motion" switch (`ui.reduce_motion`).
+    pub(crate) reduce_motion: bool,
+    /// Messages held until a session's turn ends, per session.
+    pub(crate) queues: HashMap<SessionId, MessageQueue>,
+    /// What is unfolded in the activity bar.
+    pub(crate) plan_open: bool,
+    pub(crate) queue_open: bool,
+    /// "Always allow" was pressed and is asking how far it should reach.
+    pub(crate) always_scope_open: bool,
+    /// The command palette, while it is open.
+    pub(crate) palette: Option<PaletteState>,
+    pub(crate) product_commands: Vec<ProductCommand>,
+    pub(crate) on_new_session: Option<Rc<dyn Fn()>>,
+    /// A command asked for the theme to flip; done where a window is to hand.
+    /// The composer's candidate list and where its rows come from.
+    pub(crate) completion_source: Option<CompletionSource>,
+    pub(crate) completion: Option<Completion>,
+    /// The user message being rewound to, by its event sequence.
+    pub(crate) rewinding: Option<u64>,
+    pub(crate) on_rewind: Option<RewindCallback>,
+    /// The sidebar: which projects show their sessions, which show their
+    /// long-idle ones, what is typed in the filter and where the keyboard is.
+    pub(crate) expanded_projects: HashSet<ProjectId>,
+    pub(crate) earlier_expanded: HashSet<ProjectId>,
+    pub(crate) sidebar_query: String,
+    pub(crate) sidebar_filter: Option<Entity<InputState>>,
+    _sidebar_filter_sub: Option<Subscription>,
+    pub(crate) sidebar_selected: Option<usize>,
+    pub(crate) sidebar_focus: Option<FocusHandle>,
+    pub(crate) renaming: Option<Renaming>,
+    pub(crate) on_rename: Option<SessionTextCallback>,
+    pub(crate) on_archive: Option<SessionCallback>,
+    pub(crate) on_fork: Option<SessionCallback>,
+    /// Told to try again after the error entry at this sequence.
+    pub(crate) on_retry: Option<RetryCallback>,
+    /// Told to show the object an entry is about.
+    pub(crate) on_anchor: Option<SessionTextCallback>,
+    pub(crate) on_delete: Option<SessionCallback>,
+    pub(crate) session_menu: Option<crate::session_menu::SessionMenu>,
+    /// Whether the settings dialog is open.
+    pub(crate) settings_open: bool,
     /// Callback invoked when the user decides a contingent plan.
-    on_plan_decision: Option<Rc<RefCell<dyn Fn(&SessionId, PlanDecision)>>>,
+    pub(crate) on_plan_decision: Option<PlanDecisionCallback>,
     /// Undo/redo and container save/load/import: the app layer forwards them to
     /// its engine dispatch table.
-    on_undo: Option<Rc<RefCell<dyn Fn(&SessionId)>>>,
-    on_redo: Option<Rc<RefCell<dyn Fn(&SessionId)>>>,
-    on_save: Option<Rc<RefCell<dyn Fn(&SessionId)>>>,
-    on_load: Option<Rc<RefCell<dyn Fn(&SessionId)>>>,
-    on_import: Option<Rc<RefCell<dyn Fn(&SessionId)>>>,
+    on_undo: Option<SessionCallback>,
+    on_redo: Option<SessionCallback>,
+    /// An optional product projection of the sidebar (design-rooted groups
+    /// instead of the flat session list). `None` = the default view.
+    pub(crate) sidebar_projection: Option<Rc<dyn crate::model::SidebarProjection<S>>>,
+    on_save: Option<SessionCallback>,
+    on_load: Option<SessionCallback>,
+    on_import: Option<SessionCallback>,
     /// Keeps the composer's submit subscription alive.
     _composer_sub: Option<Subscription>,
+    /// Keeps the candidate list's hold on its keys alive.
+    _completion_keys: Option<Subscription>,
     /// The currently selected entity (three-way linking with the conversation).
     selected_entity: Option<String>,
     /// The currently selected conversation block event sequence.
     selected_block: Option<u64>,
     /// Product panels and script-plugin panels.
     panel_host: PanelHost<S>,
+    /// The user settings store, when the app layer shared it. With it, what
+    /// the settings dialog changes persists; without it the changes still
+    /// apply, in memory only.
+    pub(crate) settings: Option<Arc<Mutex<Settings>>>,
+    /// The theme the shell renders in. Tracked so a toggle knows its
+    /// starting point even without a settings store.
+    theme: ThemeKind,
+    /// The identity the account provider reports (`None` = a guest). The
+    /// framework renders the chip; the product's callbacks decide what
+    /// signing in and out mean (its own dialog, a license import) — the
+    /// framework never authenticates.
+    account: Option<Account>,
+    on_sign_in: Option<Rc<dyn Fn()>>,
+    on_sign_out: Option<Rc<dyn Fn()>>,
+    /// The script plugins the app layer loaded, as the plugins panel shows
+    /// them (`None` = the panel is not registered). Enabled state is
+    /// runtime: the panel's disable removes a plugin's panels.
+    plugins: Option<Vec<PluginEntry>>,
+    /// Plugins that failed to load, with the reason.
+    rejected_plugins: Vec<(String, String)>,
+    /// The UI locale every string in this shell renders in: a user setting
+    /// (`ui.locale`), defaulted from the harness profile.
+    pub(crate) locale: Locale,
+    /// The settings dialog's font-family input, created on first show.
+    pub(crate) font_input: RefCell<Option<Entity<InputState>>>,
+    pub(crate) font_input_sub: RefCell<Option<Subscription>>,
+    /// How the window is divided: the saved preference and what the window's
+    /// width does to it now.
+    pub(crate) layout: LayoutState,
+    /// The divider being dragged, with where the drag began.
+    dragging: Option<DividerDrag>,
+    /// Where the keyboard rests when nothing else holds the focus, so the
+    /// shell's key bindings work before anything was clicked.
+    focus_anchor: Option<FocusHandle>,
+    /// The active session's conversation as it is on screen, kept so a new
+    /// projection reduces to changes at entry indices.
+    transcript: Transcript,
+    /// The conversation as rows of a virtualised list.
+    pub(crate) stream: StreamState,
+    /// Sessions that finished a turn while another was on screen.
+    pub(crate) unread: RefCell<HashSet<SessionId>>,
+}
+
+/// One script plugin as the plugins panel shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PluginEntry {
+    pub id: String,
+    pub enabled: bool,
 }
 
 impl<S: SessionView> HarnessShell<S> {
@@ -96,18 +351,81 @@ impl<S: SessionView> HarnessShell<S> {
             product_name: "harness".to_string(),
             on_session_activated: None,
             composer: None,
+            composer_has_text: false,
+            on_stop: None,
+            on_approval: None,
+            on_permission_mode: None,
+            permission_mode: PermissionMode::default(),
+            reduce_motion: false,
+            queues: HashMap::new(),
+            plan_open: false,
+            queue_open: true,
+            always_scope_open: false,
+            palette: None,
+            product_commands: Vec::new(),
+            on_new_session: None,
+            completion_source: None,
+            completion: None,
+            rewinding: None,
+            on_rewind: None,
+            expanded_projects: HashSet::new(),
+            earlier_expanded: HashSet::new(),
+            sidebar_query: String::new(),
+            sidebar_filter: None,
+            _sidebar_filter_sub: None,
+            sidebar_selected: None,
+            sidebar_focus: None,
+            renaming: None,
+            on_rename: None,
+            on_archive: None,
+            on_fork: None,
+            on_retry: None,
+            on_anchor: None,
+            on_delete: None,
+            session_menu: None,
+            settings_open: false,
             on_message_sent: None,
             on_plan_decision: None,
+            sidebar_projection: None,
             on_undo: None,
             on_redo: None,
             on_save: None,
             on_load: None,
             on_import: None,
             _composer_sub: None,
+            _completion_keys: None,
             selected_entity: None,
             selected_block: None,
             panel_host: PanelHost::default(),
+            settings: None,
+            theme: ThemeKind::Dark,
+            account: None,
+            on_sign_in: None,
+            on_sign_out: None,
+            plugins: None,
+            rejected_plugins: Vec::new(),
+            locale: Locale::default(),
+            font_input: RefCell::new(None),
+            font_input_sub: RefCell::new(None),
+            layout: LayoutState::default(),
+            dragging: None,
+            focus_anchor: None,
+            transcript: Transcript::default(),
+            stream: StreamState::default(),
+            unread: RefCell::new(HashSet::new()),
         };
+        // The open project starts unfolded; the others wait to be asked.
+        let open = shell.store.borrow().open_project_id().clone();
+        shell.expanded_projects.insert(open);
+        // Framework chrome: the diagnostics panel is always there (it reads
+        // nothing but shell state).
+        shell.panel_host.register(PanelDef::product(
+            "harness.diagnostics",
+            shell.tr("shell.diagnostics"),
+            PanelArea::Bottom,
+            1,
+            Rc::new(diagnostics_panel),
+        ));
         let session_id = shell.store.borrow().open_project().session_index.clone();
         if let Some(session_id) = session_id {
             if shell.store.borrow().session(&session_id).is_some() {
@@ -122,36 +440,138 @@ impl<S: SessionView> HarnessShell<S> {
     /// windowed constructor; headless callers use [`HarnessShell::new`].
     pub fn with_composer(
         store: SessionStore<S>,
+        locale: Locale,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let composer =
-            cx.new(|cx| InputState::new(window, cx).placeholder("描述你想做的改动，回车发送…"));
+        // Several lines, growing with what is typed. Enter submits and
+        // Shift+Enter breaks the line.
+        let composer = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .auto_grow(1, 8)
+                .submit_on_enter(true)
+                .placeholder(crate::i18n::t(locale, "composer.placeholder"))
+        });
         let subscription = cx.subscribe_in(
             &composer,
             window,
-            |shell: &mut Self, input, event: &InputEvent, window, cx| {
-                if !matches!(event, InputEvent::PressEnter { .. }) {
-                    return;
+            |shell: &mut Self, input, event: &InputEvent, window, cx| match event {
+                // With the secondary modifier (Ctrl, or Cmd on macOS) the
+                // message goes into the running turn instead of the queue.
+                InputEvent::PressEnter {
+                    secondary,
+                    shift: false,
+                } => {
+                    // Enter belongs to whatever is open over the composer.
+                    if shell.completion.is_some() {
+                        shell.apply_completion(window, cx);
+                    } else if shell.rewinding.is_some() {
+                        shell.rewind_in(RewindMode::Conversation, window, cx);
+                    } else {
+                        shell.submit_composer(*secondary, window, cx);
+                    }
                 }
-                let text = input.read(cx).value().to_string();
-                if text.trim().is_empty() {
-                    return;
+                InputEvent::Change => {
+                    let (text, caret, in_token) = {
+                        let state = input.read(cx);
+                        let caret = state.cursor();
+                        // A reference already made is not one in the making.
+                        let in_token = state.tokens().iter().any(|span| {
+                            let range = span.range();
+                            range.start < caret && caret <= range.end
+                        });
+                        (state.value().to_string(), caret, in_token)
+                    };
+                    // The candidate list follows what is typed at the caret,
+                    // and the button whether there is anything to send.
+                    let was_open = shell.completion.is_some();
+                    if in_token {
+                        shell.close_completion();
+                    } else {
+                        shell.update_completion(&text, caret);
+                    }
+                    let has_text = !text.trim().is_empty();
+                    if shell.composer_has_text != has_text
+                        || was_open
+                        || shell.completion.is_some()
+                    {
+                        shell.composer_has_text = has_text;
+                        cx.notify();
+                    }
                 }
-                let Some(session_id) = shell.workspace.as_ref().map(|ws| ws.session_id().clone())
-                else {
-                    return;
-                };
-                if let Some(sender) = shell.on_message_sent.clone() {
-                    (sender.borrow())(&session_id, &text);
-                    input.update(cx, |state, cx| state.set_value("", window, cx));
+                _ => {}
+            },
+        );
+
+        // While the candidate list is open, the arrows, Tab, Enter and Escape
+        // are its.
+        // The text area has bindings of its own for them and sits deeper in
+        // the focus path, so a key context here would lose to it: the keys are
+        // taken before any binding is looked up.
+        let weak = cx.weak_entity();
+        let keys = cx.intercept_keystrokes(move |event, window, cx| {
+            if event.keystroke.modifiers.modified() {
+                return;
+            }
+            let key = event.keystroke.key.clone();
+            if !matches!(key.as_str(), "up" | "down" | "tab" | "enter" | "escape") {
+                return;
+            }
+            let Some(shell) = weak.upgrade() else {
+                return;
+            };
+            let taken = shell.update(cx, |shell, cx| {
+                let typing = shell
+                    .composer
+                    .as_ref()
+                    .is_some_and(|composer| composer.focus_handle(cx).is_focused(window));
+                if shell.completion.is_none() || !typing {
+                    return false;
+                }
+                match key.as_str() {
+                    "up" => {
+                        shell.step_completion(-1);
+                    }
+                    "down" => {
+                        shell.step_completion(1);
+                    }
+                    "tab" | "enter" => {
+                        shell.apply_completion(window, cx);
+                    }
+                    _ => {
+                        shell.close_completion();
+                    }
+                }
+                cx.notify();
+                true
+            });
+            if taken {
+                cx.stop_propagation();
+            }
+        });
+
+        // The sidebar's filter: what is typed narrows the rows as it is typed.
+        let filter = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(crate::i18n::t(locale, "sidebar.filter"))
+        });
+        let filter_sub = cx.subscribe_in(
+            &filter,
+            window,
+            |shell: &mut Self, input, event: &InputEvent, _window, cx| {
+                if matches!(event, InputEvent::Change) {
+                    shell.set_sidebar_filter(input.read(cx).value().to_string());
+                    cx.notify();
                 }
             },
         );
 
         let mut shell = Self::new(store);
+        shell.locale = locale;
         shell.composer = Some(composer);
         shell._composer_sub = Some(subscription);
+        shell._completion_keys = Some(keys);
+        shell.sidebar_filter = Some(filter);
+        shell._sidebar_filter_sub = Some(filter_sub);
         shell
     }
 
@@ -168,56 +588,287 @@ impl<S: SessionView> HarnessShell<S> {
     where
         F: Fn(&SessionId) + 'static,
     {
-        self.on_session_activated = Some(Rc::new(RefCell::new(callback)));
+        self.on_session_activated = Some(Rc::new(callback));
     }
 
     pub fn set_on_message_sent<F>(&mut self, callback: F)
     where
-        F: Fn(&SessionId, &str) + 'static,
+        F: Fn(&SessionId, &str, Delivery) + 'static,
     {
-        self.on_message_sent = Some(Rc::new(RefCell::new(callback)));
+        self.on_message_sent = Some(Rc::new(callback));
+    }
+
+    /// What stopping the turn in progress does (the composer's button while
+    /// the agent works, or Escape).
+    pub fn set_on_stop<F>(&mut self, callback: F)
+    where
+        F: Fn(&SessionId) + 'static,
+    {
+        self.on_stop = Some(Rc::new(callback));
+    }
+
+    /// What answering a tool call that waits for approval does: the session,
+    /// the call's event sequence and the user's decision.
+    pub fn set_on_approval<F>(&mut self, callback: F)
+    where
+        F: Fn(&SessionId, u64, ApprovalDecision) + 'static,
+    {
+        self.on_approval = Some(Rc::new(callback));
+    }
+
+    /// What turning the permission dial does. The shell shows and remembers
+    /// the mode; what each mode lets the agent do is the product's policy.
+    pub fn set_on_permission_mode<F>(&mut self, callback: F)
+    where
+        F: Fn(PermissionMode) + 'static,
+    {
+        self.on_permission_mode = Some(Rc::new(callback));
     }
 
     pub fn set_on_plan_decision<F>(&mut self, callback: F)
     where
         F: Fn(&SessionId, PlanDecision) + 'static,
     {
-        self.on_plan_decision = Some(Rc::new(RefCell::new(callback)));
+        self.on_plan_decision = Some(Rc::new(callback));
+    }
+
+    /// Supply (or replace) the sidebar's projection. `None` restores the
+    /// default flat session list. Callers must notify: the sidebar renders on
+    /// the next frame.
+    pub fn set_sidebar_projection(
+        &mut self,
+        projection: Option<Rc<dyn crate::model::SidebarProjection<S>>>,
+    ) {
+        self.sidebar_projection = projection;
+    }
+
+    /// Whether a product projection is active (what a toggle renders).
+    pub fn has_sidebar_projection(&self) -> bool {
+        self.sidebar_projection.is_some()
     }
 
     pub fn set_on_undo<F>(&mut self, callback: F)
     where
         F: Fn(&SessionId) + 'static,
     {
-        self.on_undo = Some(Rc::new(RefCell::new(callback)));
+        self.on_undo = Some(Rc::new(callback));
     }
 
     pub fn set_on_redo<F>(&mut self, callback: F)
     where
         F: Fn(&SessionId) + 'static,
     {
-        self.on_redo = Some(Rc::new(RefCell::new(callback)));
+        self.on_redo = Some(Rc::new(callback));
     }
 
     pub fn set_on_save<F>(&mut self, callback: F)
     where
         F: Fn(&SessionId) + 'static,
     {
-        self.on_save = Some(Rc::new(RefCell::new(callback)));
+        self.on_save = Some(Rc::new(callback));
     }
 
     pub fn set_on_load<F>(&mut self, callback: F)
     where
         F: Fn(&SessionId) + 'static,
     {
-        self.on_load = Some(Rc::new(RefCell::new(callback)));
+        self.on_load = Some(Rc::new(callback));
     }
 
     pub fn set_on_import<F>(&mut self, callback: F)
     where
         F: Fn(&SessionId) + 'static,
     {
-        self.on_import = Some(Rc::new(RefCell::new(callback)));
+        self.on_import = Some(Rc::new(callback));
+    }
+
+    /// Shares the harness's user settings with the shell: the layout, the
+    /// language, the permission dial and the motion switch are read from it,
+    /// and what the settings dialog changes is written back to it.
+    pub fn set_settings(&mut self, settings: Option<Arc<Mutex<Settings>>>) {
+        if let Some(store) = &settings {
+            if let Ok(store) = store.lock() {
+                self.theme = crate::theme::kind_from_settings(&store);
+                if let Some(code) = store.get(crate::theme::LOCALE_KEY).and_then(|v| v.as_str()) {
+                    self.locale = Locale::from_code(code);
+                }
+                self.layout = LayoutState::new(Layout::load(&store));
+                self.permission_mode = PermissionMode::from_code(
+                    &store.get_str(crate::activity::PERMISSION_MODE_KEY, ""),
+                );
+                self.reduce_motion = store
+                    .get(crate::motion::REDUCE_MOTION_KEY)
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false);
+            }
+        }
+        self.settings = settings;
+    }
+
+    /// The shared settings store, when the app layer provided one.
+    pub fn settings(&self) -> Option<Arc<Mutex<Settings>>> {
+        self.settings.clone()
+    }
+
+    /// The settings file's path as the settings dialog and the diagnostics
+    /// panel show it (`None` = in-memory, nothing shared).
+    pub fn settings_path(&self) -> Option<String> {
+        self.settings
+            .as_ref()
+            .and_then(|store| store.lock().ok())
+            .and_then(|settings| settings.path().map(|path| path.display().to_string()))
+    }
+
+    /// The theme the shell renders in.
+    pub fn theme(&self) -> ThemeKind {
+        self.theme
+    }
+
+    /// The UI locale. Switch it with [`HarnessShell::set_locale`] (the
+    /// settings dialog does, through `ui.locale`).
+    pub fn locale(&self) -> Locale {
+        self.locale
+    }
+
+    /// Switches the UI locale; the shell re-renders on the next frame.
+    pub fn set_locale(&mut self, locale: Locale) {
+        self.locale = locale;
+    }
+
+    /// Writes one font setting and re-themes the window. The app layer applies
+    /// the stored fonts at launch through [`crate::theme::apply_font`].
+    pub(crate) fn set_font_setting(
+        &mut self,
+        key: &'static str,
+        value: serde_json::Value,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(store) = &self.settings {
+            if let Ok(mut store) = store.lock() {
+                let _ = store.set(key, value);
+                crate::theme::apply_font(&store, Some(window), cx);
+            }
+        }
+    }
+
+    /// The localized text for `key` in the shell's locale.
+    pub(crate) fn tr(&self, key: &'static str) -> &'static str {
+        crate::i18n::t(self.locale, key)
+    }
+
+    /// [`tr`](Self::tr) with `{placeholder}` substitution.
+    pub(crate) fn trf(&self, key: &str, args: &[(&str, &str)]) -> String {
+        crate::i18n::t_replace(self.locale, key, args)
+    }
+
+    /// Switches the theme: remembers it on the shell, persists it through
+    /// the settings store when one is shared, and applies it to every themed
+    /// surface (the global theme change refreshes the window).
+    pub(crate) fn switch_theme(
+        &mut self,
+        kind: ThemeKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.theme = kind;
+        match &self.settings {
+            Some(store) => crate::theme::set_theme(store, kind, Some(window), cx),
+            None => crate::theme::apply(kind, Some(window), cx),
+        }
+    }
+
+    /// The identity the sidebar's account chip shows (`None` = a guest).
+    /// Feed it from the harness's account provider whenever the app layer
+    /// learns the snapshot changed.
+    pub fn set_account(&mut self, account: Option<Account>) {
+        self.account = account;
+    }
+
+    /// The identity the chip currently shows.
+    pub fn account(&self) -> Option<&Account> {
+        self.account.as_ref()
+    }
+
+    /// What the chip's sign-in affordance does (the product opens its own
+    /// dialog — cloud sign-in, license import; the framework never
+    /// authenticates). Without a callback the affordance is inert.
+    pub fn set_on_sign_in<F>(&mut self, callback: F)
+    where
+        F: Fn() + 'static,
+    {
+        self.on_sign_in = Some(Rc::new(callback));
+    }
+
+    /// What the chip's sign-out affordance does.
+    pub fn set_on_sign_out<F>(&mut self, callback: F)
+    where
+        F: Fn() + 'static,
+    {
+        self.on_sign_out = Some(Rc::new(callback));
+    }
+
+    /// Shares the plugin load result with the shell: registers the plugins
+    /// panel (bottom dock — loaded plugins with a disable button, rejected
+    /// ones with the reason). Calling again refreshes the snapshot while
+    /// keeping what the user already disabled. A plugin disable at runtime
+    /// removes exactly that plugin's panels; commands and toolbar items
+    /// have no shell surface yet, so there is nothing else to withdraw.
+    pub fn set_plugins(&mut self, loaded: &nanobot_rhai::LoadedPlugins) {
+        let disabled: Vec<String> = self
+            .plugins
+            .take()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|entry| !entry.enabled)
+            .map(|entry| entry.id)
+            .collect();
+        self.plugins = Some(
+            loaded
+                .plugins_loaded
+                .iter()
+                .map(|id| PluginEntry {
+                    id: id.clone(),
+                    enabled: !disabled.contains(id),
+                })
+                .collect(),
+        );
+        self.rejected_plugins = loaded.plugins_rejected.clone();
+
+        const PLUGINS_PANEL_ID: &str = "harness.plugins";
+        if !self
+            .panel_host
+            .panels()
+            .iter()
+            .any(|panel| panel.id == PLUGINS_PANEL_ID)
+        {
+            self.panel_host.register(PanelDef::product(
+                PLUGINS_PANEL_ID,
+                self.tr("shell.plugins"),
+                PanelArea::Bottom,
+                2,
+                Rc::new(plugins_panel),
+            ));
+        }
+    }
+
+    /// The plugin snapshot (ids + enabled state), when shared.
+    pub fn plugins(&self) -> Option<&[PluginEntry]> {
+        self.plugins.as_deref()
+    }
+
+    /// Disables a plugin at runtime: removes exactly its panels from the
+    /// dock and flips the snapshot. Returns the panels removed.
+    pub fn disable_plugin(&mut self, id: &str) -> usize {
+        let removed = self.panel_host.remove_plugin(id);
+        if let Some(plugins) = &mut self.plugins {
+            for entry in plugins.iter_mut() {
+                if entry.id == id {
+                    entry.enabled = false;
+                }
+            }
+        }
+        removed
     }
 
     pub fn store(&self) -> Ref<'_, SessionStore<S>> {
@@ -270,14 +921,54 @@ impl<S: SessionView> HarnessShell<S> {
         };
         self.viewports
             .get(id)
-            .map(|handle| S::Viewport::painted_frames(handle))
+            .map(S::Viewport::painted_frames)
             .unwrap_or(0)
     }
 
     /// Updates a session's content from data loaded out of the session's event
     /// log. Called by the app layer when a session is activated.
     pub fn update_session_content(&self, id: &SessionId, session: S) -> bool {
+        // A turn that ends while the user is looking elsewhere leaves a mark
+        // in the sidebar until they come and see it.
+        let was_running = self
+            .store
+            .borrow()
+            .session(id)
+            .is_some_and(|old| old.status() == SessionStatus::Running);
+        let finished = was_running && session.status() == SessionStatus::Idle;
+        if finished && self.active_session_id() != Some(id) {
+            self.unread.borrow_mut().insert(id.clone());
+        }
         self.store.borrow_mut().update_session_content(id, session)
+    }
+
+    /// The mark `session` carries in the sidebar.
+    pub fn badge_of(&self, session: &S) -> SessionBadge {
+        SessionBadge::of(
+            session.status(),
+            self.unread.borrow().contains(session.id()),
+        )
+    }
+
+    /// Where the turn of the session on screen stands (`Idle` with none).
+    pub fn turn_phase(&self) -> TurnPhase {
+        self.workspace
+            .as_ref()
+            .map_or(TurnPhase::Idle, |ws| ws.turn_phase())
+    }
+
+    /// The conversation on screen.
+    pub fn transcript(&self) -> &Transcript {
+        &self.transcript
+    }
+
+    /// The conversation stream: its rows, and what is folded.
+    pub fn stream(&self) -> &StreamState {
+        &self.stream
+    }
+
+    pub fn stream_mut(&mut self) -> &mut StreamState {
+        &mut self.stream
     }
 
     /// Hands a freshly baked scene to the active session's renderer.
@@ -333,6 +1024,15 @@ impl<S: SessionView> HarnessShell<S> {
         self.panel_host.script_errors()
     }
 
+    /// Takes the conversation to show. When it differs from the one on
+    /// screen, the list is told what changed as rows to remeasure and a
+    /// splice, so a streaming answer costs its last row, not the whole stream.
+    fn show_conversation(&mut self, conversation: Conversation) {
+        if self.transcript.replace(conversation) {
+            self.stream.set_entries(self.transcript.entries());
+        }
+    }
+
     /// Builds and installs the workspace of `id` (the whole-replacement step)
     /// and records it as the project's session index.
     fn present(&mut self, id: &SessionId) -> bool {
@@ -341,10 +1041,33 @@ impl<S: SessionView> HarnessShell<S> {
         };
         self.store.borrow_mut().set_session_index(id);
         let viewport = self.viewport_of(id);
-        self.workspace = Some(session.build_workspace(viewport));
+        let workspace = session.build_workspace(viewport);
+        self.show_conversation(workspace.conversation());
+        self.workspace = Some(workspace);
+        // On screen now: it is no longer news.
+        self.unread.borrow_mut().remove(id);
         if let Some(ref callback) = self.on_session_activated {
-            callback.borrow()(id);
+            callback(id);
         }
+        true
+    }
+
+    /// Rebuilds the workspace on screen from its session in the store: for a
+    /// product whose workspace is a snapshot, after
+    /// [`update_session_content`](Self::update_session_content). (A workspace
+    /// that shares its session's state needs no refresh.) False with no
+    /// session on screen.
+    pub fn refresh_workspace(&mut self) -> bool {
+        let Some(id) = self.active_session_id().cloned() else {
+            return false;
+        };
+        let Some(session) = self.store.borrow().session(&id).cloned() else {
+            return false;
+        };
+        let viewport = self.viewport_of(&id);
+        let workspace = session.build_workspace(viewport);
+        self.show_conversation(workspace.conversation());
+        self.workspace = Some(workspace);
         true
     }
 
@@ -364,6 +1087,7 @@ impl<S: SessionView> HarnessShell<S> {
         if !self.store.borrow_mut().set_open_project(id) {
             return false;
         }
+        self.expanded_projects.insert(id.clone());
         let session_id = self.store.borrow().open_project().session_index.clone();
         self.workspace = None;
         if let Some(session_id) = session_id {
@@ -380,18 +1104,18 @@ impl<S: SessionView> HarnessShell<S> {
 /// Color slots the panels use (copied out of the gpui-component theme so the
 /// element builders do not hold a borrow of it).
 #[derive(Clone, Copy)]
-struct Palette {
-    fg: Hsla,
-    muted: Hsla,
-    border: Hsla,
-    accent: Hsla,
-    success: Hsla,
-    info: Hsla,
-    warning: Hsla,
-    danger: Hsla,
+pub(crate) struct Palette {
+    pub(crate) fg: Hsla,
+    pub(crate) muted: Hsla,
+    pub(crate) border: Hsla,
+    pub(crate) accent: Hsla,
+    pub(crate) success: Hsla,
+    pub(crate) info: Hsla,
+    pub(crate) warning: Hsla,
+    pub(crate) danger: Hsla,
 }
 
-fn palette(cx: &App) -> Palette {
+pub(crate) fn palette(cx: &App) -> Palette {
     let theme = cx.theme();
     Palette {
         fg: theme.foreground,
@@ -407,41 +1131,15 @@ fn palette(cx: &App) -> Palette {
 
 fn session_color(status: SessionStatus, p: Palette) -> Hsla {
     match status {
-        SessionStatus::Active => p.success,
+        SessionStatus::Idle => p.muted,
         SessionStatus::Running => p.info,
-        SessionStatus::AwaitingReview => p.warning,
-        SessionStatus::Archived => p.muted,
-    }
-}
-
-fn step_color(status: StepStatus, p: Palette) -> Hsla {
-    match status {
-        StepStatus::Pending => p.muted,
-        StepStatus::InProgress => p.info,
-        StepStatus::Done => p.success,
-    }
-}
-
-fn block_color(kind: BlockKind, p: Palette) -> Hsla {
-    match kind {
-        BlockKind::User => p.fg,
-        BlockKind::Assistant => p.info,
-        BlockKind::Tool => p.success,
-        BlockKind::Plan => p.warning,
-        BlockKind::Check => p.success,
-    }
-}
-
-fn tool_color(state: ToolState, p: Palette) -> Hsla {
-    match state {
-        ToolState::Running => p.info,
-        ToolState::Done => p.success,
-        ToolState::Failed => p.danger,
+        SessionStatus::AwaitingUser => p.warning,
+        SessionStatus::Error => p.danger,
     }
 }
 
 /// A tinted pill (session status, tool state, check result).
-fn badge(text: &str, color: Hsla) -> impl IntoElement {
+pub(crate) fn badge(text: &str, color: Hsla) -> impl IntoElement {
     div()
         .px_2()
         .py_1()
@@ -452,52 +1150,262 @@ fn badge(text: &str, color: Hsla) -> impl IntoElement {
         .child(text.to_string())
 }
 
-/// A titled panel frame: small caption row plus a padded body.
-fn panel(caption: &str, p: Palette, body: impl IntoElement) -> impl IntoElement {
-    div()
-        .size_full()
-        .flex()
-        .flex_col()
-        .overflow_hidden()
-        .child(
-            div()
-                .flex_none()
-                .px_3()
-                .py_1()
-                .text_xs()
-                .text_color(p.muted)
-                .border_b_1()
-                .border_color(p.border)
-                .child(caption.to_string()),
-        )
-        .child(
-            div()
-                .flex_1()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .p_2()
-                .overflow_hidden()
-                .child(body),
-        )
-}
 
 // ---- rendering ----
 
 impl<S: SessionView> HarnessShell<S> {
-    fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    // ---- layout ----
+
+    /// Whether any panel the user may see is registered for the right dock.
+    fn has_right_dock(&self) -> bool {
+        !self.panel_host.panels_in(PanelArea::Right).is_empty()
+    }
+
+    /// The saved layout preference (sidebar and dock open, the three widths).
+    pub fn layout(&self) -> Layout {
+        self.layout.layout()
+    }
+
+    /// Writes one setting through the settings store, when the app layer
+    /// shared one. A failed write loses the preference, never the UI.
+    pub(crate) fn save_setting(&self, key: &str, value: serde_json::Value) {
+        if let Some(Ok(mut settings)) = self.settings.as_ref().map(|s| s.lock()) {
+            let _ = settings.set(key, value);
+        }
+    }
+
+    /// Writes the layout preference through the settings store, when the app
+    /// layer shared one. A failed write loses the preference, never the UI.
+    fn save_layout(&self) {
+        if let Some(Ok(mut settings)) = self.settings.as_ref().map(|s| s.lock()) {
+            let _ = self.layout.layout().store(&mut settings);
+        }
+    }
+
+    /// Shows or hides the session sidebar in a window `window_width` wide.
+    pub fn toggle_sidebar(&mut self, window_width: f32) {
+        if self.layout.toggle_sidebar(window_width) {
+            self.save_layout();
+        }
+    }
+
+    /// Shows or hides the right dock in a window `window_width` wide.
+    pub fn toggle_dock(&mut self, window_width: f32) {
+        if self.layout.toggle_dock(window_width) {
+            self.save_layout();
+        }
+    }
+
+    /// Whether the session sidebar shows in a window `window_width` wide.
+    pub fn sidebar_shown(&self, window_width: f32) -> bool {
+        self.layout
+            .regions(window_width, self.has_right_dock())
+            .sidebar
+            .is_some()
+    }
+
+    /// How many sessions other than the one on screen are waiting for the
+    /// user: what the toolbar badge counts while the sidebar may be hidden.
+    pub fn attention_count(&self) -> usize {
+        let active = self.active_session_id();
+        self.store
+            .borrow()
+            .open_project_sessions()
+            .iter()
+            .filter(|session| Some(session.id()) != active)
+            .filter(|session| !session.archived())
+            .filter(|session| self.badge_of(session).needs_attention())
+            .count()
+    }
+
+    fn end_drag(&mut self) {
+        if self.dragging.take().is_some() {
+            nanobot_gpu::suspend_viewport_input(false);
+            self.save_layout();
+        }
+    }
+
+    /// The strip between two regions that a drag resizes them by.
+    fn divider(&self, divider: Divider, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
-        let store = self.store.borrow();
-        let project = store.open_project();
+        let active = self.dragging.is_some_and(|drag| drag.divider == divider);
+        div()
+            .id(match divider {
+                Divider::Sidebar => "harness-divider-sidebar",
+                Divider::Column => "harness-divider-column",
+                Divider::Dock => "harness-divider-dock",
+            })
+            .w(px(DIVIDER_W))
+            .h_full()
+            .flex_none()
+            .cursor_col_resize()
+            .border_l_1()
+            .border_color(p.border)
+            .when(active, |d| d.bg(p.accent.opacity(0.5)))
+            .hover(|d| d.bg(p.accent.opacity(0.3)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this: &mut Self, ev: &MouseDownEvent, window, cx| {
+                    let width = f32::from(window.viewport_size().width);
+                    let Some(start_width) =
+                        this.layout.width_at(divider, width, this.has_right_dock())
+                    else {
+                        return;
+                    };
+                    this.dragging = Some(DividerDrag {
+                        divider,
+                        start_x: f32::from(ev.position.x),
+                        start_width,
+                    });
+                    // The pointer will cross the viewport: on Windows its
+                    // native surface would otherwise keep the moves and the
+                    // release to itself, and the drag would stall at its edge.
+                    nanobot_gpu::suspend_viewport_input(true);
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+    }
+
+    /// The count of sessions waiting for the user, as the toolbar shows it.
+    fn attention_badge(&self, waiting: usize, p: Palette) -> Stateful<Div> {
+        div()
+            .id("harness-attention")
+            .px_2()
+            .rounded(px(9.))
+            .bg(p.warning.opacity(0.18))
+            .text_color(p.warning)
+            .text_xs()
+            .child(self.trf("shell.attention", &[("count", &waiting.to_string())]))
+    }
+
+    /// The session column toolbar: what belongs to the session on screen, plus
+    /// the two things that must stay reachable while the sidebar is hidden —
+    /// its toggle and the count of sessions waiting for the user.
+    fn toolbar(&self, fold: Fold, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = palette(cx);
+        let waiting = self.attention_count();
         let workspace = self.workspace.as_ref();
-        let (done, total) = workspace.map(plan_progress_of).unwrap_or((0, 0));
-        let session_line = match workspace {
-            Some(ws) => ws.title(),
-            None => "（无会话）".to_string(),
-        };
+        let title = workspace
+            .map_or_else(|| self.tr("shell.no_sessions").to_string(), |ws| ws.title());
         let status = workspace.map(|ws| ws.status());
         div()
-            .h(px(46.))
+            .h(px(TOOLBAR_H))
+            .flex_none()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .border_b_1()
+            .border_color(p.border)
+            .when(fold != Fold::Stacked, |d| {
+                d.child(toolbar_button("harness-toggle-sidebar", Icon::Sidebar, p.muted).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this: &mut Self, _ev: &MouseDownEvent, window, cx| {
+                        this.toggle_sidebar(f32::from(window.viewport_size().width));
+                        cx.notify();
+                    }),
+                ))
+            })
+            .when(waiting > 0, |d| {
+                d.child(self.attention_badge(waiting, p).cursor_pointer().on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this: &mut Self, _ev: &MouseDownEvent, window, cx| {
+                        let width = f32::from(window.viewport_size().width);
+                        if this.layout.reveal_sidebar(width) {
+                            this.save_layout();
+                        }
+                        // And the keyboard lands on who is waiting.
+                        this.select_first_waiting();
+                        cx.notify();
+                    }),
+                ))
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_sm()
+                    .font_semibold()
+                    .truncate()
+                    .child(title),
+            )
+            // What the turn is doing right now, then the session's status.
+            .children(workspace.and_then(|_| self.turn_mark(self.turn_phase(), "harness-turn-mark", cx)))
+            .when_some(status, |d, status| {
+                d.child(badge(status.label(self.locale), session_color(status, p)))
+            })
+            .when(self.on_new_session.is_some(), |d| {
+                d.child(
+                    toolbar_button("harness-new-session", Icon::Plus, p.muted).on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this: &mut Self, _ev: &MouseDownEvent, window, cx| {
+                            this.run_command_in(crate::palette::id::NEW_SESSION, window, cx);
+                        }),
+                    ),
+                )
+            })
+            // Everything else the shell can do is in the palette.
+            .child(
+                toolbar_button("harness-open-palette", Icon::More, p.muted).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this: &mut Self, _ev: &MouseDownEvent, window, cx| {
+                        this.open_palette(window, cx);
+                    }),
+                ),
+            )
+            .when(fold == Fold::Stacked, |d| {
+                // Too narrow for both: the one way to reach the viewport.
+                d.child(
+                    text_button("harness-show-viewport", self.tr("shell.show_viewport"), p)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this: &mut Self, _ev: &MouseDownEvent, _w, cx| {
+                                this.layout.set_stacked(Stacked::Viewport);
+                                cx.notify();
+                            }),
+                        ),
+                )
+            })
+    }
+
+    /// The strip over a viewport that has the window to itself (a stacked
+    /// layout): the way back to the session column.
+    fn viewport_return_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = palette(cx);
+        let waiting = self.attention_count();
+        div()
+            .h(px(TOOLBAR_H))
+            .flex_none()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .border_b_1()
+            .border_color(p.border)
+            .child(
+                text_button("harness-show-column", self.tr("shell.show_column"), p).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this: &mut Self, _ev: &MouseDownEvent, _w, cx| {
+                        this.layout.set_stacked(Stacked::Column);
+                        cx.notify();
+                    }),
+                ),
+            )
+            .when(waiting > 0, |d| d.child(self.attention_badge(waiting, p)))
+    }
+
+    /// The title bar: only what is global — the product, the open project and
+    /// the operations on it. What belongs to one session is in the session
+    /// column's toolbar.
+    fn header(&self, fold: Fold, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = palette(cx);
+        let project = self.store.borrow().open_project().name.clone();
+        let has_dock = self.has_right_dock();
+        div()
+            .h(px(40.))
             .flex_none()
             .flex()
             .flex_row()
@@ -507,277 +1415,46 @@ impl<S: SessionView> HarnessShell<S> {
             .border_b_1()
             .border_color(p.border)
             .child(div().font_semibold().child(self.product_name.clone()))
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(p.muted)
-                    .child(format!("{} · {}", project.name, session_line)),
-            )
-            .when_some(status, |d, status| {
-                d.child(badge(status.label(), session_color(status, p)))
-            })
+            .child(div().text_sm().text_color(p.muted).child(project))
             .child(div().flex_1())
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap_2()
-                    .child(self.undo_redo_buttons(cx))
-                    .child(self.file_ops_buttons(cx)),
-            )
-            .child(div().text_xs().text_color(p.muted).child(format!(
-                "计划 {done}/{total} · 会话工作区 · 视口 · 面板"
-            )))
-    }
-
-    fn undo_redo_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let p = palette(cx);
-        let session_id = self.workspace.as_ref().map(|ws| ws.session_id().clone());
-
-        let undo_cb = self
-            .on_undo
-            .clone()
-            .unwrap_or_else(|| Rc::new(RefCell::new(|_: &SessionId| {})));
-        let sid_undo = session_id.clone().unwrap_or_else(|| SessionId::new(""));
-        let undo_btn = div()
-            .id("harness-undo")
-            .text_sm()
-            .px_2()
-            .py_1()
-            .border_1()
-            .border_color(p.border)
-            .cursor_pointer()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_1()
-            .child(
-                img(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/undo.svg"))
-                    .w(px(14.))
-                    .h(px(14.)),
-            )
-            .child("撤销")
-            .on_click(move |_, _, _| {
-                undo_cb.borrow()(&sid_undo);
-            });
-
-        let redo_cb = self
-            .on_redo
-            .clone()
-            .unwrap_or_else(|| Rc::new(RefCell::new(|_: &SessionId| {})));
-        let sid_redo = session_id.unwrap_or_else(|| SessionId::new(""));
-        let redo_btn = div()
-            .id("harness-redo")
-            .text_sm()
-            .px_2()
-            .py_1()
-            .border_1()
-            .border_color(p.border)
-            .cursor_pointer()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_1()
-            .child(
-                img(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/redo.svg"))
-                    .w(px(14.))
-                    .h(px(14.)),
-            )
-            .child("重做")
-            .on_click(move |_, _, _| {
-                redo_cb.borrow()(&sid_redo);
-            });
-
-        div()
-            .flex()
-            .flex_row()
-            .gap_2()
-            .child(undo_btn)
-            .child(redo_btn)
-    }
-
-    fn file_ops_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let p = palette(cx);
-        let sid = self.workspace.as_ref().map(|ws| ws.session_id().clone());
-
-        let sid_save = sid.clone().unwrap_or_else(|| SessionId::new(""));
-        let save_cb = self
-            .on_save
-            .clone()
-            .unwrap_or_else(|| Rc::new(RefCell::new(|_: &SessionId| {})));
-        let save_btn = header_button("harness-save", "存档", p.border)
-            .on_click(move |_, _, _| {
-                save_cb.borrow()(&sid_save);
-            });
-
-        let sid_load = sid.clone().unwrap_or_else(|| SessionId::new(""));
-        let load_cb = self
-            .on_load
-            .clone()
-            .unwrap_or_else(|| Rc::new(RefCell::new(|_: &SessionId| {})));
-        let load_btn = header_button("harness-load", "开档", p.border)
-            .on_click(move |_, _, _| {
-                load_cb.borrow()(&sid_load);
-            });
-
-        let sid_import = sid.unwrap_or_else(|| SessionId::new(""));
-        let import_cb = self
-            .on_import
-            .clone()
-            .unwrap_or_else(|| Rc::new(RefCell::new(|_: &SessionId| {})));
-        let import_btn = header_button("harness-import", "导入", p.border)
-            .on_click(move |_, _, _| {
-                import_cb.borrow()(&sid_import);
-            });
-
-        div()
-            .flex()
-            .flex_row()
-            .gap_2()
-            .child(save_btn)
-            .child(load_btn)
-            .child(import_btn)
-    }
-
-    /// The session list (home sidebar): project switcher on top, then the open
-    /// project's sessions grouped by project.
-    fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let p = palette(cx);
-        let mut projects = div().flex().flex_col().gap_1();
-        for project in self.store.borrow().projects() {
-            let id = project.id.clone();
-            let selected = &id == self.store.borrow().open_project_id();
-            let sessions = project.sessions.len();
-            projects = projects.child(
-                div()
-                    .px_2()
-                    .py_1()
-                    .rounded(px(4.))
-                    .cursor_pointer()
-                    .when(selected, |d| d.bg(p.accent))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this: &mut Self, _ev: &MouseDownEvent, _w, cx| {
-                            if this.switch_project(&id) {
-                                cx.notify();
-                            }
-                        }),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .text_sm()
-                                    .when(selected, |d| d.font_semibold())
-                                    .child(project.name.clone()),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(p.muted)
-                                    .child(format!("{sessions}")),
-                            ),
-                    ),
-            );
-        }
-
-        let mut project_tree = div().flex().flex_col().gap_1();
-        for project in self.store.borrow().projects() {
-            let project_id = project.id.clone();
-            let selected_project = &project_id == self.store.borrow().open_project_id();
-            let sessions = project.sessions.clone();
-            let project_name = project.name.clone();
-            let session_count = sessions.len();
-
-            let project_row = div()
-                .px_2()
-                .py_1()
-                .rounded(px(4.))
-                .cursor_pointer()
-                .when(selected_project, |d| d.bg(p.accent.opacity(0.3)))
-                .on_mouse_down(
+            .child(self.session_buttons(cx))
+            .when(has_dock && fold != Fold::Stacked, |d| {
+                d.child(toolbar_button("harness-toggle-dock", Icon::Dock, p.muted).on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(move |this: &mut Self, _ev: &MouseDownEvent, _w, cx| {
-                        if this.switch_project(&project_id) {
-                            cx.notify();
-                        }
+                    cx.listener(|this: &mut Self, _ev: &MouseDownEvent, window, cx| {
+                        this.toggle_dock(f32::from(window.viewport_size().width));
+                        cx.notify();
                     }),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_2()
-                        .child(div().text_xs().text_color(p.info).child("▸".to_string()))
-                        .child(
-                            div()
-                                .flex_1()
-                                .text_sm()
-                                .when(selected_project, |d| d.font_semibold())
-                                .child(project_name),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(p.muted)
-                                .child(format!("{session_count}")),
-                        ),
-                );
-
-            project_tree = project_tree.child(project_row);
-
-            if selected_project {
-                for session in &sessions {
-                    project_tree = project_tree.child(self.session_row(session, p, cx));
-                }
-            }
-        }
-
-        div()
-            .w(px(SIDEBAR_W))
-            .h_full()
-            .flex_none()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .p_2()
-            .border_r_1()
-            .border_color(p.border)
-            .child(div().text_xs().text_color(p.muted).child("项目"))
-            .child(projects)
-            .child(
-                div()
-                    .flex_none()
-                    .px_2()
-                    .pt_2()
-                    .text_xs()
-                    .text_color(p.muted)
-                    .child(format!(
-                        "会话 · {}（{} 个）",
-                        self.store.borrow().open_project().name,
-                        self.store.borrow().open_project_sessions().len()
-                    )),
-            )
-            .child(
-                div()
-                    .id("harness-session-list".to_string())
-                    .flex_1()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .overflow_y_scroll()
-                    .child(project_tree),
-            )
-            .child(self.sidebar_footer(p, cx))
+                ))
+            })
     }
 
-    fn sidebar_footer(&self, p: Palette, _cx: &mut Context<Self>) -> impl IntoElement {
+    /// The operations on the session on screen: undo, redo, save, load,
+    /// import. Each calls the product's callback, when there is one.
+    fn session_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = palette(cx);
+        let session = self
+            .workspace
+            .as_ref()
+            .map_or_else(|| SessionId::new(""), |ws| ws.session_id().clone());
+        let buttons = [
+            ("harness-undo", Icon::Undo, "shell.undo", &self.on_undo),
+            ("harness-redo", Icon::Redo, "shell.redo", &self.on_redo),
+            ("harness-save", Icon::Save, "shell.save", &self.on_save),
+            ("harness-load", Icon::Load, "shell.load", &self.on_load),
+            ("harness-import", Icon::Import, "shell.import", &self.on_import),
+        ];
+        div().flex().flex_row().gap_2().children(buttons.map(|(id, icon, label, callback)| {
+            let (callback, session) = (callback.clone(), session.clone());
+            header_button(id, icon, self.tr(label), p.fg, p.border).on_click(move |_, _, _| {
+                if let Some(callback) = &callback {
+                    callback(&session);
+                }
+            })
+        }))
+    }
+
+    pub(crate) fn sidebar_footer(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex_none()
             .px_2()
@@ -788,110 +1465,92 @@ impl<S: SessionView> HarnessShell<S> {
             .flex_row()
             .items_center()
             .gap_2()
-            .child(
-                div()
-                    .w(px(24.))
-                    .h(px(24.))
-                    .rounded(px(12.))
-                    .bg(p.accent.opacity(0.3))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(div().text_xs().text_color(p.accent).child("U".to_string())),
-            )
+            .child(self.account_chip(p, cx))
             .child(div().flex_1())
-            .child(
-                div()
-                    .id("harness-mobile-toggle")
-                    .p_1()
-                    .rounded(px(4.))
-                    .cursor_pointer()
-                    .on_click(move |_, _, _| {})
-                    .child(
-                        img(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/mobile.svg"))
-                            .w(px(16.))
-                            .h(px(16.)),
-                    ),
-            )
-            .child(
-                div()
-                    .id("harness-settings")
-                    .p_1()
-                    .rounded(px(4.))
-                    .cursor_pointer()
-                    .on_click(move |_, _, _| {})
-                    .child(
-                        img(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/settings.svg"))
-                            .w(px(16.))
-                            .h(px(16.)),
-                    ),
-            )
+            .child(toolbar_button("harness-settings", Icon::Settings, p.muted).on_click(
+                cx.listener(|shell, _event, _window, cx| {
+                    shell.open_settings();
+                    cx.notify();
+                }),
+            ))
     }
 
-    fn session_row(&self, session: &S, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
-        let id = session.id().clone();
-        let selected = self.active_session_id() == Some(&id);
-        let (done, total) = plan_progress(&session.plan());
-        let color = session_color(session.status(), p);
-        let title = session.title();
-        let status = session.status();
-        let branch = session.branch_marker();
-        div()
-            .px_2()
-            .py_2()
-            .rounded(px(6.))
-            .cursor_pointer()
-            .when(selected, |d| d.bg(p.accent))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this: &mut Self, _ev: &MouseDownEvent, _w, cx| {
-                    if this.switch_session(&id) {
-                        cx.notify();
-                    }
-                }),
-            )
-            .child(
-                div()
+    /// The sidebar footer's account chip: the identity the account provider
+    /// reports (avatar letter, name, plan badge) or a guest with a sign-in
+    /// affordance. Clicking a signed-in chip signs out. The shell renders
+    /// the chip; the product's callbacks decide what either action means.
+    fn account_chip(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        match self.account.clone() {
+            Some(account) => {
+                let plan = account.plan.clone();
+                let mut chip = div()
+                    .id("harness-account")
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap_2()
-                    .when_some(branch, |d, _marker| {
-                        d.child(div().text_xs().text_color(p.info).child("↧".to_string()))
-                    })
+                    .min_w_0()
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |shell, _event, _window, _cx| {
+                        if let Some(sign_out) = shell.on_sign_out.clone() {
+                            sign_out();
+                        }
+                    }))
                     .child(
                         div()
-                            .flex_1()
-                            .text_sm()
-                            .when(selected, |d| d.font_semibold())
-                            .child(title),
+                            .w(px(24.))
+                            .h(px(24.))
+                            .rounded(px(12.))
+                            .bg(p.accent.opacity(0.3))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(p.accent)
+                                    .child(avatar_letter(&account.display_name).to_string()),
+                            ),
                     )
-                    .child(badge(status.label(), color)),
-            )
-            .child(
-                div()
-                    .mt_1()
-                    .text_xs()
-                    .text_color(p.muted)
-                    .child(format!("计划 {done}/{total}")),
-            )
+                    .child(div().text_xs().min_w_0().child(crate::widgets::truncate(
+                        &account.display_name,
+                        10,
+                    )));
+                if let Some(plan) = plan {
+                    chip = chip.child(badge(&plan, p.accent));
+                }
+                chip
+            }
+            None => div()
+                .id("harness-account-guest")
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .cursor_pointer()
+                .on_click(cx.listener(move |shell, _event, _window, _cx| {
+                    if let Some(sign_in) = shell.on_sign_in.clone() {
+                        sign_in();
+                    }
+                }))
+                .child(
+                    div()
+                        .w(px(24.))
+                        .h(px(24.))
+                        .rounded(px(12.))
+                        .bg(p.muted.opacity(0.2))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(div().text_xs().text_color(p.muted).child("?".to_string())),
+                )
+                .child(div().text_xs().text_color(p.muted).child(self.tr("shell.guest_signin"))),
+        }
     }
 
-    /// The viewport region: the product renderer's element, fed by this shell's
-    /// input forwarding (drag = orbit, Shift+drag = pan, wheel = zoom — the
-    /// mapping itself lives in the renderer).
-    fn viewport_panel(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let p = palette(cx);
-        div()
-            .w(px(VIEWPORT_W))
-            .flex_none()
-            .h_full()
-            .border_l_1()
-            .border_color(p.border)
-            .child(self.viewport_slot(window, cx))
-    }
 
-    fn viewport_slot(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+
+    fn viewport_slot(&self) -> impl IntoElement {
         let Some(ws) = self.workspace.as_ref() else {
             return div().size_full().into_any_element();
         };
@@ -899,266 +1558,29 @@ impl<S: SessionView> HarnessShell<S> {
         let Some(handle) = self.viewports.get(&id).cloned() else {
             return div().size_full().into_any_element();
         };
-        let (down, moved, up, scroll) = (
-            handle.clone(),
-            handle.clone(),
-            handle.clone(),
-            handle.clone(),
-        );
-        let element = S::Viewport::element(&handle);
+        // No input listeners here: the renderer's element routes pointer and
+        // wheel input itself (over a native surface GPUI's listeners never
+        // see it).
         div()
             .id("harness-viewport".to_string())
             .size_full()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |_this, ev: &MouseDownEvent, _w, cx| {
-                    S::Viewport::feed_input(
-                        &down,
-                        ViewportInput {
-                            mouse_pos: Some(ev.position),
-                            mouse_down: true,
-                            shift: ev.modifiers.shift,
-                            scroll: None,
-                        },
-                    );
-                    cx.notify();
-                }),
-            )
-            .on_mouse_move(cx.listener(move |_this, ev: &MouseMoveEvent, _w, cx| {
-                S::Viewport::feed_input(
-                    &moved,
-                    ViewportInput {
-                        mouse_pos: Some(ev.position),
-                        mouse_down: ev.pressed_button == Some(MouseButton::Left),
-                        shift: ev.modifiers.shift,
-                        scroll: None,
-                    },
-                );
-                cx.notify();
-            }))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(move |_this, ev: &MouseUpEvent, _w, cx| {
-                    S::Viewport::feed_input(
-                        &up,
-                        ViewportInput {
-                            mouse_pos: Some(ev.position),
-                            mouse_down: false,
-                            shift: ev.modifiers.shift,
-                            scroll: None,
-                        },
-                    );
-                    cx.notify();
-                }),
-            )
-            .on_scroll_wheel(cx.listener(move |_this, ev: &ScrollWheelEvent, _w, cx| {
-                // Pixels, or lines scaled like a wheel notch.
-                let dy = match ev.delta {
-                    ScrollDelta::Pixels(p) => f32::from(p.y),
-                    ScrollDelta::Lines(l) => l.y * 40.0,
-                };
-                S::Viewport::feed_input(
-                    &scroll,
-                    ViewportInput {
-                        mouse_pos: Some(ev.position),
-                        mouse_down: false,
-                        shift: ev.modifiers.shift,
-                        scroll: Some(dy),
-                    },
-                );
-                cx.notify();
-            }))
-            .child(element)
+            .child(S::Viewport::element(&handle))
             .into_any_element()
     }
 
-    /// The session workspace: plan state over the conversation stream.
+    /// The session workspace, top to bottom: the conversation, the activity
+    /// bar, the composer.
     fn ai_workspace(&self, ws: &S::Workspace, cx: &mut Context<Self>) -> impl IntoElement {
-        let p = palette(cx);
-        let plan = plan_rows(&ws.plan(), p);
-        let conversation = self.conversation_stream(&ws.conversation().blocks, p, cx);
         div()
             .flex_1()
-            .h_full()
+            .min_h_0()
             .flex()
             .flex_col()
-            .border_l_1()
-            .border_color(p.border)
-            .child(div().flex_none().child(panel("plan 状态", p, plan)))
-            .when_some(ws.progress(), |panel, (done, total)| {
-                let pct = if total > 0 { done as f32 / total as f32 } else { 0.0 };
-                panel.child(
-                    div()
-                        .flex_none()
-                        .px_2()
-                        .py_1()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(p.muted)
-                                .child(format!("计算进度 {done}/{total}")),
-                        )
-                        .child(
-                            div()
-                                .w_full()
-                                .h(px(4.))
-                                .rounded(px(2.))
-                                .bg(p.border)
-                                .child(
-                                    div()
-                                        .w(px(pct * 200.0))
-                                        .h(px(4.))
-                                        .rounded(px(2.))
-                                        .bg(p.info),
-                                ),
-                        ),
-                )
-            })
-            .when(ws.plan_phase().awaits_decision(), |panel| {
-                if ws.plan_phase() == PlanPhase::Clarify {
-                    panel.child(self.clarify_bar(ws, p))
-                } else {
-                    panel.child(self.plan_decision_bar(ws, p))
-                }
-            })
-            .child(
-                div()
-                    .flex_1()
-                    .overflow_hidden()
-                    .border_t_1()
-                    .border_color(p.border)
-                    .child(panel(
-                        "对话流",
-                        p,
-                        div()
-                            .id("harness-conversation".to_string())
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .overflow_y_scroll()
-                            .child(conversation),
-                    )),
-            )
-            .when_some(self.composer.clone(), |panel, composer| {
-                panel.child(
-                    div()
-                        .flex_none()
-                        .p_2()
-                        .border_t_1()
-                        .border_color(p.border)
-                        .child(Input::new(&composer).w_full()),
-                )
-            })
-    }
-
-    /// The Clarify bar: the agent needs more information before proposing.
-    fn clarify_bar(&self, ws: &S::Workspace, p: Palette) -> impl IntoElement {
-        let mut bar = div()
-            .flex_none()
-            .p_2()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .border_t_1()
-            .border_color(p.border)
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(p.warning)
-                    .child("AI 需要补充信息，请回答以下问题（通过输入框提交）："),
-            );
-
-        for (i, question) in ws.clarify_questions().iter().enumerate() {
-            bar = bar.child(div().text_sm().text_color(p.fg).child(format!(
-                "{}. {}",
-                i + 1,
-                question
-            )));
-        }
-
-        bar
-    }
-
-    /// The approval bar: the plan failed verification and waits on the user.
-    fn plan_decision_bar(&self, ws: &S::Workspace, p: Palette) -> impl IntoElement {
-        let mut bar = div()
-            .flex_none()
-            .p_2()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
-            .border_t_1()
-            .border_color(p.border)
-            .child(
-                div()
-                    .flex_1()
-                    .text_xs()
-                    .text_color(p.warning)
-                    .child(format!(
-                        "plan {}：验证未通过，等你决定",
-                        ws.plan_phase().label()
-                    )),
-            );
-
-        for (label, decision) in [
-            ("接受", PlanDecision::Accept),
-            ("回滚", PlanDecision::Reject),
-            ("修改", PlanDecision::Modify),
-        ] {
-            let callback = self.on_plan_decision.clone();
-            let session_id = ws.session_id().clone();
-            bar = bar.child(
-                div()
-                    .id(format!("harness-plan-decision-{label}"))
-                    .px_2()
-                    .py_1()
-                    .rounded(px(4.0))
-                    .border_1()
-                    .border_color(p.border)
-                    .cursor_pointer()
-                    .text_xs()
-                    .child(label)
-                    .on_click(move |_, _, _| {
-                        if let Some(callback) = callback.clone() {
-                            (callback.borrow())(&session_id, decision);
-                        }
-                    }),
-            );
-        }
-
-        // Settlement items the product reports (per-feature accept/reject).
-        let settlement = ws.settlement_items();
-        if !settlement.is_empty() {
-            bar = bar.child(
-                div()
-                    .flex_none()
-                    .text_xs()
-                    .text_color(p.muted)
-                    .child("逐项: "),
-            );
-            for (name, accepted) in settlement {
-                let color = if accepted { p.success } else { p.danger };
-                bar = bar.child(
-                    div()
-                        .id(format!("harness-settlement-{name}"))
-                        .px_2()
-                        .py_1()
-                        .rounded(px(4.0))
-                        .border_1()
-                        .border_color(color)
-                        .cursor_pointer()
-                        .text_xs()
-                        .text_color(color)
-                        .child(format!("{} {}", if accepted { "✓" } else { "✗" }, name))
-                        .on_click(move |_, _, _| {}),
-                );
-            }
-        }
-        bar
+            .child(self.render_stream(cx))
+            .child(self.activity_bar(ws, cx))
+            .children(self.rewind_section(cx))
+            .children(self.completion_list(cx))
+            .child(self.composer_area(ws, cx))
     }
 
     /// The open project has no sessions yet: the session list is empty and there
@@ -1176,75 +1598,14 @@ impl<S: SessionView> HarnessShell<S> {
             .child(
                 div()
                     .text_sm()
-                    .child(format!("工程「{}」还没有会话", self.store.borrow().open_project().name)),
+                    .child(self.trf("shell.no_sessions_in_project", &[("name", &self.store.borrow().open_project().name)])),
             )
             .child(
                 div()
                     .text_xs()
                     .text_color(p.muted)
-                    .child("会话的创建与事件日志随会话内核落地；项目层已把工程目录与清单读进来了"),
+                    .child(self.tr("shell.sessions_note")),
             )
-    }
-
-    /// The conversation stream of the active session.
-    fn conversation_stream(
-        &self,
-        blocks: &[Block],
-        p: Palette,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let selected = self.selected_block;
-        let mut stream = div().flex().flex_col().gap_2();
-        for block in blocks {
-            let color = block_color(block.kind, p);
-            let anchor = format!("#{}", block.event_seq);
-            let is_selected = selected == Some(block.event_seq);
-            let seq = block.event_seq;
-            let mut head = div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .child(div().text_xs().text_color(color).child(block.kind.label()))
-                .child(div().text_xs().text_color(p.muted).child(anchor));
-            if let Some(state) = block.tool_state {
-                head = head.child(badge(state.label(), tool_color(state, p)));
-            }
-            stream = stream.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .px_2()
-                    .py_1()
-                    .rounded(px(4.))
-                    .cursor_pointer()
-                    .when(is_selected, |d| d.bg(p.accent.opacity(0.2)))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this: &mut Self, _ev: &MouseDownEvent, _w, cx| {
-                            this.select_block(Some(seq));
-                            cx.notify();
-                        }),
-                    )
-                    .child(head)
-                    .when_some(block.selection_ref.as_ref(), |d, sel| {
-                        d.child(
-                            div()
-                                .px_2()
-                                .py_0p5()
-                                .rounded(px(3.))
-                                .bg(p.info.opacity(0.16))
-                                .text_color(p.info)
-                                .text_xs()
-                                .cursor_pointer()
-                                .child(format!("📍 {sel}")),
-                        )
-                    })
-                    .child(div().text_sm().child(block.text.clone())),
-            );
-        }
-        stream
     }
 
     /// Renders one dock region: every registered panel of that area, stacked.
@@ -1255,6 +1616,9 @@ impl<S: SessionView> HarnessShell<S> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        // Only this region's panels, in their order.
+        let mut panels: Vec<&PanelDef<S>> = panels.iter().filter(|p| p.area == area).collect();
+        panels.sort_by_key(|p| p.order);
         if panels.is_empty() {
             return div().into_any_element();
         }
@@ -1270,7 +1634,7 @@ impl<S: SessionView> HarnessShell<S> {
                     self.panel_host.product_element(panel, self, window, cx)
                 }
                 crate::panels::PanelSource::Script(script) => {
-                    self.panel_host.script_element(&panel.id, script, window, cx)
+                    self.panel_host.script_element(&panel.id, script, self.locale, window, cx)
                 }
             };
             let p = palette(cx);
@@ -1296,13 +1660,18 @@ impl<S: SessionView> HarnessShell<S> {
                     .child(div().flex_1().overflow_hidden().child(body)),
             );
         }
-        let _ = area;
         column.into_any_element()
     }
 }
 
-/// A header icon button (save / load / import).
-fn header_button(id: &'static str, label: &'static str, border: Hsla) -> Stateful<Div> {
+/// A header button: an icon and a word.
+fn header_button(
+    id: &'static str,
+    icon: Icon,
+    label: &'static str,
+    color: Hsla,
+    border: Hsla,
+) -> Stateful<Div> {
     div()
         .id(id)
         .text_sm()
@@ -1315,94 +1684,291 @@ fn header_button(id: &'static str, label: &'static str, border: Hsla) -> Statefu
         .flex_row()
         .items_center()
         .gap_1()
-        .child(img(assets::icon(id)).w(px(14.)).h(px(14.)))
+        .child(icons::icon(icon, color))
         .child(label)
 }
 
-/// Asset paths, kept in one place so the header buttons stay declarative.
-mod assets {
-    pub fn icon(id: &str) -> String {
-        let name = match id {
-            "harness-save" => "save",
-            "harness-load" => "load",
-            "harness-import" => "import",
-            _ => "settings",
-        };
-        format!("{}/assets/{name}.svg", env!("CARGO_MANIFEST_DIR"))
-    }
+
+/// The avatar letter the account chip shows: the display name's first
+/// character (`U` for the empty name, matching the placeholder the chip
+/// replaced).
+pub(crate) fn avatar_letter(name: &str) -> char {
+    name.trim().chars().next().unwrap_or('U')
 }
 
-/// `(done, total)` of a workspace's plan.
-fn plan_progress_of<W: WorkspaceView>(ws: &W) -> (usize, usize) {
-    plan_progress(&ws.plan())
-}
+/// The framework's plugins panel body, registered by
+/// [`HarnessShell::set_plugins`]: loaded plugins with a runtime disable,
+/// rejected plugins with the reason. The disable removes exactly the
+/// plugin's own panels — the trust boundary stays declarative.
+fn plugins_panel<S: SessionView>(
+    shell: &HarnessShell<S>,
+    _workspace: &S::Workspace,
+    _window: &mut Window,
+    cx: &mut Context<HarnessShell<S>>,
+) -> AnyElement {
+    let p = palette(cx);
+    let mut column = div().flex().flex_col().gap_1().px_1();
 
-fn plan_rows(plan: &[PlanStep], p: Palette) -> impl IntoElement {
-    let mut rows = div().flex().flex_col().gap_1();
-    for step in plan {
-        let color = step_color(step.status, p);
-        rows = rows.child(
-            div()
+    if let Some(plugins) = shell.plugins.clone() {
+        for entry in plugins {
+            let (badge_text, color) = if entry.enabled {
+                (shell.tr("plugins.enabled"), p.success)
+            } else {
+                (shell.tr("plugins.disabled"), p.muted)
+            };
+            let id = entry.id.clone();
+            let mut row = div()
                 .flex()
                 .flex_row()
                 .items_center()
                 .gap_2()
                 .child(
                     div()
-                        .w(px(8.))
-                        .h(px(8.))
-                        .flex_none()
-                        .rounded(px(4.))
-                        .bg(color),
+                        .text_xs()
+                        .min_w_0()
+                        .child(crate::widgets::truncate(&id, 36)),
                 )
-                .child(div().flex_1().text_sm().child(step.text.clone()))
+                .child(crate::shell::badge(badge_text, color));
+            if entry.enabled {
+                row = row.child(crate::widgets::button(
+                    format!("harness-plugin-disable-{}", id),
+                    shell.tr("plugins.disable"),
+                    p.danger,
+                    cx,
+                    cx.listener(move |shell, _event, _window, _cx| {
+                        shell.disable_plugin(&id);
+                    }),
+                ));
+            }
+            column = column.child(row);
+        }
+    } else {
+        column = column
+            .child(div().text_xs().text_color(p.muted).child(shell.tr("plugins.not_shared")));
+    }
+    for (plugin, reason) in shell.rejected_plugins.clone() {
+        column = column.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .child(div().text_xs().text_color(p.danger).child(shell.trf(
+                    "plugins.rejected",
+                    &[("name", &crate::widgets::truncate(&plugin, 36))],
+                )))
                 .child(
                     div()
                         .text_xs()
                         .text_color(p.muted)
-                        .child(step.status.label()),
+                        .child(crate::widgets::truncate(&reason, 64)),
                 ),
         );
     }
-    rows
+    column.into_any_element()
 }
+
+/// The framework's diagnostics panel body, registered by
+/// [`HarnessShell::new`] — framework chrome like workbench-rs's
+/// DiagnosticsPanel. It reads nothing but shell state: identity, store
+/// shape, panel/script health, viewport liveness, settings wiring.
+fn diagnostics_panel<S: SessionView>(
+    shell: &HarnessShell<S>,
+    _workspace: &S::Workspace,
+    _window: &mut Window,
+    cx: &mut Context<HarnessShell<S>>,
+) -> AnyElement {
+    let p = palette(cx);
+    let store = shell.store.borrow();
+    let rows: Vec<(String, String)> = vec![
+        (
+            shell.tr("diagnostics.product").to_string(),
+            shell.product_name.clone(),
+        ),
+        (
+            shell.tr("diagnostics.theme").to_string(),
+            shell.theme().as_str().to_string(),
+        ),
+        (
+            shell.tr("diagnostics.projects").to_string(),
+            store.projects().len().to_string(),
+        ),
+        (
+            shell.tr("diagnostics.sessions").to_string(),
+            shell.trf(
+                "diagnostics.sessions_in_project",
+                &[
+                    ("count", &store.open_project_sessions().len().to_string()),
+                    ("name", &store.open_project().name),
+                ],
+            ),
+        ),
+        (
+            shell.tr("diagnostics.panels").to_string(),
+            shell.panel_host.len().to_string(),
+        ),
+        (
+            shell.tr("diagnostics.script_panels").to_string(),
+            shell.trf(
+                "diagnostics.mounted_errors",
+                &[
+                    ("mounted", &shell.panel_host.mounted_scripts().to_string()),
+                    ("errors", &shell.panel_host.script_errors().len().to_string()),
+                ],
+            ),
+        ),
+        (
+            shell.tr("diagnostics.viewport_frames").to_string(),
+            shell.painted_frames().to_string(),
+        ),
+        (
+            shell.tr("diagnostics.settings").to_string(),
+            shell
+                .settings_path()
+                .unwrap_or_else(|| shell.tr("diagnostics.settings_unconnected").to_string()),
+        ),
+        (
+            shell.tr("diagnostics.account").to_string(),
+            shell
+                .account()
+                .map(|account| account.display_name.clone())
+                .unwrap_or_else(|| shell.tr("diagnostics.guest").to_string()),
+        ),
+    ];
+    div()
+        .flex()
+        .flex_wrap()
+        .gap_x_4()
+        .gap_y_1()
+        .px_1()
+        .children(rows.into_iter().map(|(label, value)| {
+            div()
+                .flex()
+                .flex_row()
+                .gap_1()
+                .child(div().text_xs().text_color(p.muted).child(label.to_string()))
+                .child(
+                    div()
+                        .text_xs()
+                        .min_w_0()
+                        .child(crate::widgets::truncate(&value, 48)),
+                )
+                .into_any_element()
+        }))
+        .into_any_element()
+}
+
+
 
 impl<S: SessionView> Render for HarnessShell<S> {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
+        // Bring the conversation on screen up to the workspace's projection.
+        let conversation = self
+            .workspace
+            .as_ref()
+            .map(|ws| ws.conversation())
+            .unwrap_or_default();
+        self.show_conversation(conversation);
+        // A session that has gone idle gets the next message it was holding.
+        self.drain_queues();
+        let window_width = f32::from(window.viewport_size().width);
+        self.layout.observe(window_width);
+        let regions = self.layout.regions(window_width, self.has_right_dock());
+
+        // Where the keyboard rests when nothing else holds the focus: without
+        // it GPUI has no focus path to send the shell's key bindings along
+        // until something is clicked.
+        let anchor = self
+            .focus_anchor
+            .get_or_insert_with(|| cx.focus_handle())
+            .clone();
+        if window.focused(cx).is_none() {
+            window.focus(&anchor, cx);
+        }
+        // The sidebar takes the keyboard as a whole: its rows are moved
+        // through with the arrows.
+        if self.sidebar_focus.is_none() {
+            self.sidebar_focus = Some(cx.focus_handle());
+        }
+
         // The registry is cloned out so the panel factories can be called with
         // an immutable borrow of the shell.
-        let panels = self.panel_host.panels().to_vec();
+        let panels = self.panel_host.visible_panels();
         let left = self.dock_region(PanelArea::Left, &panels, window, cx);
         let right = self.dock_region(PanelArea::Right, &panels, window, cx);
         let top = self.dock_region(PanelArea::Top, &panels, window, cx);
         let bottom = self.dock_region(PanelArea::Bottom, &panels, window, cx);
 
-        let body = match self.workspace.as_ref() {
+        let mut body = div().flex_1().flex().flex_row().overflow_hidden().child(left);
+        if let Some(width) = regions.sidebar {
+            body = body
+                .child(self.render_sidebar(width, cx))
+                .child(self.divider(Divider::Sidebar, cx));
+        }
+        match self.workspace.as_ref() {
             Some(ws) => {
-                let ai = self.ai_workspace(ws, cx).into_any_element();
-                let viewport = self.viewport_panel(window, cx).into_any_element();
-                div()
-                    .flex_1()
-                    .flex()
-                    .flex_row()
-                    .overflow_hidden()
-                    .child(self.sidebar(cx))
-                    .child(ai)
-                    .child(viewport)
-                    .child(right)
-                    .into_any_element()
+                if let Some(width) = regions.column {
+                    // Alone in a stacked layout the column takes the window.
+                    let alone = regions.viewport.is_none();
+                    body = body.child(
+                        div()
+                            .h_full()
+                            .flex()
+                            .flex_col()
+                            .overflow_hidden()
+                            .map(|d| {
+                                if alone {
+                                    d.flex_1().min_w_0()
+                                } else {
+                                    d.w(px(width)).flex_none()
+                                }
+                            })
+                            .child(self.toolbar(regions.fold, cx))
+                            .child(self.ai_workspace(ws, cx)),
+                    );
+                }
+                if regions.column.is_some() && regions.viewport.is_some() {
+                    body = body.child(self.divider(Divider::Column, cx));
+                }
+                if regions.viewport.is_some() {
+                    // The main area: it takes whatever the others leave.
+                    body = body.child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .flex()
+                            .flex_col()
+                            .when(regions.column.is_none(), |d| {
+                                d.child(self.viewport_return_bar(cx))
+                            })
+                            .child(div().flex_1().min_h_0().child(self.viewport_slot()))
+                            // Alone in the window, the viewport keeps a way
+                            // to talk to the session under it.
+                            .when(regions.column.is_none(), |d| {
+                                d.child(self.composer_strip(ws, cx))
+                            }),
+                    );
+                }
             }
-            None => div()
-                .flex_1()
-                .flex()
-                .flex_row()
-                .overflow_hidden()
-                .child(self.sidebar(cx))
-                .child(self.empty_workspace(cx))
-                .child(right)
-                .into_any_element(),
-        };
+            None => {
+                body = body.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .flex()
+                        .flex_col()
+                        .child(self.toolbar(regions.fold, cx))
+                        .child(self.empty_workspace(cx)),
+                );
+            }
+        }
+        if let Some(width) = regions.dock {
+            body = body
+                .child(self.divider(Divider::Dock, cx))
+                .child(div().w(px(width)).flex_none().h_full().overflow_hidden().child(right));
+        }
 
         div()
             .size_full()
@@ -1410,17 +1976,153 @@ impl<S: SessionView> Render for HarnessShell<S> {
             .flex_col()
             .bg(cx.theme().background)
             .text_color(p.fg)
-            .child(self.header(cx))
-            .child(top)
-            .child(
-                div()
-                    .flex_1()
-                    .flex()
-                    .flex_row()
-                    .overflow_hidden()
-                    .child(left)
-                    .child(body),
+            .key_context(KEY_CONTEXT)
+            .on_action(cx.listener(|this: &mut Self, _: &ToggleSidebar, window, cx| {
+                this.toggle_sidebar(f32::from(window.viewport_size().width));
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this: &mut Self, _: &ToggleDock, window, cx| {
+                this.toggle_dock(f32::from(window.viewport_size().width));
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this: &mut Self, _: &CyclePermissionMode, _window, cx| {
+                this.cycle_permission_mode();
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this: &mut Self, _: &StopTurn, _window, cx| {
+                // An open menu or dialog takes Escape first.
+                if this.close_settings() || this.close_session_menu() {
+                    cx.notify();
+                    return;
+                }
+                // Escape with nothing running is for whatever else wants it.
+                if this.stop_turn() {
+                    cx.notify();
+                } else {
+                    cx.propagate();
+                }
+            }))
+            .on_action(cx.listener(|this: &mut Self, _: &OpenPalette, window, cx| {
+                this.open_palette(window, cx);
+            }))
+            .on_action(cx.listener(|this: &mut Self, _: &OpenSettings, _window, cx| {
+                this.open_settings();
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this: &mut Self, _: &NewSession, window, cx| {
+                this.run_command_in(crate::palette::id::NEW_SESSION, window, cx);
+            }))
+            .on_action(cx.listener(|this: &mut Self, _: &NextSession, window, cx| {
+                this.run_command_in(crate::palette::id::NEXT_SESSION, window, cx);
+            }))
+            .on_action(cx.listener(|this: &mut Self, _: &PreviousSession, window, cx| {
+                this.run_command_in(crate::palette::id::PREVIOUS_SESSION, window, cx);
+            }))
+            .on_action(cx.listener(|this: &mut Self, _: &JumpToEnd, window, cx| {
+                this.run_command_in(crate::palette::id::JUMP_TO_END, window, cx);
+            }))
+            .on_action(cx.listener(|this: &mut Self, _: &ToggleTools, window, cx| {
+                this.run_command_in(crate::palette::id::TOGGLE_TOOLS, window, cx);
+            }))
+            .on_action(cx.listener(|this: &mut Self, _: &PreviousUserMessage, _window, cx| {
+                this.stream.step_user_message(-1);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this: &mut Self, _: &NextUserMessage, _window, cx| {
+                this.stream.step_user_message(1);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this: &mut Self, _: &FocusComposer, window, cx| {
+                if let Some(composer) = this.composer.clone() {
+                    composer.update(cx, |state, cx| state.focus(window, cx));
+                }
+            }))
+            .on_action(cx.listener(|this: &mut Self, _: &PaletteUp, _window, cx| {
+                this.step_palette(-1, cx);
+            }))
+            .on_action(cx.listener(|this: &mut Self, _: &PaletteDown, _window, cx| {
+                this.step_palette(1, cx);
+            }))
+            .on_action(cx.listener(|this: &mut Self, _: &PaletteClose, window, cx| {
+                this.close_palette(window, cx);
+            }))
+            .on_action(cx.listener(|this: &mut Self, _: &FocusSidebar, window, cx| {
+                // A hidden sidebar is shown first.
+                let width = f32::from(window.viewport_size().width);
+                if this.layout.reveal_sidebar(width) {
+                    this.save_layout();
+                }
+                if let Some(focus) = this.sidebar_focus.clone() {
+                    window.focus(&focus, cx);
+                }
+                if this.sidebar_selected.is_none() {
+                    this.step_sidebar(1);
+                }
+                cx.notify();
+            }))
+            // A divider drag is followed here, at the root, so it keeps going
+            // wherever the pointer is.
+            .on_mouse_move(cx.listener(|this: &mut Self, ev: &MouseMoveEvent, window, cx| {
+                let Some(drag) = this.dragging else {
+                    return;
+                };
+                if !ev.dragging() {
+                    // The button came up somewhere that did not tell us.
+                    this.end_drag();
+                    cx.notify();
+                    return;
+                }
+                let moved = f32::from(ev.position.x) - drag.start_x;
+                // The dock grows as its divider moves left.
+                let width = match drag.divider {
+                    Divider::Dock => drag.start_width - moved,
+                    _ => drag.start_width + moved,
+                };
+                let window_width = f32::from(window.viewport_size().width);
+                let has_dock = this.has_right_dock();
+                if this.layout.resize(drag.divider, width, window_width, has_dock) {
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this: &mut Self, _ev: &MouseUpEvent, _w, cx| {
+                    if this.dragging.is_some() {
+                        this.end_drag();
+                        cx.notify();
+                    }
+                }),
             )
+            // Sizeless, so a click never lands on it and pulls the focus away
+            // from a panel or an input.
+            .child(div().track_focus(&anchor))
+            .child(self.header(regions.fold, cx))
+            .child(top)
+            .child(body)
             .child(bottom)
+            .children(self.session_menu_overlay(window, cx))
+            .children(self.settings_overlay(window, cx))
+            .children(self.palette_overlay(cx))
     }
+}
+
+/// A toolbar button that is only an icon.
+fn toolbar_button(id: &'static str, icon: Icon, color: Hsla) -> Stateful<Div> {
+    div()
+        .id(id)
+        .p_1()
+        .rounded(px(4.))
+        .cursor_pointer()
+        .child(sized(icon, 16., color))
+}
+
+/// A toolbar button that is only a word.
+fn text_button(id: &'static str, label: &'static str, p: Palette) -> Stateful<Div> {
+    div()
+        .id(id)
+        .px_2()
+        .text_xs()
+        .text_color(p.muted)
+        .cursor_pointer()
+        .child(label)
 }

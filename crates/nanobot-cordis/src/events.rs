@@ -1,12 +1,11 @@
-//! Events: typed event bus with 4 dispatch modes (design-harness 10.5).
+//! Events: typed event bus with 3 dispatch modes (design-harness 10.5).
 //!
-//! Listeners are stored keyed by `(event name, Payload TypeId, Result TypeId)`.
-//! Four dispatch modes are supported:
+//! Listeners are stored keyed by `(event name, Payload TypeId[, Result TypeId])`.
+//! Three dispatch modes are supported:
 //!
 //! - `emit` — fire-and-forget observer (telemetry, UI projection)
 //! - `serial` — ask each listener in turn, first `Some<R>` wins (capability query)
 //! - `waterfall` — payload flows through the listener chain, each gets `(payload, next)`
-//! - `waterfall_async` — async variant for tool bodies that need to await
 //!
 //! All listeners are type-erased via `Box<dyn Any>` and safely downcast at
 //! invocation time. If a payload type does not match the registered `TypeId`,
@@ -15,7 +14,6 @@
 use crate::disposable::{Disposable, FnDisposable};
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 // Type aliases for type-erased listeners.
@@ -33,36 +31,48 @@ type WaterfallListener = Arc<
         + Sync,
 >;
 
-type AsyncWaterfallListener = Arc<
-    dyn Fn(
-            Box<dyn Any + Send + Sync>,
-            Box<
-                dyn Fn(
-                        Box<dyn Any + Send + Sync>,
-                    ) -> Pin<
-                        Box<dyn std::future::Future<Output = Box<dyn Any + Send + Sync>> + Send>,
-                    > + Send
-                    + Sync,
-            >,
-        ) -> Pin<Box<dyn std::future::Future<Output = Box<dyn Any + Send + Sync>> + Send>>
-        + Send
-        + Sync,
+/// The sync passthrough a waterfall chains through.
+type Passthrough = Arc<
+    dyn Fn(Box<dyn Any + Send + Sync>) -> Box<dyn Any + Send + Sync> + Send + Sync,
 >;
 
-/// Typed event bus with 4 dispatch modes.
+type EmitListeners = Arc<Mutex<HashMap<(&'static str, TypeId), Vec<EmitListener>>>>;
+type SerialListeners = Arc<Mutex<HashMap<(&'static str, TypeId, TypeId), Vec<SerialListener>>>>;
+type WaterfallListeners =
+    Arc<Mutex<HashMap<(&'static str, TypeId, TypeId), Vec<WaterfallListener>>>>;
+
+/// A disposable that pops the last listener registered under `key`.
+///
+/// Every registrar hands back the same shape of effect, so it lives here once
+/// instead of once per mode.
+fn pop_last<K, L>(store: &Arc<Mutex<HashMap<K, Vec<L>>>>, key: K) -> Arc<dyn Disposable>
+where
+    K: Eq + std::hash::Hash + Clone + Send + Sync + 'static,
+    L: Send + Sync + 'static,
+{
+    let store = Arc::clone(store);
+    let key = key.clone();
+    Arc::new(FnDisposable::new(move || {
+        let mut map = store.lock().unwrap();
+        if let Some(listeners) = map.get_mut(&key) {
+            listeners.pop();
+            if listeners.is_empty() {
+                map.remove(&key);
+            }
+        }
+    }))
+}
+
+/// Typed event bus with 3 dispatch modes.
 ///
 /// `Events` is `Clone` — each clone shares the same underlying listener
-/// stores via `Arc`. This allows `Context` to own one `Events` and hand
-/// out clones to children, while disposables capture `Arc<Mutex<...>>`
-/// handles that remain valid for `'static`.
+/// stores via `Arc`. Disposables capture `Arc<Mutex<...>>` handles that remain
+/// valid for `'static`.
 #[derive(Clone, Default)]
 pub struct Events {
-    emit_listeners: Arc<Mutex<HashMap<(&'static str, TypeId), Vec<EmitListener>>>>,
-    serial_listeners: Arc<Mutex<HashMap<(&'static str, TypeId, TypeId), Vec<SerialListener>>>>,
-    waterfall_listeners:
-        Arc<Mutex<HashMap<(&'static str, TypeId, TypeId), Vec<WaterfallListener>>>>,
-    async_waterfall_listeners:
-        Arc<Mutex<HashMap<(&'static str, TypeId, TypeId), Vec<AsyncWaterfallListener>>>>,
+    emit_listeners: EmitListeners,
+    serial_listeners: SerialListeners,
+    waterfall_listeners: WaterfallListeners,
 }
 
 impl Events {
@@ -79,20 +89,14 @@ impl Events {
             }
         });
 
-        let mut map = self.emit_listeners.lock().unwrap();
-        map.entry((name, type_id)).or_default().push(wrapped);
-        drop(map);
+        self.emit_listeners
+            .lock()
+            .unwrap()
+            .entry((name, type_id))
+            .or_default()
+            .push(wrapped);
 
-        let store = Arc::clone(&self.emit_listeners);
-        Arc::new(FnDisposable::new(move || {
-            let mut map = store.lock().unwrap();
-            if let Some(listeners) = map.get_mut(&(name, type_id)) {
-                listeners.pop();
-                if listeners.is_empty() {
-                    map.remove(&(name, type_id));
-                }
-            }
-        }))
+        pop_last(&self.emit_listeners, (name, type_id))
     }
 
     /// Emit an event named `name` with payload `payload`.
@@ -127,22 +131,14 @@ impl Events {
             }
         });
 
-        let mut map = self.serial_listeners.lock().unwrap();
-        map.entry((name, type_id, result_type_id))
+        self.serial_listeners
+            .lock()
+            .unwrap()
+            .entry((name, type_id, result_type_id))
             .or_default()
             .push(wrapped);
-        drop(map);
 
-        let store = Arc::clone(&self.serial_listeners);
-        Arc::new(FnDisposable::new(move || {
-            let mut map = store.lock().unwrap();
-            if let Some(listeners) = map.get_mut(&(name, type_id, result_type_id)) {
-                listeners.pop();
-                if listeners.is_empty() {
-                    map.remove(&(name, type_id, result_type_id));
-                }
-            }
-        }))
+        pop_last(&self.serial_listeners, (name, type_id, result_type_id))
     }
 
     /// Query a serial event named `name` with payload `P`, returning the first `Some<R>`.
@@ -200,22 +196,14 @@ impl Events {
             },
         );
 
-        let mut map = self.waterfall_listeners.lock().unwrap();
-        map.entry((name, type_id, result_type_id))
+        self.waterfall_listeners
+            .lock()
+            .unwrap()
+            .entry((name, type_id, result_type_id))
             .or_default()
             .push(wrapped);
-        drop(map);
 
-        let store = Arc::clone(&self.waterfall_listeners);
-        Arc::new(FnDisposable::new(move || {
-            let mut map = store.lock().unwrap();
-            if let Some(listeners) = map.get_mut(&(name, type_id, result_type_id)) {
-                listeners.pop();
-                if listeners.is_empty() {
-                    map.remove(&(name, type_id, result_type_id));
-                }
-            }
-        }))
+        pop_last(&self.waterfall_listeners, (name, type_id, result_type_id))
     }
 
     /// Drive a waterfall event named `name` with payload `P` through the listener chain.
@@ -239,9 +227,7 @@ impl Events {
                 return None;
             }
 
-            let mut next: Arc<
-                dyn Fn(Box<dyn Any + Send + Sync>) -> Box<dyn Any + Send + Sync> + Send + Sync,
-            > = Arc::new(|b| b);
+            let mut next: Passthrough = Arc::new(|b| b);
             for listener in listeners.iter() {
                 let listener = Arc::clone(listener);
                 let prev_next = Arc::clone(&next);
@@ -253,78 +239,5 @@ impl Events {
         } else {
             None
         }
-    }
-
-    /// Register an async waterfall listener for events named `name`.
-    pub fn on_waterfall_async<P, R>(
-        &self,
-        name: &'static str,
-        listener: impl Fn(
-                P,
-                Box<
-                    dyn Fn(
-                            Box<dyn Any + Send + Sync>,
-                        ) -> Pin<
-                            Box<
-                                dyn std::future::Future<Output = Box<dyn Any + Send + Sync>> + Send,
-                            >,
-                        > + Send
-                        + Sync,
-                >,
-            )
-                -> Pin<Box<dyn std::future::Future<Output = Box<dyn Any + Send + Sync>> + Send>>
-            + Send
-            + Sync
-            + 'static,
-    ) -> Arc<dyn Disposable>
-    where
-        P: Any + Send + Sync + Clone,
-        R: Any + Send + Sync,
-    {
-        let type_id = TypeId::of::<P>();
-        let result_type_id = TypeId::of::<R>();
-        let listener = Arc::new(listener);
-        let wrapped: AsyncWaterfallListener = Arc::new(
-            move |payload: Box<dyn Any + Send + Sync>,
-                  next: Box<
-                dyn Fn(
-                        Box<dyn Any + Send + Sync>,
-                    ) -> Pin<
-                        Box<dyn std::future::Future<Output = Box<dyn Any + Send + Sync>> + Send>,
-                    > + Send
-                    + Sync,
-            >|
-                  -> Pin<
-                Box<dyn std::future::Future<Output = Box<dyn Any + Send + Sync>> + Send>,
-            > {
-                let listener = Arc::clone(&listener);
-                Box::pin(async move {
-                    match payload.downcast::<P>() {
-                        Ok(p_box) => {
-                            let p = *p_box;
-                            listener(p, next).await
-                        }
-                        Err(payload) => next(payload).await,
-                    }
-                })
-            },
-        );
-
-        let mut map = self.async_waterfall_listeners.lock().unwrap();
-        map.entry((name, type_id, result_type_id))
-            .or_default()
-            .push(wrapped);
-        drop(map);
-
-        let store = Arc::clone(&self.async_waterfall_listeners);
-        Arc::new(FnDisposable::new(move || {
-            let mut map = store.lock().unwrap();
-            if let Some(listeners) = map.get_mut(&(name, type_id, result_type_id)) {
-                listeners.pop();
-                if listeners.is_empty() {
-                    map.remove(&(name, type_id, result_type_id));
-                }
-            }
-        }))
     }
 }

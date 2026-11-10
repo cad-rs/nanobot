@@ -20,7 +20,6 @@ fn derive_messages_projects_model_visible() {
     s.append(SessionEvent::UserMessage {
         content: "hello".into(),
         image: None,
-            selection_ref: None,
     });
     s.append(SessionEvent::AssistantMessage {
         content: "hi".into(),
@@ -57,7 +56,6 @@ fn a_user_message_with_an_image_projects_the_image() {
     s.append(SessionEvent::UserMessage {
         content: "read the drawing".into(),
         image: Some("data:image/png;base64,AAAA".into()),
-        selection_ref: None,
     });
 
     let messages = s.derive_messages();
@@ -77,7 +75,6 @@ fn truncate_to_rewinds_the_log_and_resumes_numbering() {
     s.append(SessionEvent::UserMessage {
         content: "keep me".into(),
         image: None,
-            selection_ref: None,
     }); // seq 1
     s.append(SessionEvent::ToolCall {
         id: "c1".into(),
@@ -89,7 +86,6 @@ fn truncate_to_rewinds_the_log_and_resumes_numbering() {
         id: "c1".into(),
         success: true,
         output: "{}".into(),
-        topology_signature: None,
     }); // seq 3
 
     s.truncate_to(1);
@@ -140,7 +136,6 @@ fn persist_to_writes_the_log_as_it_grows() {
     session.append(SessionEvent::UserMessage {
         content: "hello".into(),
         image: None,
-            selection_ref: None,
     });
 
     let loaded = nanobot_session::load(&path).expect("the log is readable");
@@ -167,7 +162,6 @@ fn a_rewind_reaches_the_file_on_the_next_append() {
     session.append(SessionEvent::UserMessage {
         content: "make a plate".into(),
         image: None,
-            selection_ref: None,
     });
     session.append(SessionEvent::ToolCall {
         id: "call_1".into(),
@@ -216,7 +210,6 @@ fn audit_to_records_every_tool_call_with_its_outcome() {
         id: "call_1".into(),
         success: true,
         output: r#"{"ok":true}"#.into(),
-        topology_signature: None,
     });
     session.append(SessionEvent::ToolCall {
         id: "call_2".into(),
@@ -228,7 +221,6 @@ fn audit_to_records_every_tool_call_with_its_outcome() {
         id: "call_2".into(),
         success: false,
         output: r#"{"ok":false}"#.into(),
-        topology_signature: None,
     });
 
     let text = std::fs::read_to_string(&path).expect("the audit log exists");
@@ -253,7 +245,6 @@ fn persistence_roundtrip() {
     s.append(SessionEvent::UserMessage {
         content: "test".into(),
         image: None,
-            selection_ref: None,
     });
 
     let path = std::env::temp_dir().join("nanobot_session_test.jsonl");
@@ -262,4 +253,51 @@ fn persistence_roundtrip() {
     let loaded = nanobot_session::load(&path).unwrap();
     assert_eq!(loaded.len(), 1);
     std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn revert_records_the_rollback_on_the_log() {
+    let s = Session::new("revert");
+    s.append(SessionEvent::TurnStart { turn: 0 }); // seq 0
+    s.append(SessionEvent::UserMessage {
+        content: "keep".into(),
+        image: None,
+    }); // seq 1
+    s.append(SessionEvent::ToolCall {
+        id: "c1".into(),
+        name: "x".into(),
+        arguments: serde_json::json!({}),
+        seq: 0,
+    }); // seq 2
+
+    let reverted = s.revert_to(1);
+    assert_eq!(reverted, 1);
+    let events = s.events();
+    assert_eq!(events.len(), 3, "prefix + the revert marker: {events:?}");
+    assert!(
+        matches!(
+            events.last().unwrap().event,
+            SessionEvent::SessionReverted {
+                to_seq: 1,
+                reverted: 1
+            }
+        ),
+        "the revert is on the record: {:?}",
+        events.last().unwrap().event
+    );
+    // The rolled-back tool call leaves the projected model history too.
+    assert!(
+        s.derive_messages()
+            .iter()
+            .all(|m| !matches!(m, ProjectedMessage::ToolCall { .. })),
+        "a reverted tool call must not stay in the model's history"
+    );
+}
+
+#[test]
+fn revert_past_the_end_is_a_noop() {
+    let s = Session::new("revert_noop");
+    s.append(SessionEvent::TurnStart { turn: 0 });
+    assert_eq!(s.revert_to(99), 0);
+    assert_eq!(s.len(), 1);
 }

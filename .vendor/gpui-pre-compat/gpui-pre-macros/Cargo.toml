@@ -1,0 +1,19 @@
+# gpui-fast's `gpui_macros` standing in for gpui-pre-macros =0.3.11; see
+# ../gpui-pre/Cargo.toml.
+[package]
+name = "gpui-pre-macros"
+version = "0.3.11"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "gpui_macros"
+path = "lib.rs"
+doctest = false
+
+[features]
+inspector = ["gpui_fast/inspector"]
+
+[dependencies]
+gpui_fast = { package = "gpui_macros", git = "https://github.com/longbridge/gpui-fast", rev = "a10f393d8033c5f52f34821d6a25cddadc6174b4", default-features = false }

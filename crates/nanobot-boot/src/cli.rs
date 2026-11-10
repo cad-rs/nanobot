@@ -161,24 +161,6 @@ pub fn agent_smoke_exit(make_builder: impl Fn() -> HarnessBuilder) -> i32 {
     }
 }
 
-/// Assemble the harness for `session_id`, drive one headless turn, and report
-/// the event count (a diagnostics mode, always exit 0).
-pub fn agent_run_exit(
-    make_builder: impl Fn(&str) -> HarnessBuilder,
-    session_id: &str,
-) -> i32 {
-    let harness = match make_builder(session_id).build() {
-        Ok(harness) => harness,
-        Err(error) => {
-            println!("FAIL: harness assembly for `{session_id}` failed: {error}");
-            return 1;
-        }
-    };
-    run_one_turn(&harness, "test");
-    let count = harness.agent.session().len();
-    println!("agent-run session {session_id}: {count} events");
-    0
-}
 
 #[cfg(test)]
 mod tests {

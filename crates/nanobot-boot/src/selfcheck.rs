@@ -15,7 +15,9 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use crate::harness::{is_user_message, run_one_turn};
+#[cfg(not(target_family = "wasm"))]
+use crate::harness::is_user_message;
+use crate::harness::run_one_turn;
 use crate::Harness;
 
 /// One selfcheck outcome.
@@ -94,22 +96,10 @@ pub fn checks(harness: &Harness) -> Vec<Check> {
         format!("events={}", harness.agent.session().len()),
     ));
 
-    // 4. Persistence round trip (probe: needs project paths).
+    // 4. Persistence round trip (probe: needs project paths; native only —
+    // the web has no file to read back, so the probe skips there).
     match harness.events_path() {
-        Some(events) => {
-            let found = nanobot_session::persistence::load(&events)
-                .map(|entries| {
-                    entries
-                        .iter()
-                        .any(|entry| is_user_message(&entry.event, SELFCHECK_TURN))
-                })
-                .unwrap_or(false);
-            checks.push(Check::new(
-                "持久化: 事件日志落盘可回读",
-                found,
-                format!("path={}", events.display()),
-            ));
-        }
+        Some(events) => checks.push(persistence_probe(&events)),
         None => checks.push(Check::skip(
             "持久化: 事件日志落盘可回读",
             "未配置项目路径",
@@ -144,11 +134,60 @@ pub fn checks(harness: &Harness) -> Vec<Check> {
         ));
     }
 
+    // 7. Recovery repair (probe: only when the previous run crashed). A tool
+    //    call without its result makes the log an invalid turn for every
+    //    provider, so a recovered session must have none left.
+    if harness.crash_recovered() {
+        let dangling =
+            nanobot_session::dangling_tool_calls(&harness.agent.session().events()).len();
+        checks.push(Check::new(
+            "崩溃恢复: 悬空调用已了结",
+            dangling == 0,
+            format!(
+                "dangling={dangling} repaired={} pending_replay={}",
+                harness.repaired_calls().len(),
+                harness.pending_resume().len()
+            ),
+        ));
+    } else {
+        checks.push(Check::skip(
+            "崩溃恢复: 悬空调用已了结",
+            "上次运行正常结束（无恢复）",
+        ));
+    }
+
     checks
 }
 
 /// Prints the checks and returns the process exit code (0 = nothing failed;
 /// SKIPs do not fail).
+/// The persistence probe's read-back half. Native reads the JSONL log; the
+/// web has no project file, so the probe skips (probe semantics: a missing
+/// prerequisite is a SKIP, never a FAIL).
+#[cfg(not(target_family = "wasm"))]
+fn persistence_probe(events: &Path) -> Check {
+    let found = nanobot_session::persistence::load(events)
+        .map(|entries| {
+            entries
+                .iter()
+                .any(|entry| is_user_message(&entry.event, SELFCHECK_TURN))
+        })
+        .unwrap_or(false);
+    Check::new(
+        "持久化: 事件日志落盘可回读",
+        found,
+        format!("path={}", events.display()),
+    )
+}
+
+#[cfg(target_family = "wasm")]
+fn persistence_probe(_events: &Path) -> Check {
+    Check::skip(
+        "持久化: 事件日志落盘可回读",
+        "wasm 没有可回读的项目文件",
+    )
+}
+
 pub fn report(checks: &[Check]) -> i32 {
     let failed = checks.iter().filter(|c| !c.ok && !c.skipped).count();
     let skipped = checks.iter().filter(|c| c.skipped).count();

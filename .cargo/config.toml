@@ -1,0 +1,5 @@
+# gpui-fast and wgpu come from git. libgit2 fails certificate revocation
+# checks behind a local proxy, where the git command line succeeds (same
+# setting as javagg/gpui-fast-wgpu-demo).
+[net]
+git-fetch-with-cli = true

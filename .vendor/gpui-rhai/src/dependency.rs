@@ -79,14 +79,25 @@ impl ModuleDependencyGraph {
 /// Returns [`DependencyError`] for invalid Rhai syntax, a dynamic import, or an
 /// invalid module ID.
 pub fn extract_imports(source: &str) -> Result<BTreeSet<ModuleId>, DependencyError> {
+    let (global, functions) = crate::engine::EXPRESSION_DEPTHS;
+    extract_imports_with_depths(source, global, functions)
+}
+
+/// [`extract_imports`] with the expression depths of the engine that will
+/// compile the source, so a Host that raises them can import deeper modules.
+pub(crate) fn extract_imports_with_depths(
+    source: &str,
+    global: usize,
+    functions: usize,
+) -> Result<BTreeSet<ModuleId>, DependencyError> {
     let mut parser = Engine::new_raw();
     parser.set_optimization_level(OptimizationLevel::None);
-    parser.set_max_expr_depths(64, 32);
+    parser.set_max_expr_depths(global, functions);
     let ast = parser
         .compile(source)
         .map_err(|error| DependencyError::Parse {
             position: error.position(),
-            message: error.to_string(),
+            message: crate::engine::explain_keyword_name(source, error).to_string(),
         })?;
     extract_imports_from_ast(&ast)
 }
@@ -167,7 +178,7 @@ impl ModuleCompileCache {
                         module: id.clone(),
                         source: source.into(),
                     })?;
-            crate::engine::validate_assignment_targets(&ast).map_err(|error| {
+            crate::engine::validate_runtime_ast(&ast).map_err(|error| {
                 DependencyError::UnsafeAst {
                     module: id.clone(),
                     message: error.to_string(),
@@ -475,7 +486,7 @@ mod tests {
         let watcher = FileWatcher::new(directory.path()).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(200));
         std::fs::write(&file, "fn view(ctx) { text(\"after\") }").unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = web_time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             let batch = watcher.poll().unwrap();
             if batch
@@ -486,7 +497,7 @@ mod tests {
                 break;
             }
             assert!(
-                std::time::Instant::now() < deadline,
+                web_time::Instant::now() < deadline,
                 "watcher event timed out"
             );
             std::thread::sleep(std::time::Duration::from_millis(25));

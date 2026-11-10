@@ -1,0 +1,35 @@
+[package]
+name = "nanobot-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "nanobot auth backends for the AccountProvider seam: OAuth2 device flow (RFC 8628), browser sign-in with PKCE (RFC 7636), offline and plugin licenses"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+nanobot-boot = { workspace = true }
+# The glob a feature list matches against (the approval policy's matcher).
+nanobot-tools = { workspace = true }
+reqwest = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+web-time.workspace = true
+ed25519-dalek.workspace = true
+
+# Browser sign-in (auth_code): the PKCE challenge, its random verifier and the
+# redirect's query. Desktop only — the loopback listener has no wasm form.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+sha2 = { version = "0.10", default-features = false }
+getrandom = "0.2"
+form_urlencoded = "1"
+
+[dev-dependencies]
+# reqwest needs a reactor; the tests drive it on a current-thread runtime.
+# Test-only — the kernel's discipline (no tokio runtime entry points) holds
+# for the crate itself, matching nanobot-llm.
+tokio = { version = "1", features = ["rt", "net", "time", "macros"] }
+# The sign-license example draws its key from the OS entropy source.
+getrandom = "0.2"

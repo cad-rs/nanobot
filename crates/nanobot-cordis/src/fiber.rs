@@ -1,13 +1,11 @@
 //! Fiber: reversible effect tracker with state machine (design-harness 10.5).
 //!
-//! A `Fiber` records all disposables (listeners, services, child fibers)
-//! registered during a plugin's body execution. On `dispose()`, all effects
-//! are unwound in **reverse order** (LIFO), ensuring dependencies are torn
-//! down before their dependents.
+//! A `Fiber` records all disposables (listeners, services) registered during a
+//! plugin's body execution. On `dispose()`, all effects are unwound in
+//! **reverse order** (LIFO), so dependencies are torn down before their
+//! dependents.
 //!
-//! Fiber state machine:
-//! `Pending` → `Loading` → `Active` → `Disposed`
-//!                  ↘ `Failed` → `Disposed`
+//! Fiber state machine: `Pending` → `Active` → `Disposed`.
 
 use crate::disposable::Disposable;
 use std::sync::{Arc, Mutex};
@@ -16,9 +14,7 @@ use std::sync::{Arc, Mutex};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FiberState {
     Pending,
-    Loading,
     Active,
-    Failed(String),
     Disposed,
     Unloading,
 }
@@ -28,7 +24,6 @@ pub struct Fiber {
     name: String,
     state: Mutex<FiberState>,
     effects: Mutex<Vec<Arc<dyn Disposable>>>,
-    children: Mutex<Vec<Arc<Fiber>>>,
 }
 
 impl Fiber {
@@ -38,7 +33,6 @@ impl Fiber {
             name: name.into(),
             state: Mutex::new(FiberState::Pending),
             effects: Mutex::new(Vec::new()),
-            children: Mutex::new(Vec::new()),
         }
     }
 
@@ -57,23 +51,13 @@ impl Fiber {
         *self.state.lock().unwrap() = FiberState::Active;
     }
 
-    /// Transition to `Failed` with a reason.
-    pub fn set_failed(&self, reason: String) {
-        *self.state.lock().unwrap() = FiberState::Failed(reason);
-    }
-
     /// Record an effect (disposable) to be reversed on dispose.
     pub fn add_effect(&self, d: Arc<dyn Disposable>) {
         self.effects.lock().unwrap().push(d);
     }
 
-    /// Register a child fiber. The child is disposed before this fiber.
-    pub fn add_child(&self, child: Arc<Fiber>) {
-        self.children.lock().unwrap().push(child);
-    }
-
-    /// Dispose the fiber: unwind all effects in reverse order, then
-    /// dispose all child fibers, then transition to `Disposed`.
+    /// Dispose the fiber: unwind all effects in reverse order, then transition
+    /// to `Disposed`.
     pub fn dispose(&self) {
         {
             let mut state = self.state.lock().unwrap();
@@ -90,15 +74,6 @@ impl Fiber {
         };
         for effect in effects.into_iter().rev() {
             effect.dispose();
-        }
-
-        // Dispose children in reverse order.
-        let children: Vec<_> = {
-            let mut children = self.children.lock().unwrap();
-            children.drain(..).collect()
-        };
-        for child in children.into_iter().rev() {
-            child.dispose();
         }
 
         *self.state.lock().unwrap() = FiberState::Disposed;

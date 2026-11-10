@@ -24,18 +24,26 @@
 
 pub mod adapter;
 pub mod assembler;
+pub mod catalog;
 pub mod chunk;
+pub mod cost;
 pub mod error;
+#[cfg(feature = "providers")]
 pub mod openai;
+pub mod retry;
 pub mod runtime;
 pub mod scripted;
 
 pub use adapter::{
-    LlmAdapter, LlmRequest, LlmResponse, Message, Role, ToolCallRef, ToolDefinition, Usage,
+    LlmAdapter, LlmRequest, Message, Role, ToolCallRef, ToolDefinition, Usage,
 };
 pub use assembler::{AssembledToolCall, BlockAssembler, ResponseBlock};
-pub use chunk::{StreamChunk, ToolCallDelta};
+pub use catalog::{DEFAULT_PROVIDER, ModelCatalog, ModelRoute};
+pub use chunk::{StopReason, StreamChunk, ToolCallDelta};
+pub use cost::{BudgetDecision, ModelAccount, Pricing, UsageAccount};
 pub use error::LlmError;
+#[cfg(feature = "providers")]
 pub use openai::OpenAiCompatibleAdapter;
+pub use retry::{RetryOn, RetryPolicy};
 pub use runtime::LlmRuntime;
 pub use scripted::{ScriptedAdapter, ScriptedResponse};

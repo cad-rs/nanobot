@@ -165,6 +165,9 @@ pub struct ChartSemanticDatum {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChartTheme {
+    /// Color the chart is drawn on. SVG and PNG export fill their canvas with
+    /// it; pie and donut slices, map regions and point annotations are edged in
+    /// it. The native view paints no fill and takes its layer's color.
     pub background: Rgba8,
     pub text: Rgba8,
     pub muted_text: Rgba8,
@@ -236,9 +239,7 @@ fn typography_pixels(value: crate::Length, fallback: f64) -> f64 {
     match value {
         crate::Length::Pixels(value) => value,
         crate::Length::Rems(value) => value * 16.0,
-        crate::Length::Relative(_)
-        | crate::Length::ThemeSpacing(_)
-        | crate::Length::ThemeRadius(_) => fallback,
+        crate::Length::Relative(_) | crate::Length::Token(_) => fallback,
     }
 }
 
@@ -3938,6 +3939,7 @@ mod tests {
             annotations: Vec::new(),
             link_group: None,
             link_domain: None,
+            interaction: crate::ChartInteractionSpec::default(),
         }
     }
 
@@ -4175,6 +4177,7 @@ mod tests {
                 annotations: Vec::new(),
                 link_group: None,
                 link_domain: None,
+                interaction: crate::ChartInteractionSpec::default(),
             };
             let prepared = prepare_chart_data(
                 spec,

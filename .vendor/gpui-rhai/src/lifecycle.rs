@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
+use crate::state::topmost_paths;
 use rhai::Dynamic;
 use thiserror::Error;
 
@@ -30,7 +31,11 @@ pub struct ScriptLifecycle {
     state: LifecycleState,
     root: Option<Rc<UiNode>>,
     retained: crate::RetainedUiTree,
-    suspended_at: Option<std::time::Instant>,
+    semantics: crate::CommittedSemanticFrame,
+    suspended_at: Option<web_time::Instant>,
+    /// Advances whenever a new retained tree is committed (or restored).
+    revision: u64,
+    commit_statistics: CommitStatistics,
 }
 
 #[derive(Clone)]
@@ -39,7 +44,56 @@ pub(crate) struct ScriptLifecycleCheckpoint {
     state: LifecycleState,
     root: Option<Rc<UiNode>>,
     retained: crate::RetainedUiTree,
-    suspended_at: Option<std::time::Instant>,
+    semantics: crate::CommittedSemanticFrame,
+    suspended_at: Option<web_time::Instant>,
+}
+
+/// Commits and the time spent in each of their phases, summed since the last
+/// [`ScriptLifecycle::take_commit_statistics`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CommitStatistics {
+    pub commits: u64,
+    /// Phases in the order they first ran.
+    pub phases: Vec<(&'static str, std::time::Duration)>,
+}
+
+impl CommitStatistics {
+    fn add(&mut self, phase: &'static str, elapsed: std::time::Duration) {
+        if let Some((_, total)) = self.phases.iter_mut().find(|(name, _)| *name == phase) {
+            *total += elapsed;
+        } else {
+            self.phases.push((phase, elapsed));
+        }
+    }
+
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.commits += other.commits;
+        for (phase, elapsed) in other.phases {
+            self.add(phase, elapsed);
+        }
+    }
+}
+
+/// Laps one commit's phases; folded into the lifecycle's statistics when the
+/// commit ends, whether it succeeded or not.
+struct PhaseClock {
+    last: web_time::Instant,
+    laps: CommitStatistics,
+}
+
+impl PhaseClock {
+    fn start() -> Self {
+        Self {
+            last: web_time::Instant::now(),
+            laps: CommitStatistics::default(),
+        }
+    }
+
+    fn lap(&mut self, phase: &'static str) {
+        let now = web_time::Instant::now();
+        self.laps.add(phase, now - self.last);
+        self.last = now;
+    }
 }
 
 #[derive(Default)]
@@ -57,6 +111,7 @@ impl ScriptLifecycle {
             state: self.state,
             root: self.root.clone(),
             retained: self.retained.clone(),
+            semantics: self.semantics.clone(),
             suspended_at: self.suspended_at,
         }
     }
@@ -66,6 +121,11 @@ impl ScriptLifecycle {
         self.state = checkpoint.state;
         self.root = checkpoint.root;
         self.retained = checkpoint.retained;
+        self.semantics = checkpoint.semantics;
+        // Two steps: a revision one past another is always the reconcile of
+        // the tree before it, which cache islands rely on, and a restore is
+        // not.
+        self.revision = self.revision.wrapping_add(2);
         self.suspended_at = checkpoint.suspended_at;
     }
 
@@ -93,6 +153,9 @@ impl ScriptLifecycle {
             transaction.mount(root_path.clone(), state_schema)?;
             runtime_state.component_state.commit_render(transaction);
             runtime_state.ensure_component_incarnation(&root_path);
+            runtime_state
+                .effect_cascades
+                .register_generation(&root_path, compiled.generation());
         }
         Ok(Self {
             compiled,
@@ -104,8 +167,23 @@ impl ScriptLifecycle {
             state: LifecycleState::Created,
             root: None,
             retained: crate::RetainedUiTree::new(),
+            semantics: crate::CommittedSemanticFrame::default(),
             suspended_at: None,
+            revision: 0,
+            commit_statistics: CommitStatistics::default(),
         })
+    }
+
+    /// Commits since the last call and the time each phase took.
+    pub(crate) fn take_commit_statistics(&mut self) -> CommitStatistics {
+        std::mem::take(&mut self.commit_statistics)
+    }
+
+    /// The revision of the committed retained tree; it advances on every
+    /// commit, so observers can skip work when nothing new was rendered.
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
     }
 
     #[must_use]
@@ -121,6 +199,11 @@ impl ScriptLifecycle {
     #[must_use]
     pub const fn retained(&self) -> &crate::RetainedUiTree {
         &self.retained
+    }
+
+    #[must_use]
+    pub const fn semantics(&self) -> &crate::CommittedSemanticFrame {
+        &self.semantics
     }
 
     #[must_use]
@@ -168,6 +251,25 @@ impl ScriptLifecycle {
         }
     }
 
+    /// Validate the initial `view(ctx)` without executing `init(ctx)`.
+    ///
+    /// This entry point is for static tooling that has no Host capability
+    /// implementations. It validates the rendered tree but deliberately does
+    /// not claim that Host-dependent initialization succeeded.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same render, reconciliation, and resource errors as
+    /// [`Self::render`].
+    pub fn validate_initial_view_without_init(
+        &mut self,
+        engine: &mut RuntimeEngine,
+    ) -> Result<&UiNode, LifecycleError> {
+        self.require_state(LifecycleState::Created)?;
+        self.state = LifecycleState::Initialized;
+        self.render(engine)
+    }
+
     /// Evaluate required `view(ctx)` and activate its generation on success.
     ///
     /// # Errors
@@ -192,12 +294,13 @@ impl ScriptLifecycle {
                 operation: "render",
             });
         }
+        let mut clock = PhaseClock::start();
         let runtime_snapshot = self.begin_runtime_transaction()?;
         let engine_checkpoint = engine.execution_checkpoint();
         let previous_root = reuse_dirty.and_then(|_| self.root.clone());
         let result = (|| {
             let context = self.context(ExecutionPhase::Render);
-            let root = match (previous_root.as_ref(), reuse_dirty) {
+            let mut root = match (previous_root.as_ref(), reuse_dirty) {
                 (Some(previous_root), Some(dirty)) => engine.render_with_context_staged_reusing(
                     &self.compiled,
                     context,
@@ -206,28 +309,28 @@ impl ScriptLifecycle {
                 )?,
                 _ => engine.render_with_context_staged(&self.compiled, context)?,
             };
+            clock.lap("render");
             let mut retained = self.retained.clone();
-            let motion_reconcile_report = retained.reconcile(root.clone())?;
-            self.validate_resource_budgets(engine, &retained, &root)?;
-            self.reconcile_motion(&root, &retained, self.compiled.generation())?;
-            self.reconcile_exit_ghosts(&motion_reconcile_report)?;
-            self.reconcile_effects(
+            clock.lap("clone");
+            let semantics = self.commit_phases(
                 engine,
-                &self.compiled,
-                runtime_snapshot.component_state().clone(),
-                &retained,
+                &runtime_snapshot,
+                &mut retained,
+                &mut root,
+                &mut clock,
             )?;
-            self.retain_geometry_nodes(&retained)?;
-            self.validate_signal_bindings(&root)?;
-            Ok((root, retained))
+            Ok((root, retained, semantics))
         })();
+        self.commit_statistics.merge(clock.laps);
         match result {
-            Ok((root, retained)) => {
+            Ok((root, retained, semantics)) => {
+                self.commit_or_roll_back(engine, runtime_snapshot, engine_checkpoint)?;
                 self.trace_reconcile("full", retained.last_report());
                 self.retained = retained;
+                self.semantics = semantics;
+                self.revision = self.revision.wrapping_add(1);
                 self.state = LifecycleState::Running;
                 self.root = Some(Rc::new(root));
-                self.commit_runtime_transaction()?;
                 self.root.as_deref().ok_or(LifecycleError::MissingRoot)
             }
             Err(error) => {
@@ -292,7 +395,9 @@ impl ScriptLifecycle {
             return self.render_dirty_full(engine, &dirty, runtime_snapshot, engine_checkpoint);
         };
         engine.begin_execution_session();
+        let mut clock = PhaseClock::start();
         let mut retained = self.retained.clone();
+        clock.lap("clone");
         let result = (|| {
             for path in topmost {
                 let subtree = engine.rerender_component(&path, &root, &dirty)?;
@@ -300,27 +405,25 @@ impl ScriptLifecycle {
                     return Err(LifecycleError::MissingComponentSubtree(path));
                 }
             }
-            let motion_reconcile_report = retained.reconcile(root.clone())?;
-            self.validate_resource_budgets(engine, &retained, &root)?;
-            self.reconcile_motion(&root, &retained, self.compiled.generation())?;
-            self.reconcile_exit_ghosts(&motion_reconcile_report)?;
-            self.reconcile_effects(
+            clock.lap("render");
+            self.commit_phases(
                 engine,
-                &self.compiled,
-                runtime_snapshot.component_state().clone(),
-                &retained,
-            )?;
-            self.retain_geometry_nodes(&retained)?;
-            self.validate_signal_bindings(&root)?;
-            Ok(())
+                &runtime_snapshot,
+                &mut retained,
+                &mut root,
+                &mut clock,
+            )
         })();
+        self.commit_statistics.merge(clock.laps);
         match result {
-            Ok(()) => {
+            Ok(semantics) => {
+                self.commit_or_roll_back(engine, runtime_snapshot, engine_checkpoint)?;
                 self.trace_reconcile("incremental", retained.last_report());
                 self.root = Some(Rc::new(root));
                 self.retained = retained;
+                self.semantics = semantics;
+                self.revision = self.revision.wrapping_add(1);
                 self.state = LifecycleState::Running;
-                self.commit_runtime_transaction()?;
                 Ok(true)
             }
             Err(error) => {
@@ -405,67 +508,78 @@ impl ScriptLifecycle {
             .as_deref()
             .cloned()
             .ok_or(LifecycleError::MissingRoot)?;
+        let mut clock = PhaseClock::start();
         let mut retained = self.retained.clone();
+        clock.lap("clone");
         let result = (|| {
             let mut changed = false;
             for (id, indices) in selected {
+                // Parent targets are processed first. A child that existed at
+                // batch start may legitimately be removed by a parent prune.
+                if root.virtual_collection_spec(&id).is_none()
+                    && self
+                        .root
+                        .as_deref()
+                        .is_some_and(|root| root.virtual_collection_spec(&id).is_some())
+                {
+                    continue;
+                }
                 let mut items = root
                     .virtual_collection_items(&id)
                     .cloned()
                     .ok_or_else(|| LifecycleError::MissingVirtualCollection(id.clone()))?;
-                let missing = indices
-                    .iter()
-                    .filter(|index| !items.contains_key(index))
-                    .copied()
-                    .collect::<BTreeSet<_>>();
                 let previous_indices = items.keys().copied().collect::<BTreeSet<_>>();
-                if missing.is_empty() && previous_indices == indices {
+                if previous_indices == indices {
                     continue;
                 }
-                items.retain(|index, _| indices.contains(index));
-                if !missing.is_empty() {
-                    let inherited_motion_group = root
-                        .virtual_collection_spec(&id)
-                        .and_then(|spec| spec.inherited_motion_group.clone());
-                    let mut realized = engine.realize_virtual_collection(&id, &missing)?;
-                    if let Some(group) = inherited_motion_group {
-                        for node in realized.values_mut() {
-                            crate::node::apply_motion_group(node, &group);
+                let inherited_motion_group = root.virtual_collection_spec(&id).and_then(|spec| {
+                    spec.inherited_motion_group
+                        .clone()
+                        .map(|group| (group, spec.inherited_motion_scope.clone()))
+                });
+                clock.lap("lookup");
+                let previous = items;
+                items = engine.realize_virtual_collection(&id, &indices, &previous)?;
+                clock.lap("realize");
+                if let Some((group, scope)) = inherited_motion_group {
+                    // An item kept from before has its group already; applying
+                    // it again would copy the item and add the mutation twice.
+                    for (index, node) in &mut items {
+                        if !previous.get(index).is_some_and(|kept| kept.ptr_eq(node)) {
+                            crate::node::apply_motion_group(node, &group, scope.as_deref());
                         }
                     }
-                    items.extend(realized);
                 }
                 if !root.replace_virtual_collection_items(&id, items.clone()) {
                     return Err(LifecycleError::MissingVirtualCollection(id));
                 }
-                engine.update_virtual_collection_snapshot(&id, &items)?;
+                engine.update_virtual_collection_snapshot(&id, &items);
                 changed = true;
             }
+            clock.lap("replace");
             if !changed {
-                return Ok(false);
+                return Ok((false, self.semantics.clone()));
             }
-            let motion_reconcile_report = retained.reconcile(root.clone())?;
-            self.validate_resource_budgets(engine, &retained, &root)?;
-            self.reconcile_motion(&root, &retained, self.compiled.generation())?;
-            self.reconcile_exit_ghosts(&motion_reconcile_report)?;
-            self.reconcile_effects(
+            let semantics = self.commit_phases(
                 engine,
-                &self.compiled,
-                runtime_snapshot.component_state().clone(),
-                &retained,
+                &runtime_snapshot,
+                &mut retained,
+                &mut root,
+                &mut clock,
             )?;
-            self.retain_geometry_nodes(&retained)?;
-            self.validate_signal_bindings(&root)?;
-            Ok(true)
+            Ok((true, semantics))
         })();
+        self.commit_statistics.merge(clock.laps);
         match result {
-            Ok(changed) => {
+            Ok((changed, semantics)) => {
+                self.commit_or_roll_back(engine, runtime_snapshot, engine_checkpoint)?;
                 if changed {
                     self.trace_reconcile("virtual", retained.last_report());
                     self.root = Some(Rc::new(root));
                     self.retained = retained;
+                    self.semantics = semantics;
+                    self.revision = self.revision.wrapping_add(1);
                 }
-                self.commit_runtime_transaction()?;
                 Ok(changed)
             }
             Err(error) => {
@@ -477,6 +591,48 @@ impl ScriptLifecycle {
                 Err(error)
             }
         }
+    }
+
+    /// The phases every commit runs over its candidate root, in order:
+    /// reconcile `retained` (the working copy that becomes the committed tree
+    /// on success) against `root`, where an error boundary that contains a
+    /// script mistake becomes its fallback, then budgets, motion, exit ghosts,
+    /// effects, geometry, signal bindings and the semantic frame.
+    fn commit_phases(
+        &self,
+        engine: &mut RuntimeEngine,
+        runtime_snapshot: &crate::UiStateSnapshot,
+        retained: &mut crate::RetainedUiTree,
+        root: &mut UiNode,
+        clock: &mut PhaseClock,
+    ) -> Result<crate::CommittedSemanticFrame, LifecycleError> {
+        clock.laps.commits += 1;
+        let motion_reconcile_report = retained.reconcile_contained(root)?;
+        clock.lap("reconcile");
+        self.validate_resource_budgets(engine, retained, root)?;
+        clock.lap("budgets");
+        self.reconcile_motion(root, retained, self.compiled.generation())?;
+        clock.lap("motion");
+        self.reconcile_exit_ghosts(&motion_reconcile_report)?;
+        clock.lap("ghosts");
+        self.reconcile_effects(
+            engine,
+            &self.compiled,
+            runtime_snapshot.component_state().clone(),
+            retained,
+            root,
+        )?;
+        clock.lap("effects");
+        self.retain_geometry_nodes(retained)?;
+        clock.lap("geometry");
+        // A tree whose nodes read no signal has none to validate.
+        if retained.summary().signals > 0 {
+            self.validate_signal_bindings(root)?;
+        }
+        clock.lap("signals");
+        let semantics = crate::CommittedSemanticFrame::from_retained(retained)?;
+        clock.lap("semantics");
+        Ok(semantics)
     }
 
     /// Run optional `dispose(ctx)` once and make the lifecycle terminal.
@@ -496,6 +652,7 @@ impl ScriptLifecycle {
             });
         }
         let snapshot = self.begin_runtime_transaction()?;
+        self.restart_effect_cascade()?;
         let result = (|| {
             self.reconcile_effect_candidate(
                 engine,
@@ -510,6 +667,11 @@ impl ScriptLifecycle {
         match result {
             Ok(()) => {
                 self.state = LifecycleState::Disposed;
+                self.runtime
+                    .try_borrow()
+                    .map_err(|_| LifecycleError::Borrowed)?
+                    .virtual_requests
+                    .release_scope(&self.root_path);
                 self.commit_runtime_transaction()?;
                 Ok(())
             }
@@ -541,6 +703,7 @@ impl ScriptLifecycle {
             });
         }
         let snapshot = self.begin_runtime_transaction()?;
+        self.restart_effect_cascade()?;
         let checkpoint = engine.execution_checkpoint();
         let result = (|| {
             engine.call_optional_lifecycle(
@@ -601,6 +764,7 @@ impl ScriptLifecycle {
             });
         }
         let snapshot = self.begin_runtime_transaction()?;
+        self.restart_effect_cascade()?;
         let checkpoint = engine.execution_checkpoint();
         let suspended_at = self
             .suspended_at
@@ -652,7 +816,7 @@ impl ScriptLifecycle {
             .map_err(|_| LifecycleError::Borrowed)?
             .effects
             .plan(&self.root_path, BTreeMap::new());
-        if plan.transition_count() > 64 {
+        if plan.transition_count() > crate::effect::EFFECT_TRANSITION_CALLBACK_BUDGET {
             return Err(LifecycleError::EffectBudget(plan.transition_count()));
         }
         for (descriptor, scope) in plan.cleanup_descriptors() {
@@ -697,6 +861,37 @@ impl ScriptLifecycle {
         event_target: Option<crate::GeometryBounds>,
     ) -> Result<Dynamic, LifecycleError> {
         self.validate_callback_owner(callback)?;
+        // Effect-generated semantic events retain their origin when delivered
+        // later. They are part of the same cascade, not new user operations.
+        {
+            let mut runtime = self
+                .runtime
+                .try_borrow_mut()
+                .map_err(|_| LifecycleError::Borrowed)?;
+            runtime.prune_pending_dispatch();
+            if runtime.invocation_origin() == &crate::InvocationOrigin::Effect {
+                let root = runtime
+                    .dispatch_owner
+                    .as_ref()
+                    .and_then(crate::SemanticDispatchOwner::cascade_root)
+                    .cloned()
+                    .unwrap_or_else(|| self.root_path.clone());
+                if runtime.effect_cascades.blocked(&root) {
+                    return Ok(Dynamic::UNIT);
+                }
+                if runtime.dispatch_owner.is_none() {
+                    runtime.effect_cascades.retain_unowned_dispatch(&root);
+                }
+                // Pure semantic recursion may never restart an effect. Every
+                // effect-origin callback shares the graph's transition budget.
+                runtime
+                    .effect_cascades
+                    .charge(&root, 1)
+                    .map_err(LifecycleError::EffectBudget)?;
+            } else {
+                runtime.effect_cascades.restart(&self.root_path);
+            }
+        }
         let root_context = self.context(ExecutionPhase::Event);
         let context = callback
             .component()
@@ -746,7 +941,17 @@ impl ScriptLifecycle {
         engine: &RuntimeEngine,
         delivery: AsyncDelivery,
     ) -> Result<Dynamic, LifecycleError> {
+        if !self
+            .runtime
+            .try_borrow()
+            .map_err(|_| LifecycleError::Borrowed)?
+            .effects
+            .contains_scope(&delivery.scope)
+        {
+            return Ok(Dynamic::UNIT);
+        }
         self.validate_callback_owner(&delivery.callback)?;
+        self.restart_effect_cascade()?;
         let component = delivery
             .callback
             .component()
@@ -755,6 +960,7 @@ impl ScriptLifecycle {
             .unwrap_or_else(|| self.root_path.clone());
         let events = delivery.callback.events().clone();
         let scope = delivery.scope.clone();
+        let origin = delivery.origin.clone();
         let context = UiContext::new(
             Rc::clone(&self.runtime),
             component,
@@ -766,11 +972,35 @@ impl ScriptLifecycle {
         .with_generation(self.compiled.generation())
         .with_native_context(delivery.callback.native_context().cloned())
         .with_async_scope(scope);
-        Ok(engine.invoke_callback(
-            &self.compiled,
-            &delivery.callback,
-            (context, delivery.payload.into_dynamic()),
-        )?)
+        self.with_dispatch_owner(None, || {
+            self.with_origin(origin, || {
+                Ok(engine.invoke_callback(
+                    &self.compiled,
+                    &delivery.callback,
+                    (context, delivery.payload.into_dynamic()),
+                )?)
+            })
+        })
+    }
+
+    /// Run `invoke` with `origin` as the running invocation's origin, then
+    /// restore the previous one.
+    pub(crate) fn with_origin<T>(
+        &self,
+        origin: crate::InvocationOrigin,
+        invoke: impl FnOnce() -> Result<T, LifecycleError>,
+    ) -> Result<T, LifecycleError> {
+        let previous = self
+            .runtime
+            .try_borrow_mut()
+            .map_err(|_| LifecycleError::Borrowed)?
+            .replace_origin(origin);
+        let result = invoke();
+        self.runtime
+            .try_borrow_mut()
+            .map_err(|_| LifecycleError::Borrowed)?
+            .replace_origin(previous);
+        result
     }
 
     /// Deliver async work with the same UI-state rollback as foreground events.
@@ -810,6 +1040,14 @@ impl ScriptLifecycle {
         engine: &RuntimeEngine,
         pending: crate::PendingEvent,
     ) -> Result<Option<Dynamic>, LifecycleError> {
+        if !self
+            .runtime
+            .try_borrow()
+            .map_err(|_| LifecycleError::Borrowed)?
+            .dispatch_owner_active(pending.owner.as_ref())
+        {
+            return Ok(None);
+        }
         let callback = self
             .runtime
             .try_borrow()
@@ -817,9 +1055,78 @@ impl ScriptLifecycle {
             .component_event_handler(&pending.target, &pending.event.name);
         callback
             .map(|callback| {
-                self.invoke_callback_transactional(engine, &callback, pending.event.payload)
+                self.with_dispatch_owner(pending.owner, || {
+                    self.with_origin(pending.origin, || {
+                        self.invoke_callback_transactional(engine, &callback, pending.event.payload)
+                    })
+                })
             })
             .transpose()
+    }
+
+    /// Deliver a queued semantic action with its original origin and opaque
+    /// provenance. Stale generation, mount, activation or rejected derivations
+    /// are ignored, including clones retained by an external Host.
+    ///
+    /// # Errors
+    /// Returns callback, effect-budget or transaction errors.
+    pub fn invoke_action_transactional(
+        &self,
+        engine: &RuntimeEngine,
+        pending: crate::ActionInvocation,
+    ) -> Result<Dynamic, LifecycleError> {
+        if pending.callback.generation() != self.generation()
+            || !self
+                .runtime
+                .try_borrow()
+                .map_err(|_| LifecycleError::Borrowed)?
+                .dispatch_owner_active(pending.owner.as_ref())
+        {
+            return Ok(Dynamic::UNIT);
+        }
+        self.with_dispatch_owner(pending.owner, || {
+            self.with_origin(pending.origin, || {
+                self.invoke_callback_transactional(engine, &pending.callback, pending.payload)
+            })
+        })
+    }
+
+    fn with_dispatch_owner<T>(
+        &self,
+        owner: Option<crate::SemanticDispatchOwner>,
+        invoke: impl FnOnce() -> Result<T, LifecycleError>,
+    ) -> Result<T, LifecycleError> {
+        let previous = {
+            let mut runtime = self
+                .runtime
+                .try_borrow_mut()
+                .map_err(|_| LifecycleError::Borrowed)?;
+            std::mem::replace(&mut runtime.dispatch_owner, owner)
+        };
+        let result = invoke();
+        self.runtime
+            .try_borrow_mut()
+            .map_err(|_| LifecycleError::Borrowed)?
+            .dispatch_owner = previous;
+        result
+    }
+
+    pub(crate) fn reject_semantic_dispatch_budget(
+        &self,
+        origin: &crate::InvocationOrigin,
+        owner: Option<&crate::SemanticDispatchOwner>,
+    ) -> Result<(), LifecycleError> {
+        let mut runtime = self
+            .runtime
+            .try_borrow_mut()
+            .map_err(|_| LifecycleError::Borrowed)?;
+        if origin == &crate::InvocationOrigin::Effect && runtime.dispatch_owner_active(owner) {
+            let root = owner
+                .and_then(crate::SemanticDispatchOwner::cascade_root)
+                .unwrap_or(&self.root_path);
+            runtime.effect_cascades.reject(root);
+        }
+        Ok(())
     }
 
     /// Transactionally run candidate `init(ctx)` and `view(ctx)` during hot reload.
@@ -843,8 +1150,12 @@ impl ScriptLifecycle {
             });
         }
         let snapshot = self.begin_runtime_transaction()?;
+        self.restart_effect_cascade()?;
         let engine_checkpoint = engine.execution_checkpoint();
-        let result: Result<(UiNode, crate::RetainedUiTree), LifecycleError> = (|| {
+        let result: Result<
+            (UiNode, crate::RetainedUiTree, crate::CommittedSemanticFrame),
+            LifecycleError,
+        > = (|| {
             self.runtime
                 .try_borrow_mut()
                 .map_err(|_| LifecycleError::Borrowed)?
@@ -855,12 +1166,12 @@ impl ScriptLifecycle {
                 "init",
                 self.context_for(ExecutionPhase::Init, candidate.generation()),
             )?;
-            let root = engine.render_with_context_staged(
+            let mut root = engine.render_with_context_staged(
                 &candidate,
                 self.context_for(ExecutionPhase::Render, candidate.generation()),
             )?;
             let mut retained = self.retained.clone();
-            let motion_reconcile_report = retained.reconcile(root.clone())?;
+            let motion_reconcile_report = retained.reconcile_contained(&mut root)?;
             self.validate_resource_budgets(engine, &retained, &root)?;
             self.reconcile_motion(&root, &retained, candidate.generation())?;
             self.reconcile_exit_ghosts(&motion_reconcile_report)?;
@@ -869,19 +1180,23 @@ impl ScriptLifecycle {
                 &candidate,
                 snapshot.component_state().clone(),
                 &retained,
+                &root,
             )?;
             self.retain_geometry_nodes(&retained)?;
             self.validate_signal_bindings(&root)?;
-            Ok((root, retained))
+            let semantics = crate::CommittedSemanticFrame::from_retained(&retained)?;
+            Ok((root, retained, semantics))
         })();
         match result {
-            Ok((root, retained)) => {
+            Ok((root, retained, semantics)) => {
+                self.commit_or_roll_back(engine, snapshot, engine_checkpoint)?;
                 self.trace_reconcile("reload", retained.last_report());
                 self.compiled = candidate;
                 self.retained = retained;
+                self.semantics = semantics;
+                self.revision = self.revision.wrapping_add(1);
                 self.state = LifecycleState::Running;
                 self.root = Some(Rc::new(root));
-                self.commit_runtime_transaction()?;
                 self.root.as_deref().ok_or(LifecycleError::MissingRoot)
             }
             Err(error) => {
@@ -918,6 +1233,7 @@ impl ScriptLifecycle {
             });
         }
         let snapshot = self.begin_runtime_transaction()?;
+        self.restart_effect_cascade()?;
         let engine_checkpoint = engine.execution_checkpoint();
         let suspended_at = self
             .suspended_at
@@ -929,7 +1245,10 @@ impl ScriptLifecycle {
             .clock
             .now();
         let elapsed = now.saturating_duration_since(suspended_at);
-        let result: Result<(UiNode, crate::RetainedUiTree), LifecycleError> = (|| {
+        let result: Result<
+            (UiNode, crate::RetainedUiTree, crate::CommittedSemanticFrame),
+            LifecycleError,
+        > = (|| {
             self.runtime
                 .try_borrow_mut()
                 .map_err(|_| LifecycleError::Borrowed)?
@@ -953,12 +1272,12 @@ impl ScriptLifecycle {
                     .map_err(|_| LifecycleError::Borrowed)?;
                 runtime.motion_values = runtime.motions.snapshot(now);
             }
-            let root = engine.render_with_context_staged(
+            let mut root = engine.render_with_context_staged(
                 &candidate,
                 self.context_for(ExecutionPhase::Render, candidate.generation()),
             )?;
             let mut retained = self.retained.clone();
-            let motion_reconcile_report = retained.reconcile(root.clone())?;
+            let motion_reconcile_report = retained.reconcile_contained(&mut root)?;
             self.validate_resource_budgets(engine, &retained, &root)?;
             self.reconcile_motion(&root, &retained, candidate.generation())?;
             self.reconcile_exit_ghosts(&motion_reconcile_report)?;
@@ -967,21 +1286,28 @@ impl ScriptLifecycle {
                 &candidate,
                 snapshot.component_state().clone(),
                 &retained,
+                &root,
             )?;
             self.resume_runtime_mechanisms(now, elapsed)?;
             self.retain_geometry_nodes(&retained)?;
             self.validate_signal_bindings(&root)?;
-            Ok((root, retained))
+            let semantics = crate::CommittedSemanticFrame::from_retained(&retained)?;
+            Ok((root, retained, semantics))
         })();
         match result {
-            Ok((root, retained)) => {
+            Ok((root, retained, semantics)) => {
+                if let Err(error) = self.commit_or_roll_back(engine, snapshot, engine_checkpoint) {
+                    self.state = LifecycleState::Suspended;
+                    return Err(error);
+                }
                 self.trace_reconcile("resume_reload", retained.last_report());
                 self.compiled = candidate;
                 self.retained = retained;
+                self.semantics = semantics;
+                self.revision = self.revision.wrapping_add(1);
                 self.root = Some(Rc::new(root));
                 self.suspended_at = None;
                 self.state = LifecycleState::Running;
-                self.commit_runtime_transaction()?;
                 self.root.as_deref().ok_or(LifecycleError::MissingRoot)
             }
             Err(error) => {
@@ -1003,6 +1329,7 @@ impl ScriptLifecycle {
     /// Returns lifecycle or script errors from either stage.
     pub fn start(&mut self, engine: &mut RuntimeEngine) -> Result<&UiNode, LifecycleError> {
         let runtime_snapshot = self.begin_runtime_transaction()?;
+        self.restart_effect_cascade()?;
         let engine_checkpoint = engine.execution_checkpoint();
         let lifecycle_checkpoint = self.execution_checkpoint();
         let result = (|| {
@@ -1038,6 +1365,19 @@ impl ScriptLifecycle {
         generation: ScriptGeneration,
     ) -> Result<(), LifecycleError> {
         let domain = self.motion_root_path();
+        let inert = retained
+            .root_id()
+            .and_then(|id| retained.node(id))
+            .is_some_and(|node| node.summary().motion == 0)
+            && self
+                .runtime
+                .try_borrow()
+                .map_err(|_| LifecycleError::Borrowed)?
+                .motions
+                .live_scope_idle(&domain);
+        if inert {
+            return self.reconcile_inert_motion(root, retained, generation, &domain);
+        }
         let identities = crate::motion::retained_motion_identities(root, retained, &domain)?;
         let mut runtime = self
             .runtime
@@ -1080,13 +1420,120 @@ impl ScriptLifecycle {
         let usage = runtime.motions.resource_usage();
         let active = usage.active.saturating_add(usage.geometry_slots);
         crate::RuntimeBudgets::check("active_motions", active, runtime.budgets.active_motions)?;
-        runtime.motion_values = values;
+        runtime.reconcile_page_visibility(retained, &self.root_path, &domain);
+        runtime.motion_values = if values.is_empty() {
+            values
+        } else {
+            runtime.motions.snapshot(now)
+        };
         Ok(())
+    }
+
+    /// [`Self::reconcile_motion`] for a tree that declares no motion
+    /// ([`crate::motion::node_takes_motion`]) in a domain that holds none:
+    /// the declarations, identities and scene it would walk the tree for are
+    /// empty, and the scopes it would retain hold nothing to cancel, so what
+    /// remains are its budget checks, reservations and resamples.
+    fn reconcile_inert_motion(
+        &self,
+        root: &UiNode,
+        retained: &crate::RetainedUiTree,
+        generation: ScriptGeneration,
+        domain: &str,
+    ) -> Result<(), LifecycleError> {
+        #[cfg(debug_assertions)]
+        let reference = self.reference_motion_outcome(root, retained, generation, domain);
+        #[cfg(not(debug_assertions))]
+        let _ = (root, generation);
+        let mut runtime = self
+            .runtime
+            .try_borrow_mut()
+            .map_err(|_| LifecycleError::Borrowed)?;
+        let now = runtime.clock.now();
+        let active_limit = runtime.budgets.active_motions;
+        runtime.motions.set_active_limit(active_limit);
+        runtime
+            .geometry_for(self.presentation_scope())
+            .retain_shared_layout_ids(&BTreeSet::new());
+        runtime.motions.set_active_reservation(domain, 0);
+        let usage = runtime.motions.resource_usage();
+        let active = usage.active.saturating_add(usage.geometry_slots);
+        let result = if active > active_limit {
+            Err(crate::motion::MotionError::ActiveBudget {
+                actual: active,
+                limit: active_limit,
+            }
+            .into())
+        } else {
+            runtime.reconcile_page_visibility(retained, &self.root_path, domain);
+            runtime.motion_values = runtime.motions.snapshot(now);
+            Ok(())
+        };
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(
+            result
+                .as_ref()
+                .map(|()| runtime.motions.snapshot(now))
+                .map_err(ToString::to_string),
+            reference,
+            "an inert commit's motion phase differs from the full one"
+        );
+        result
+    }
+
+    /// The motion values (or the error) the full motion phase reaches from
+    /// the current motion state, which it leaves as it is.
+    #[cfg(debug_assertions)]
+    fn reference_motion_outcome(
+        &self,
+        root: &UiNode,
+        retained: &crate::RetainedUiTree,
+        generation: ScriptGeneration,
+        domain: &str,
+    ) -> Result<BTreeMap<crate::MotionKey, f64>, String> {
+        let runtime = self.runtime.borrow();
+        let mut motions = runtime.motions.transaction_snapshot();
+        let now = runtime.clock.now();
+        let outcome = (|| {
+            let identities = crate::motion::retained_motion_identities(root, retained, domain)?;
+            let geometry_slots = crate::motion::node_motion_resource_usage(root).geometry_slots;
+            crate::RuntimeBudgets::check(
+                "active_motions",
+                geometry_slots,
+                runtime.budgets.active_motions,
+            )?;
+            motions.set_active_limit(runtime.budgets.active_motions);
+            let shared_layout_ids = crate::motion::shared_layout_ids(root)?;
+            assert!(shared_layout_ids.is_empty(), "an inert tree shares layout");
+            motions.set_active_reservation(domain, geometry_slots);
+            let incarnations = runtime.component_incarnations_snapshot();
+            crate::motion::reconcile_node_motion_scoped_owned(
+                root,
+                &mut motions,
+                now,
+                domain,
+                crate::motion::MotionReconcileContext {
+                    domain,
+                    root_component: &self.root_path,
+                    root_incarnation: runtime
+                        .component_incarnation(&self.root_path)
+                        .unwrap_or_else(crate::ComponentIncarnation::unscoped),
+                    generation,
+                    incarnations: &incarnations,
+                    identities: Some(&identities),
+                },
+            )?;
+            let usage = motions.resource_usage();
+            let active = usage.active.saturating_add(usage.geometry_slots);
+            crate::RuntimeBudgets::check("active_motions", active, runtime.budgets.active_motions)?;
+            Ok::<_, LifecycleError>(motions.snapshot(now))
+        })();
+        outcome.map_err(|error| error.to_string())
     }
 
     fn resume_runtime_mechanisms(
         &self,
-        now: std::time::Instant,
+        now: web_time::Instant,
         elapsed: std::time::Duration,
     ) -> Result<(), LifecycleError> {
         let mut runtime = self
@@ -1111,6 +1558,14 @@ impl ScriptLifecycle {
         let Some(root_id) = self.retained.root_id() else {
             return Ok(());
         };
+        // Only a removed node with exit motions leaves a ghost.
+        if report.unmounted.iter().all(|id| {
+            self.retained
+                .node(*id)
+                .is_none_or(|node| node.summary().exit == 0)
+        }) {
+            return Ok(());
+        }
         let removed = report.unmounted.iter().copied().collect::<BTreeSet<_>>();
         let mut exits = Vec::<(crate::NodeId, &UiNode)>::new();
         collect_removed_exit_nodes(previous, root_id, &self.retained, &removed, &mut exits);
@@ -1178,38 +1633,26 @@ impl ScriptLifecycle {
             .clone();
         budgets.validate()?;
         crate::RuntimeBudgets::check("retained_nodes", retained.len(), budgets.retained_nodes)?;
-        let handlers = retained.nodes().fold(0usize, |total, node| {
-            total.saturating_add(node.handler_count())
-        });
-        crate::RuntimeBudgets::check("event_handlers", handlers, budgets.event_handlers)?;
-        let layers = retained
-            .nodes()
-            .filter(|node| node.kind() == crate::UiNodeKindTag::Layer)
-            .count();
-        crate::RuntimeBudgets::check("layers", layers, budgets.layers)?;
-        let canvas_scenes = retained
-            .nodes()
-            .filter(|node| node.kind() == crate::UiNodeKindTag::Canvas)
-            .count();
-        crate::RuntimeBudgets::check("canvas_scenes", canvas_scenes, budgets.canvas_scenes)?;
-        let canvas_commands = retained.nodes().fold(0usize, |total, node| {
-            total.saturating_add(node.canvas_command_count())
-        });
-        crate::RuntimeBudgets::check("canvas_commands", canvas_commands, budgets.canvas_commands)?;
-        let virtual_data = retained.nodes().fold(0usize, |total, node| {
-            total.saturating_add(node.virtual_data_item_count())
-        });
-        let virtual_realized = retained.nodes().fold(0usize, |total, node| {
-            total.saturating_add(node.virtual_realized_item_count())
-        });
+        // The tree keeps these totals as it is reconciled.
+        let summary = retained.summary();
+        let totals = summary.resources;
+        debug_assert_eq!(totals, retained.recounted_resources());
+        crate::RuntimeBudgets::check("event_handlers", totals.handlers, budgets.event_handlers)?;
+        crate::RuntimeBudgets::check("layers", totals.layers, budgets.layers)?;
+        crate::RuntimeBudgets::check("canvas_scenes", totals.canvas_scenes, budgets.canvas_scenes)?;
+        crate::RuntimeBudgets::check(
+            "canvas_commands",
+            totals.canvas_commands,
+            budgets.canvas_commands,
+        )?;
         crate::RuntimeBudgets::check(
             "virtual_data_items",
-            virtual_data,
+            totals.virtual_data_items,
             budgets.virtual_data_items,
         )?;
         crate::RuntimeBudgets::check(
             "virtual_realized_items",
-            virtual_realized,
+            totals.virtual_realized_items,
             budgets.virtual_realized_items,
         )?;
         crate::RuntimeBudgets::check(
@@ -1239,7 +1682,12 @@ impl ScriptLifecycle {
             engine.component_timers_in_scope(&self.root_path).len(),
             budgets.timers,
         )?;
-        let motion = crate::motion::node_motion_resource_usage(root);
+        // A tree that declares no motion uses none of these.
+        let motion = if summary.motion == 0 {
+            crate::motion::MotionResourceUsage::default()
+        } else {
+            crate::motion::node_motion_resource_usage(root)
+        };
         crate::RuntimeBudgets::check(
             "motion_declarations",
             motion.declarations,
@@ -1284,6 +1732,7 @@ impl ScriptLifecycle {
         candidate: &CompiledUi,
         previous_state: crate::StateStore,
         retained: &crate::RetainedUiTree,
+        root: &UiNode,
     ) -> Result<(), LifecycleError> {
         let declarations = RetainedDeclarations {
             effects: engine.component_effects_in_scope(&self.root_path),
@@ -1291,7 +1740,21 @@ impl ScriptLifecycle {
             signals: engine.component_signals_in_scope(&self.root_path),
             element_refs: self.element_ref_bindings(engine, retained)?,
         };
-        self.reconcile_effect_candidate(engine, candidate, declarations, Some(previous_state))
+        // The items virtual collections keep keep their reads too.
+        let mut contributions = root.virtual_read_contributions();
+        contributions.extend(engine.kept_virtual_read_contributions(&self.root_path));
+        self.runtime
+            .try_borrow_mut()
+            .map_err(|_| LifecycleError::Borrowed)?
+            .retain_virtual_read_contributions(&self.root_path, &contributions);
+        self.reconcile_effect_candidate(engine, candidate, declarations, Some(previous_state))?;
+        self.runtime
+            .try_borrow()
+            .map_err(|_| LifecycleError::Borrowed)?
+            .virtual_requests
+            .native_views
+            .retain_scope(&self.root_path, retained, candidate.generation());
+        Ok(())
     }
 
     fn reconcile_effect_candidate(
@@ -1301,6 +1764,16 @@ impl ScriptLifecycle {
         declarations: RetainedDeclarations,
         previous_state: Option<crate::StateStore>,
     ) -> Result<(), LifecycleError> {
+        {
+            let mut runtime = self
+                .runtime
+                .try_borrow_mut()
+                .map_err(|_| LifecycleError::Borrowed)?;
+            runtime
+                .effect_cascades
+                .register_generation(&self.root_path, candidate.generation());
+            runtime.prune_pending_dispatch();
+        }
         let plan = self
             .runtime
             .try_borrow()
@@ -1308,9 +1781,12 @@ impl ScriptLifecycle {
             .effects
             .plan(&self.root_path, declarations.effects);
         let transition_count = plan.transition_count();
-        if transition_count > 64 {
-            return Err(LifecycleError::EffectBudget(transition_count));
-        }
+        self.runtime
+            .try_borrow_mut()
+            .map_err(|_| LifecycleError::Borrowed)?
+            .effect_cascades
+            .charge(&self.root_path, transition_count)
+            .map_err(LifecycleError::EffectBudget)?;
         if plan.has_cleanup()
             && let Some(previous_state) = previous_state
         {
@@ -1342,14 +1818,15 @@ impl ScriptLifecycle {
             runtime
                 .signals
                 .reconcile(&self.root_path, declarations.signals);
-            let geometry_readers = runtime
+            runtime
                 .element_refs
                 .reconcile(&self.root_path, declarations.element_refs);
+            let geometry_bindings = runtime.element_refs.geometry_bindings(&self.root_path);
             let geometry = runtime.geometry_for(self.presentation_scope());
-            for (node, readers) in geometry_readers {
-                geometry.register_readers(node, readers);
-            }
-            runtime.virtual_requests.retain(&virtual_collections);
+            geometry.sync_ref_readers(&self.root_path, geometry_bindings);
+            runtime
+                .virtual_requests
+                .retain_within(&self.root_path, &virtual_collections);
         }
         for (descriptor, scope) in plan.start_descriptors() {
             self.invoke_effect_callback(
@@ -1400,12 +1877,16 @@ impl ScriptLifecycle {
             })
             .with_native_context(callback.native_context().cloned())
             .with_async_scope(scope);
-        let _ = engine.invoke_callback_for_generation(
-            compiled,
-            callback,
-            (context, dependencies.into_dynamic()),
-        )?;
-        Ok(())
+        self.with_dispatch_owner(None, || {
+            self.with_origin(crate::InvocationOrigin::Effect, || {
+                let _ = engine.invoke_callback_for_generation(
+                    compiled,
+                    callback,
+                    (context, dependencies.into_dynamic()),
+                )?;
+                Ok(())
+            })
+        })
     }
 
     fn validate_callback_owner(&self, callback: &ScriptCallback) -> Result<(), LifecycleError> {
@@ -1438,6 +1919,14 @@ impl ScriptLifecycle {
         while let Some(node) = pending.pop() {
             for (_, signal) in node.signal_bindings() {
                 let _ = runtime.signals.read(signal)?;
+            }
+            if let Some(style) = node.signal_style() {
+                let _ = runtime.signals.read(&style.signal)?;
+            }
+            for binding in node.progress_motions() {
+                if let Some(trigger) = &binding.signal_trigger {
+                    let _ = runtime.signals.read(&trigger.signal)?;
+                }
             }
             for (_, children) in node.retained_child_groups() {
                 pending.extend(children);
@@ -1476,17 +1965,16 @@ impl ScriptLifecycle {
         &self,
         retained: &crate::RetainedUiTree,
     ) -> Result<(), LifecycleError> {
-        let nodes = retained.nodes().map(crate::RetainedNode::id).collect();
         let runtime = self
             .runtime
             .try_borrow()
             .map_err(|_| LifecycleError::Borrowed)?;
         runtime
             .geometry_for(self.presentation_scope())
-            .retain_nodes(&nodes);
+            .retain_tree(retained);
         runtime
             .pointer_capture_for(self.presentation_scope())
-            .retain_nodes(&nodes);
+            .retain_nodes(|node| retained.node(node).is_some() && retained.is_page_visible(node));
         Ok(())
     }
 
@@ -1500,6 +1988,35 @@ impl ScriptLifecycle {
             .map_err(|_| LifecycleError::Borrowed)?
             .begin_transaction()
             .map_err(LifecycleError::from)
+    }
+
+    fn restart_effect_cascade(&self) -> Result<(), LifecycleError> {
+        self.runtime
+            .try_borrow_mut()
+            .map_err(|_| LifecycleError::Borrowed)?
+            .effect_cascades
+            .restart(&self.root_path);
+        Ok(())
+    }
+
+    /// Commits the runtime transaction a commit began, before the commit
+    /// publishes anything; when that fails, rolls the runtime and the engine
+    /// back, so nothing of the commit stays.
+    fn commit_or_roll_back(
+        &self,
+        engine: &mut RuntimeEngine,
+        snapshot: crate::UiStateSnapshot,
+        checkpoint: crate::engine::RuntimeEngineCheckpoint,
+    ) -> Result<(), LifecycleError> {
+        let Err(error) = self.commit_runtime_transaction() else {
+            return Ok(());
+        };
+        self.runtime
+            .try_borrow_mut()
+            .map_err(|_| LifecycleError::Borrowed)?
+            .restore(snapshot)?;
+        engine.restore_execution_checkpoint(checkpoint);
+        Err(error)
     }
 
     fn commit_runtime_transaction(&self) -> Result<(), LifecycleError> {
@@ -1664,18 +2181,8 @@ pub enum LifecycleError {
     ElementRef(#[from] crate::ElementRefError),
     #[error(transparent)]
     Budget(#[from] crate::RuntimeBudgetError),
-}
-
-fn topmost_paths(paths: &BTreeSet<ComponentInstancePath>) -> Vec<ComponentInstancePath> {
-    paths
-        .iter()
-        .filter(|path| {
-            !paths
-                .iter()
-                .any(|candidate| *path != candidate && path.is_within(candidate))
-        })
-        .cloned()
-        .collect()
+    #[error(transparent)]
+    Accessibility(#[from] crate::AccessibilityError),
 }
 
 fn collect_removed_exit_nodes<'a>(
@@ -1692,6 +2199,9 @@ fn collect_removed_exit_nodes<'a>(
     let Some(retained_node) = retained.node(id) else {
         return;
     };
+    if retained_node.summary().exit == 0 {
+        return;
+    }
     for (group, children) in node.retained_child_groups() {
         let ids = retained_node
             .children()
@@ -1734,10 +2244,120 @@ mod tests {
     use crate::{
         AssetData, AsyncCapabilityHandler, CapabilityDescriptor, CapabilityId, CapabilityMethod,
         ExecutionOperation, InMemoryAssetProvider, OpaqueHandle, StateField,
-        SubscriptionCapabilityHandler, SubscriptionWork, TaskWork, UiValue, ValueSchema,
+        SubscriptionCapabilityHandler, SubscriptionWork, TaskWork, UiNodeKind, UiValue,
+        ValueSchema,
     };
     use semver::{Version, VersionReq};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
+    use web_time::Instant;
+
+    #[test]
+    fn effect_origin_followup_does_not_restart_a_rejected_cascade() {
+        let mut engine = RuntimeEngine::new();
+        let compiled = engine
+            .compile(
+                r#"
+            fn followup(ctx, payload) { ctx.set_state("phase", "changed"); }
+            fn view(ctx) { text(ctx.get_state("phase")) }
+        "#,
+            )
+            .unwrap();
+        let followup = engine.callback(&compiled, "followup").unwrap();
+        let runtime = Rc::new(RefCell::new(UiRuntimeState::new()));
+        let root = ComponentInstancePath::root("App", "main");
+        let mut lifecycle = ScriptLifecycle::new(
+            compiled,
+            Rc::clone(&runtime),
+            root.clone(),
+            Some("main".to_owned()),
+            BTreeMap::new(),
+            &state_schema(),
+        )
+        .unwrap();
+        lifecycle.start(&mut engine).unwrap();
+        {
+            let mut runtime = runtime.borrow_mut();
+            runtime.effect_cascades.restart(&root);
+            runtime.effect_cascades.charge(&root, 64).unwrap();
+            assert!(runtime.effect_cascades.charge(&root, 1).is_err());
+        }
+        let _ = lifecycle
+            .with_origin(crate::InvocationOrigin::Effect, || {
+                lifecycle.invoke_callback_transactional(&engine, &followup, UiValue::Null)
+            })
+            .unwrap();
+        assert!(!lifecycle.render_dirty(&mut engine).unwrap());
+        let _ = lifecycle
+            .invoke_callback_transactional(&engine, &followup, UiValue::Null)
+            .unwrap();
+        assert!(lifecycle.render_dirty(&mut engine).unwrap());
+    }
+
+    #[test]
+    fn pure_event_loop_without_effect_transitions_shares_budget_and_prunes_restored_queue() {
+        let mut engine = RuntimeEngine::new();
+        let compiled = engine
+            .compile(
+                r#"
+            fn echo(ctx, payload) { ctx.emit("tick", ()); }
+            fn view(ctx) { text("stable") }
+        "#,
+            )
+            .unwrap();
+        let mut echo = engine.callback(&compiled, "echo").unwrap();
+        let runtime = Rc::new(RefCell::new(UiRuntimeState::new()));
+        let root = ComponentInstancePath::root("App", "pure_event");
+        let events = BTreeMap::from([(
+            "tick".to_owned(),
+            crate::EventSchema::new(ValueSchema::Null),
+        )]);
+        let mut lifecycle = ScriptLifecycle::new(
+            compiled,
+            Rc::clone(&runtime),
+            root.clone(),
+            None,
+            events.clone(),
+            &ComponentStateSchema::default(),
+        )
+        .unwrap();
+        lifecycle.start(&mut engine).unwrap();
+        echo.bind_component_scope_if_unset(
+            &root,
+            runtime.borrow().component_incarnation(&root).unwrap(),
+            events,
+        );
+        runtime.borrow_mut().replace_component_event_handlers(
+            &root,
+            BTreeMap::from([((root.clone(), "tick".to_owned()), echo)]),
+        );
+        let context = lifecycle.context(ExecutionPhase::Event);
+        lifecycle
+            .with_origin(crate::InvocationOrigin::Effect, || {
+                context.emit("tick", Dynamic::UNIT).unwrap();
+                Ok(())
+            })
+            .unwrap();
+        let checkpoint = runtime.borrow_mut().begin_transaction().unwrap();
+        let mut rejected = false;
+        for _ in 0..65 {
+            let pending = runtime.borrow_mut().drain_batch().events.pop().unwrap();
+            match lifecycle.invoke_component_event_transactional(&engine, pending) {
+                Ok(Some(_)) => (),
+                Err(LifecycleError::EffectBudget(65)) => {
+                    rejected = true;
+                    break;
+                }
+                result => panic!("unexpected pure event result {result:?}"),
+            }
+        }
+        assert!(rejected);
+        runtime
+            .borrow_mut()
+            .rollback_transaction(checkpoint)
+            .unwrap();
+        assert!(runtime.borrow_mut().drain_batch().events.is_empty());
+        assert!(!lifecycle.render_dirty(&mut engine).unwrap());
+    }
 
     fn state_schema() -> ComponentStateSchema {
         ComponentStateSchema::new(BTreeMap::from([(
@@ -1750,7 +2370,7 @@ mod tests {
     const STREAM_COMPONENT_APP: &str = r#"
         define_component(#{
             metadata: #{ id: "test/stream", "export": "StreamProbe", version: "0.1.0",
-                runtime_api: #{ min_inclusive: 2, max_exclusive: 3 },
+                runtime_api: #{ min_inclusive: 3, max_exclusive: 4 },
                 dependencies: [], capabilities: #{ "app.stream": "*" } },
             schema: #{ props: #{ key: #{ schema: #{ type: "string" }, required: true, sensitive: false } },
                 state: #{ fields: #{ phase: #{ schema: #{ type: "string" },
@@ -1773,6 +2393,54 @@ mod tests {
         }
         fn view(ctx) { render_component("test/stream", #{ key: "stream" }) }
     "#;
+
+    #[test]
+    fn a_duplicate_key_reports_script_positions_and_an_error_boundary_contains_it() {
+        let mount = |source: &str| {
+            let mut engine = RuntimeEngine::new();
+            let compiled = engine.compile(source).unwrap();
+            let mut lifecycle = ScriptLifecycle::new(
+                compiled,
+                Rc::new(RefCell::new(UiRuntimeState::new())),
+                ComponentInstancePath::root("App", "root"),
+                Some("main".to_owned()),
+                BTreeMap::new(),
+                &state_schema(),
+            )
+            .unwrap();
+            lifecycle.start(&mut engine).cloned()
+        };
+        let rows = r#"column([
+            text("a").with_key("same"),
+            text("b").with_key("same"),
+        ]).with_key("list")"#;
+        let error = mount(&format!(
+            "fn view(ctx) {{ column([{rows}]).with_key(\"page\") }}"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains(
+                "duplicate key `same` in child group `children` of page > list, \
+                 created at ui/main.rhai:2:13 and ui/main.rhai:3:13"
+            ),
+            "{error}"
+        );
+
+        let root = mount(&format!(
+            "fn view(ctx) {{ column([error_boundary({rows}, text(\"fallback\")), \
+             text(\"kept\")]).with_key(\"page\") }}"
+        ))
+        .unwrap();
+        let crate::UiNodeKind::Box { children } = root.kind() else {
+            panic!("the page renders");
+        };
+        assert!(
+            matches!(children[0].kind(), crate::UiNodeKind::Text { text } if text == "fallback")
+        );
+        assert!(children[0].attributes().contains_key("boundary_error"));
+        assert!(matches!(children[1].kind(), crate::UiNodeKind::Text { text } if text == "kept"));
+    }
 
     #[test]
     fn lifecycle_order_and_optional_functions_are_enforced() {
@@ -2004,7 +2672,7 @@ mod tests {
         );
         let layout_request = |now| crate::geometry::LayoutMotionRequest {
             shared: None,
-            duration: Duration::from_millis(1_000),
+            duration: Duration::from_secs(1),
             easing: crate::MotionEasing::Linear,
             preference: crate::MotionPreference::Normal,
             now,
@@ -2469,7 +3137,7 @@ mod tests {
         );
         assert!(!lifecycle.suspend(&mut engine).unwrap());
 
-        manual.advance(Duration::from_millis(1_000));
+        manual.advance(Duration::from_secs(1));
         {
             let mut runtime = runtime.borrow_mut();
             let now = runtime.clock.now();
@@ -2567,6 +3235,78 @@ mod tests {
     }
 
     #[test]
+    fn a_realization_in_a_motion_group_keeps_the_items_it_kept() {
+        let mut engine = RuntimeEngine::new();
+        let compiled = engine
+            .compile(
+                r#"
+                    fn render_item(ctx, payload) {
+                        text(payload.item.label).with_key(payload.key)
+                            .shared_layout(payload.key)
+                    }
+                    fn view(ctx) {
+                        let data = [];
+                        for index in 0..32 {
+                            data.push(#{ key: `row-${index}`, label: `Row ${index}` });
+                        }
+                        motion_group("rows", [virtual_collection(#{
+                            key: "rows", label: "Rows", data: data,
+                            estimated_height: 24, height: 96,
+                            overdraw_pixels: 24, alignment: "top", follow_tail: false,
+                            batch_items: 1, retain_items: 0
+                        }, Fn("render_item"))])
+                    }
+                "#,
+            )
+            .unwrap();
+        let runtime = Rc::new(RefCell::new(UiRuntimeState::new()));
+        let path = ComponentInstancePath::root("App", "root");
+        let mut lifecycle = ScriptLifecycle::new(
+            compiled,
+            Rc::clone(&runtime),
+            path.clone(),
+            Some("main".to_owned()),
+            BTreeMap::new(),
+            &ComponentStateSchema::default(),
+        )
+        .unwrap();
+        lifecycle.start(&mut engine).unwrap();
+        let id = engine
+            .virtual_collection_ids_in_scope(&path)
+            .into_iter()
+            .next()
+            .unwrap();
+        let items = |lifecycle: &ScriptLifecycle| {
+            lifecycle
+                .root()
+                .unwrap()
+                .virtual_collection_items(&id)
+                .unwrap()
+                .clone()
+        };
+        let before = items(&lifecycle);
+        let kept = *before.keys().last().unwrap();
+        runtime
+            .borrow()
+            .virtual_requests
+            .request(id.clone(), [kept, kept + 1]);
+        assert!(lifecycle.realize_virtual_requests(&mut engine).unwrap());
+        let after = items(&lifecycle);
+        assert!(
+            after[&kept].ptr_eq(&before[&kept]),
+            "the kept item was copied"
+        );
+        assert_eq!(
+            after[&(kept + 1)].attributes().get("shared_layout_group"),
+            Some(&UiValue::String("rows".to_owned()))
+        );
+        // Applying the group to a grouped item changes nothing.
+        let mut again = after[&(kept + 1)].clone();
+        crate::node::apply_motion_group(&mut again, "rows", None);
+        assert!(again.ptr_eq(&after[&(kept + 1)]));
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn virtual_realization_commits_the_complete_target_window_and_prunes_old_items() {
         let mut engine = RuntimeEngine::new();
@@ -2584,7 +3324,8 @@ mod tests {
                         virtual_collection(#{
                             key: "rows", label: "Rows", data: data,
                             estimated_height: 24, height: 96,
-                            overdraw_pixels: 24, alignment: "top", follow_tail: false
+                            overdraw_pixels: 24, alignment: "top", follow_tail: false,
+                            batch_items: 1, retain_items: 0
                         }, Fn("render_item"))
                     }
                 "#,
@@ -2654,7 +3395,10 @@ mod tests {
             .virtual_requests
             .request(id.clone(), [retained, first_new]);
         assert!(!lifecycle.realize_virtual_requests(&mut engine).unwrap());
-        assert!(engine.take_timings().is_empty());
+        assert_eq!(
+            engine.take_timings(),
+            [] as [crate::engine::ExecutionTiming; 0]
+        );
 
         runtime
             .borrow()
@@ -2686,6 +3430,710 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn virtual_target_commit_retains_and_releases_the_complete_component_manifest() {
+        fn counter_callback(node: &UiNode) -> Option<ScriptCallback> {
+            if let Some(handler) = node.handler("click") {
+                return handler.as_script().cloned();
+            }
+            match node.kind() {
+                crate::UiNodeKind::Box { children } | crate::UiNodeKind::Fragment { children } => {
+                    children.iter().find_map(counter_callback)
+                }
+                _ => None,
+            }
+        }
+        for (wrapper, row) in [
+            (
+                "child",
+                r#"render_component("test/virtual_counter",#{key:payload.key})"#,
+            ),
+            (
+                "child",
+                r#"render_component("test/wrapper",#{key:payload.key,depth:0})"#,
+            ),
+            (
+                "child",
+                r#"render_component("test/wrapper",#{key:payload.key,depth:2})"#,
+            ),
+            (
+                "column([child])",
+                r#"render_component("test/wrapper",#{key:payload.key,depth:0})"#,
+            ),
+        ] {
+            let mut engine = RuntimeEngine::new();
+            let source = r#"
+            define_component(#{
+                metadata: #{id:"test/virtual_counter", "export":"Counter", version:"0.1.8",
+                    runtime_api:#{min_inclusive: 3,max_exclusive: 4},dependencies:[],capabilities:#{}},
+                schema: #{props:#{key:#{schema:#{type:"string"},required:true,sensitive:false}},
+                    state:#{fields:#{count:#{schema:#{type:"integer"},"default":#{type:"integer",value:7}}}},
+                    events:#{},slots:#{},parts:[],effects:["keep"]},render:Fn("render_counter")
+            });
+            fn read_count(ctx,payload) {ctx.get_state("count")}
+            fn start(ctx,deps) {()}
+            fn cleanup(ctx,deps) {()}
+            fn tick(ctx,value) {()}
+            fn render_counter(ctx,props) {
+                effect("keep",(),Fn("start"),Fn("cleanup"));
+                timeout("tick",1000,false,Fn("tick"),());
+                let opacity=signal("opacity",1.0);
+                text(`${ctx.get_state("count")}`).with_key(props.key).bind_signal("opacity",opacity)
+                    .with_ref(element_ref("counter")).on_click(Fn("read_count"))
+            }
+            define_component(#{
+                metadata:#{id:"test/wrapper","export":"Wrapper",version:"0.1.8",
+                    runtime_api:#{min_inclusive: 3,max_exclusive: 4},dependencies:[],capabilities:#{}},
+                schema:#{props:#{key:#{schema:#{type:"string"},required:true,sensitive:false},
+                    depth:#{schema:#{type:"integer"},required:true,sensitive:false}},
+                    state:#{fields:#{}},events:#{},slots:#{},parts:[]},render:Fn("render_wrapper")
+            });
+            fn render_wrapper(ctx,props) {
+                let child=if props.depth==0 {
+                    render_component("test/virtual_counter",#{key:"inner"})
+                } else {
+                    render_component("test/wrapper",#{key:"inner",depth:props.depth-1})
+                };
+                WRAPPER_BODY
+            }
+            fn row(ctx,payload) {
+                if payload.index==19 {throw "candidate row failed";}
+                ROW_BODY
+            }
+            fn view(ctx) {
+                let data=[];for index in 0..20 {data.push(#{key:`row-${index}`});}
+                virtual_collection(#{key:"rows",label:"Rows",data:data,height:24,
+                    estimated_height:24,overdraw_pixels:0,batch_items:1,retain_items:0},Fn("row"))
+            }
+        "#.replace("WRAPPER_BODY",wrapper).replace("ROW_BODY",row);
+            let compiled = engine.compile(&source).unwrap();
+            let runtime = Rc::new(RefCell::new(UiRuntimeState::new()));
+            let path = ComponentInstancePath::root("App", "manifest");
+            let mut lifecycle = ScriptLifecycle::new(
+                compiled,
+                Rc::clone(&runtime),
+                path.clone(),
+                None,
+                BTreeMap::new(),
+                &ComponentStateSchema::default(),
+            )
+            .unwrap();
+            lifecycle.start(&mut engine).unwrap();
+            let id = engine
+                .virtual_collection_ids_in_scope(&path)
+                .into_iter()
+                .next()
+                .unwrap();
+            let callback = counter_callback(
+                &lifecycle
+                    .root()
+                    .unwrap()
+                    .virtual_collection_items(&id)
+                    .unwrap()[&0],
+            )
+            .unwrap();
+            let child = callback.component().unwrap().clone();
+            let signal = runtime.borrow().signals.resolve(&child, "opacity").unwrap();
+            let initial_effects = runtime
+                .borrow()
+                .effects
+                .iter_active()
+                .filter(|(id, _, _)| id.component() == &child)
+                .map(|(id, _, activation)| (id.clone(), activation))
+                .collect::<Vec<_>>();
+            runtime
+                .borrow()
+                .virtual_requests
+                .request(id.clone(), [0, 10]);
+            lifecycle.realize_virtual_requests(&mut engine).unwrap();
+            assert_eq!(
+                lifecycle
+                    .invoke_callback(&engine, &callback, UiValue::Null)
+                    .unwrap()
+                    .as_int()
+                    .unwrap(),
+                7
+            );
+            assert_eq!(
+                runtime
+                    .borrow()
+                    .effects
+                    .iter_active()
+                    .filter(|(id, _, _)| id.component() == &child)
+                    .map(|(id, _, activation)| (id.clone(), activation))
+                    .collect::<Vec<_>>(),
+                initial_effects
+            );
+            assert!(runtime.borrow().signals.read(&signal).is_ok());
+            assert_eq!(engine.component_timers_in_scope(&child).len(), 1);
+            assert_eq!(engine.component_element_refs_in_scope(&child).len(), 1);
+            let event = UiContext::new(
+                Rc::clone(&runtime),
+                child.clone(),
+                None,
+                ExecutionPhase::Event,
+                BTreeMap::new(),
+            );
+            event
+                .set_state("count", UiValue::Integer(8).into_dynamic())
+                .unwrap();
+            assert!(lifecycle.render_dirty(&mut engine).unwrap());
+            assert_eq!(
+                lifecycle
+                    .invoke_callback(&engine, &callback, UiValue::Null)
+                    .unwrap()
+                    .as_int()
+                    .unwrap(),
+                8,
+                "transparent descendants remain executable after scrolling"
+            );
+            runtime
+                .borrow()
+                .virtual_requests
+                .request(id.clone(), [0, 10, 19]);
+            assert!(lifecycle.realize_virtual_requests(&mut engine).is_err());
+            assert_eq!(
+                lifecycle
+                    .root()
+                    .unwrap()
+                    .virtual_collection_items(&id)
+                    .unwrap()
+                    .keys()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                vec![0, 10]
+            );
+            assert!(runtime.borrow().signals.read(&signal).is_ok());
+            runtime.borrow().virtual_requests.request_target(id, [10]);
+            lifecycle.realize_virtual_requests(&mut engine).unwrap();
+            assert!(
+                runtime
+                    .borrow()
+                    .component_state
+                    .get(&child, "count")
+                    .is_none()
+            );
+            assert!(
+                lifecycle
+                    .invoke_callback(&engine, &callback, UiValue::Null)
+                    .is_err()
+            );
+            assert!(runtime.borrow().signals.read(&signal).is_err());
+            assert!(engine.component_timers_in_scope(&child).is_empty());
+            assert!(engine.component_element_refs_in_scope(&child).is_empty());
+            assert!(
+                !runtime
+                    .borrow()
+                    .effects
+                    .iter()
+                    .any(|(id, _)| id.component() == &child)
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn nested_virtual_targets_preserve_callbacks_snapshots_and_prune_atomically() {
+        let mut engine = RuntimeEngine::new();
+        let compiled = engine.compile(r#"
+            define_component(#{
+                metadata:#{id:"test/panel","export":"Panel",version:"0.1.8",
+                    runtime_api:#{min_inclusive: 3,max_exclusive: 4},dependencies:[],capabilities:#{}},
+                schema:#{props:#{key:#{schema:#{type:"string"},required:true,sensitive:false}},
+                    state:#{fields:#{count:#{schema:#{type:"integer"},"default":#{type:"integer",value:7}}}},
+                    events:#{},slots:#{},parts:[]},render:Fn("render_panel")
+            });
+            fn data() {let rows=[];for i in 0..20 {rows.push(#{key:`row-${i}`});}rows}
+            fn read_count(ctx,payload) {ctx.get_state("count")}
+            fn inner_row(ctx,payload) {
+                if payload.index==19 {throw "candidate rejected";}
+                text(payload.key).on_click(Fn("read_count"))
+            }
+            fn outer_row(ctx,payload) {
+                virtual_collection(#{key:`inner-${payload.key}`,label:"Inner",data:data(),height:24,
+                    estimated_height:24,overdraw_pixels:0,batch_items:1,retain_items:0},Fn("inner_row"))
+            }
+            fn render_panel(ctx,props) {
+                virtual_collection(#{key:"outer",label:"Outer",data:data(),height:24,
+                    estimated_height:24,overdraw_pixels:0,batch_items:1,retain_items:0},Fn("outer_row"))
+            }
+            fn view(ctx) {column([text(`${ctx.get_state("other")}`),render_component("test/panel",#{key:"panel"})])}
+        "#).unwrap();
+        let runtime = Rc::new(RefCell::new(UiRuntimeState::new()));
+        let path = ComponentInstancePath::root("App", "nested");
+        let schema = ComponentStateSchema::new(BTreeMap::from([(
+            "other".into(),
+            crate::StateField::new(crate::ValueSchema::integer(), UiValue::Integer(0)),
+        )]))
+        .unwrap();
+        let mut lifecycle = ScriptLifecycle::new(
+            compiled,
+            Rc::clone(&runtime),
+            path.clone(),
+            None,
+            BTreeMap::new(),
+            &schema,
+        )
+        .unwrap();
+        lifecycle.start(&mut engine).unwrap();
+        let panel = path.child("Panel", "panel");
+        let ids = engine.virtual_collection_ids_in_scope(&path);
+        let outer = ids.iter().find(|id| id.key == "outer").unwrap().clone();
+        let inner = ids
+            .iter()
+            .find(|id| id.key == "inner-row-0")
+            .unwrap()
+            .clone();
+        runtime
+            .borrow()
+            .virtual_requests
+            .request_target(inner.clone(), [10]);
+        lifecycle.realize_virtual_requests(&mut engine).unwrap();
+        let callback = lifecycle
+            .root()
+            .unwrap()
+            .virtual_collection_items(&inner)
+            .unwrap()[&10]
+            .handler("click")
+            .unwrap()
+            .as_script()
+            .unwrap()
+            .clone();
+        assert_eq!(callback.component(), Some(&panel));
+        assert_eq!(
+            lifecycle
+                .invoke_callback(&engine, &callback, UiValue::Null)
+                .unwrap()
+                .as_int()
+                .unwrap(),
+            7
+        );
+
+        // An unrelated root update reuses Panel. Its committed snapshot must
+        // contain the latest inner target, not the initial seed window.
+        let context = UiContext::new(
+            Rc::clone(&runtime),
+            path,
+            None,
+            ExecutionPhase::Event,
+            BTreeMap::new(),
+        );
+        context
+            .set_state("other", UiValue::Integer(1).into_dynamic())
+            .unwrap();
+        lifecycle.render_dirty(&mut engine).unwrap();
+        assert_eq!(
+            lifecycle
+                .root()
+                .unwrap()
+                .virtual_collection_items(&inner)
+                .unwrap()
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![10]
+        );
+
+        // Keep the outer row while adding a sibling, then exercise rollback.
+        runtime
+            .borrow()
+            .virtual_requests
+            .request_target(outer.clone(), [0, 10]);
+        lifecycle.realize_virtual_requests(&mut engine).unwrap();
+        assert!(
+            engine
+                .virtual_collection_ids_in_scope(&panel)
+                .contains(&inner)
+        );
+        runtime
+            .borrow()
+            .virtual_requests
+            .request_target(inner.clone(), [10, 19]);
+        assert!(lifecycle.realize_virtual_requests(&mut engine).is_err());
+        assert_eq!(
+            lifecycle
+                .root()
+                .unwrap()
+                .virtual_collection_items(&inner)
+                .unwrap()
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![10]
+        );
+
+        // A simultaneous parent prune makes a child request obsolete; it must
+        // not roll back the parent or recreate the removed collection.
+        runtime
+            .borrow()
+            .virtual_requests
+            .request_target(outer, [10]);
+        runtime
+            .borrow()
+            .virtual_requests
+            .request_target(inner.clone(), [11]);
+        lifecycle.realize_virtual_requests(&mut engine).unwrap();
+        assert!(
+            lifecycle
+                .root()
+                .unwrap()
+                .virtual_collection_spec(&inner)
+                .is_none()
+        );
+        assert!(
+            !engine
+                .virtual_collection_ids_in_scope(&panel)
+                .contains(&inner)
+        );
+    }
+
+    /// 64 rows of 24px in a 96px viewport with one row of overdraw, `EXTRA` appended to
+    /// the collection's config. Rows from 40 on are a component that owns an effect, and
+    /// row 50 fails to render. The state `version` renders the collection again.
+    const RENDER_AHEAD: &str = r#"
+        define_component(#{
+            metadata:#{id:"test/ticking","export":"Ticking",version:"0.1.0",
+                runtime_api:#{min_inclusive: 3,max_exclusive: 4},dependencies:[],capabilities:#{}},
+            schema:#{props:#{key:#{schema:#{type:"string"},required:true,sensitive:false}},
+                state:#{fields:#{}},events:#{},slots:#{},parts:[],effects:["tick"]},
+            render:Fn("render_ticking")
+        });
+        fn start(ctx,deps) {()}
+        fn stop(ctx,deps) {()}
+        fn render_ticking(ctx,props) {
+            effect("tick",(),Fn("start"),Fn("stop"));
+            text("ticking").with_key(props.key)
+        }
+        fn row(ctx,payload) {
+            if payload.index == 50 { throw "row 50 failed"; }
+            if payload.index >= 40 { render_component("test/ticking",#{key:payload.key}) }
+            else { text(payload.item.label).with_key(payload.key) }
+        }
+        fn view(ctx) {
+            let version = ctx.get_state("version");
+            let data=[];
+            for index in 0..64 {data.push(#{key:`row-${index}`,label:`Row ${index}:${version}`});}
+            virtual_collection(#{key:"rows",label:"Rows",data:data,height:96,
+                estimated_height:24,overdraw_pixels:24 EXTRA},Fn("row"))
+        }
+    "#;
+
+    struct RenderAhead {
+        engine: RuntimeEngine,
+        lifecycle: ScriptLifecycle,
+        runtime: Rc<RefCell<UiRuntimeState>>,
+        id: crate::VirtualCollectionId,
+        path: ComponentInstancePath,
+    }
+
+    impl RenderAhead {
+        fn start(extra: &str, policy: crate::VirtualCollectionPolicy) -> Self {
+            let mut engine = RuntimeEngine::new();
+            engine.set_virtual_collection_policy(policy);
+            let compiled = engine
+                .compile(&RENDER_AHEAD.replace("EXTRA", extra))
+                .unwrap();
+            let runtime = Rc::new(RefCell::new(UiRuntimeState::new()));
+            let path = ComponentInstancePath::root("App", "ahead");
+            let schema = ComponentStateSchema::new(BTreeMap::from([(
+                "version".to_owned(),
+                StateField::new(ValueSchema::integer(), UiValue::Integer(0)),
+            )]))
+            .unwrap();
+            let mut lifecycle = ScriptLifecycle::new(
+                compiled,
+                Rc::clone(&runtime),
+                path.clone(),
+                Some("main".to_owned()),
+                BTreeMap::new(),
+                &schema,
+            )
+            .unwrap();
+            lifecycle.start(&mut engine).unwrap();
+            let id = engine
+                .virtual_collection_ids_in_scope(&path)
+                .into_iter()
+                .next()
+                .unwrap();
+            let _ = engine.take_timings();
+            Self {
+                engine,
+                lifecycle,
+                runtime,
+                id,
+                path,
+            }
+        }
+
+        fn realized(&self) -> Vec<usize> {
+            self.lifecycle
+                .root()
+                .unwrap()
+                .virtual_collection_items(&self.id)
+                .unwrap()
+                .keys()
+                .copied()
+                .collect()
+        }
+
+        /// Ask for `range`, as a frame that needs it does, replacing any pending target;
+        /// returns the rows the renderer rendered for it.
+        fn request(&mut self, range: std::ops::Range<usize>) -> usize {
+            self.runtime
+                .borrow()
+                .virtual_requests
+                .request_target(self.id.clone(), range);
+            self.lifecycle
+                .realize_virtual_requests(&mut self.engine)
+                .unwrap();
+            self.engine
+                .take_timings()
+                .iter()
+                .filter(|timing| {
+                    matches!(timing.operation, ExecutionOperation::VirtualCollection(_))
+                })
+                .count()
+        }
+
+        fn render_again(&mut self) {
+            self.runtime
+                .borrow_mut()
+                .set_component_state_from_host(&self.path, "version", UiValue::Integer(1))
+                .unwrap();
+            assert!(self.lifecycle.render_dirty(&mut self.engine).unwrap());
+            let _ = self.engine.take_timings();
+        }
+    }
+
+    #[test]
+    fn a_commit_keeps_the_requests_of_other_scopes_sharing_the_runtime() {
+        let mut ahead = RenderAhead::start(
+            ",batch_items:1,retain_items:0",
+            crate::VirtualCollectionPolicy::default(),
+        );
+        // A window opened from this view shares its runtime and commits on its own.
+        let theirs = crate::VirtualCollectionId {
+            component: ComponentInstancePath::root("View", "window"),
+            key: "rows".to_owned(),
+        };
+        ahead
+            .runtime
+            .borrow()
+            .virtual_requests
+            .request(theirs.clone(), [4]);
+        assert_eq!(ahead.request(2..8), 2);
+        let pending = ahead.runtime.borrow().virtual_requests.drain();
+        assert_eq!(pending.get(&theirs), Some(&BTreeSet::from([4])));
+    }
+
+    #[test]
+    fn a_scroll_that_needs_new_items_renders_a_batch_beyond_them() {
+        let mut ahead = RenderAhead::start(
+            ",batch_items:8,retain_items:0",
+            crate::VirtualCollectionPolicy::default(),
+        );
+        assert_eq!(ahead.realized(), (0..6).collect::<Vec<_>>());
+        // Rows 6 and 7 are needed; seven more follow them.
+        assert_eq!(ahead.request(2..8), 9);
+        assert_eq!(ahead.realized(), (2..15).collect::<Vec<_>>());
+        // Scrolling back up needs rows 0 and 1, and renders seven above them where there
+        // are rows: none.
+        assert_eq!(ahead.request(0..6), 2);
+        assert_eq!(ahead.realized(), (0..6).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn items_leaving_the_range_come_back_without_rendering() {
+        let mut ahead = RenderAhead::start(
+            ",batch_items:1,retain_items:32",
+            crate::VirtualCollectionPolicy::default(),
+        );
+        assert_eq!(ahead.request(20..26), 6);
+        assert_eq!(ahead.request(0..6), 0, "rows 0 to 5 were kept");
+        assert_eq!(ahead.realized(), (0..6).collect::<Vec<_>>());
+        let items = ahead
+            .lifecycle
+            .root()
+            .unwrap()
+            .virtual_collection_items(&ahead.id)
+            .unwrap()
+            .clone();
+        assert!(matches!(items[&3].kind(), UiNodeKind::Text { text } if text == "Row 3:0"));
+        assert_eq!(ahead.request(20..26), 0, "and so were rows 20 to 25");
+    }
+
+    #[test]
+    fn kept_items_are_dropped_when_the_collection_renders_again() {
+        let mut ahead = RenderAhead::start(
+            ",batch_items:1,retain_items:32",
+            crate::VirtualCollectionPolicy::default(),
+        );
+        assert_eq!(ahead.request(20..26), 6);
+        assert_eq!(ahead.request(30..36), 6);
+        ahead.render_again();
+        // Rows 20 to 25 were kept from the first render; the new one renders them anew,
+        // with the new data.
+        assert_eq!(ahead.request(20..26), 6);
+        let items = ahead
+            .lifecycle
+            .root()
+            .unwrap()
+            .virtual_collection_items(&ahead.id)
+            .unwrap()
+            .clone();
+        assert!(matches!(items[&22].kind(), UiNodeKind::Text { text } if text == "Row 22:1"));
+    }
+
+    #[test]
+    fn an_item_whose_component_owns_an_effect_is_released_not_kept() {
+        let mut ahead = RenderAhead::start(
+            ",batch_items:1,retain_items:32",
+            crate::VirtualCollectionPolicy::default(),
+        );
+        assert_eq!(ahead.request(40..46), 6);
+        assert_eq!(ahead.request(20..26), 6);
+        // Rows 40 to 45 stopped their effects when they left; they render again.
+        assert_eq!(ahead.request(40..46), 6);
+        // Rows 20 to 25 own no work and were kept.
+        assert_eq!(ahead.request(20..26), 0);
+    }
+
+    #[test]
+    fn kept_items_survive_a_failed_realization() {
+        let mut ahead = RenderAhead::start(
+            ",batch_items:1,retain_items:32",
+            crate::VirtualCollectionPolicy::default(),
+        );
+        assert_eq!(ahead.request(20..26), 6);
+        // Row 50 fails: the items roll back to 20 to 25, which this attempt had kept.
+        ahead
+            .runtime
+            .borrow()
+            .virtual_requests
+            .request(ahead.id.clone(), 48..52);
+        assert!(
+            ahead
+                .lifecycle
+                .realize_virtual_requests(&mut ahead.engine)
+                .is_err()
+        );
+        let _ = ahead.engine.take_timings();
+        assert_eq!(ahead.realized(), (20..26).collect::<Vec<_>>());
+        // What the collection kept before and during the failed attempt still comes back
+        // without rendering.
+        assert_eq!(ahead.request(0..6), 0);
+        assert_eq!(ahead.request(20..26), 0);
+        assert_eq!(ahead.realized(), (20..26).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_failing_item_rendered_ahead_falls_back_to_the_requested_ones() {
+        let mut ahead = RenderAhead::start(
+            ",batch_items:8,retain_items:0",
+            crate::VirtualCollectionPolicy::default(),
+        );
+        // The batch after rows 44 and 45 reaches row 50, which fails: rows 44 to 49 render
+        // and 50 fails (seven renders), then only the requested rows render again (two).
+        // No failure is reported.
+        assert_eq!(ahead.request(44..46), 9);
+        assert_eq!(ahead.realized(), vec![44, 45]);
+        // Within the engine's session, before the lifecycle starts another, the recovered
+        // failure is not the last one either.
+        let previous = ahead
+            .lifecycle
+            .root()
+            .unwrap()
+            .virtual_collection_items(&ahead.id)
+            .unwrap()
+            .clone();
+        ahead.engine.begin_execution_session();
+        let realized = ahead
+            .engine
+            .realize_virtual_collection(&ahead.id, &BTreeSet::from([46, 47]), &previous)
+            .unwrap();
+        assert_eq!(realized.keys().copied().collect::<Vec<_>>(), vec![46, 47]);
+        assert_eq!(ahead.engine.last_failed_timing(), None);
+        assert_eq!(ahead.engine.last_failed_component(), None);
+        // A failing requested row still fails the realization.
+        ahead
+            .runtime
+            .borrow()
+            .virtual_requests
+            .request_target(ahead.id.clone(), 50..51);
+        assert!(
+            ahead
+                .lifecycle
+                .realize_virtual_requests(&mut ahead.engine)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn the_host_policy_applies_unless_a_collection_sets_its_own() {
+        let policy = crate::VirtualCollectionPolicy {
+            overscan_items: Some(3),
+            batch_items: Some(4),
+            retain_items: Some(0),
+        };
+        let mut ahead = RenderAhead::start("", policy);
+        // Three items of overscan replace the collection's own 24 pixels.
+        let spec = ahead
+            .lifecycle
+            .root()
+            .unwrap()
+            .virtual_collection_spec(&ahead.id)
+            .unwrap()
+            .clone();
+        assert!((spec.overdraw_pixels - 72.0).abs() < f64::EPSILON);
+        let first = *ahead.realized().last().unwrap() + 1;
+        // The Host's batch of four: the needed row and three more.
+        assert_eq!(ahead.request(first..first + 1), 4);
+
+        let mut own = RenderAhead::start(",overscan_items:0,batch_items:1", policy);
+        let spec = own
+            .lifecycle
+            .root()
+            .unwrap()
+            .virtual_collection_spec(&own.id)
+            .unwrap()
+            .clone();
+        assert!(spec.overdraw_pixels.abs() < f64::EPSILON);
+        let first = *own.realized().last().unwrap() + 1;
+        assert_eq!(own.request(first..first + 1), 1);
+    }
+
+    #[test]
+    fn render_ahead_settings_are_validated() {
+        for (extra, field) in [
+            (",batch_items:0", "batch_items"),
+            (",retain_items:-1", "retain_items"),
+            (",overscan_items:1001", "overscan_items"),
+            (",batch_items:2.5", "batch_items"),
+        ] {
+            let mut engine = RuntimeEngine::new();
+            let compiled = engine
+                .compile(&RENDER_AHEAD.replace("EXTRA", extra))
+                .unwrap();
+            let schema = ComponentStateSchema::new(BTreeMap::from([(
+                "version".to_owned(),
+                StateField::new(ValueSchema::integer(), UiValue::Integer(0)),
+            )]))
+            .unwrap();
+            let mut lifecycle = ScriptLifecycle::new(
+                compiled,
+                Rc::new(RefCell::new(UiRuntimeState::new())),
+                ComponentInstancePath::root("App", "invalid"),
+                Some("main".to_owned()),
+                BTreeMap::new(),
+                &schema,
+            )
+            .unwrap();
+            let error = lifecycle.start(&mut engine).unwrap_err().to_string();
+            assert!(error.contains(field), "{extra}: {error}");
+        }
+    }
+
+    #[test]
     fn controlled_rerender_synchronously_rebuilds_the_retained_virtual_window() {
         let mut engine = RuntimeEngine::new();
         let compiled = engine
@@ -2708,6 +4156,7 @@ mod tests {
                             key: "rows", label: "Rows", data: data,
                             estimated_height: 24, height: 96,
                             overdraw_pixels: 24, alignment: "top", follow_tail: false,
+                            batch_items: 1, retain_items: 0,
                             reveal_key: `row-${active}`,
                         }, Fn("render_item"))
                     }
@@ -2883,6 +4332,35 @@ mod tests {
     }
 
     #[test]
+    fn invalid_native_semantics_reject_the_candidate_before_commit() {
+        let mut engine = RuntimeEngine::new();
+        let compiled = engine
+            .compile(
+                r#"fn view(ctx) {
+                    text("Mystery").accessibility_role("mystery_widget")
+                }"#,
+            )
+            .unwrap();
+        let mut lifecycle = ScriptLifecycle::new(
+            compiled,
+            Rc::new(RefCell::new(UiRuntimeState::new())),
+            ComponentInstancePath::root("App", "root"),
+            None,
+            BTreeMap::new(),
+            &ComponentStateSchema::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            lifecycle.start(&mut engine),
+            Err(LifecycleError::Accessibility(
+                crate::AccessibilityError::UnsupportedRole(role)
+            )) if role == "mystery_widget"
+        ));
+        assert!(lifecycle.retained().is_empty());
+        assert!(lifecycle.semantics().nodes().next().is_none());
+    }
+
+    #[test]
     fn layer_budget_rejects_candidate_before_commit() {
         let mut engine = RuntimeEngine::new();
         let compiled = engine
@@ -3009,6 +4487,47 @@ mod tests {
             runtime.borrow().component_state.get(&path, "phase"),
             Some(&UiValue::String("active".to_owned()))
         );
+    }
+
+    #[test]
+    fn hot_reload_keeps_a_disabled_action_disabled() {
+        let source = r#"
+            fn init(ctx) { ctx.register_action("document.save", Fn("save")); }
+            fn save(ctx, payload) {}
+            fn disable(ctx, payload) { ctx.set_action_enabled("document.save", false); }
+            fn view(ctx) { text("actions") }
+        "#;
+        let mut engine = RuntimeEngine::new();
+        let active = engine.compile(source).unwrap();
+        let disable = engine.callback(&active, "disable").unwrap();
+        let runtime = Rc::new(RefCell::new(UiRuntimeState::new()));
+        let mut lifecycle = ScriptLifecycle::new(
+            active,
+            Rc::clone(&runtime),
+            ComponentInstancePath::root("App", "root"),
+            None,
+            BTreeMap::new(),
+            &state_schema(),
+        )
+        .unwrap();
+        lifecycle.start(&mut engine).unwrap();
+        let id = crate::ActionId::parse("document.save").unwrap();
+        assert_eq!(runtime.borrow().actions.is_enabled(&id), Some(true));
+        let _ = lifecycle
+            .invoke_callback(&engine, &disable, UiValue::Null)
+            .unwrap();
+        assert_eq!(runtime.borrow().actions.is_enabled(&id), Some(false));
+
+        let candidate = engine.compile(source).unwrap();
+        let generation = candidate.generation();
+        lifecycle
+            .reload(&mut engine, candidate, &state_schema())
+            .unwrap();
+        let mut runtime = runtime.borrow_mut();
+        assert_eq!(runtime.actions.is_enabled(&id), Some(false));
+        runtime.actions.set_enabled(&id, true).unwrap();
+        let invocation = runtime.actions.dispatch(&id, UiValue::Null).unwrap();
+        assert_eq!(invocation.callback.generation(), generation);
     }
 
     #[test]
@@ -3255,7 +4774,10 @@ mod tests {
         }
 
         let mut engine = RuntimeEngine::new();
-        let compiled = engine.compile(STREAM_COMPONENT_APP).unwrap();
+        let compiled = engine.compile(&STREAM_COMPONENT_APP.replace(
+            "fn view(ctx) { render_component(\"test/stream\", #{ key: \"stream\" }) }",
+            "fn view(ctx) { if ctx.get_state(\"phase\")==\"hidden\" {text(\"hidden\")} else {render_component(\"test/stream\", #{key:\"stream\"})} }",
+        )).unwrap();
         let runtime = Rc::new(RefCell::new(UiRuntimeState::new()));
         let capability = CapabilityId::parse("app.stream").unwrap();
         runtime
@@ -3294,12 +4816,14 @@ mod tests {
         lifecycle.start(&mut engine).unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(1);
+        let mut already_drained = None;
         loop {
             let deliveries = runtime
                 .borrow_mut()
                 .subscriptions
                 .drain(lifecycle.generation());
             for delivery in deliveries {
+                already_drained = Some(delivery.clone());
                 let _ = lifecycle.invoke_async_delivery(&engine, delivery).unwrap();
             }
             if runtime.borrow().subscriptions.active_count() == 0 {
@@ -3315,6 +4839,19 @@ mod tests {
                 .component_state
                 .get(&path.child("StreamProbe", "stream"), "phase"),
             Some(&UiValue::String("second".to_owned()))
+        );
+        let late = already_drained.unwrap();
+        runtime
+            .borrow_mut()
+            .set_component_state_from_host(&path, "phase", UiValue::String("hidden".to_owned()))
+            .unwrap();
+        lifecycle.render_dirty(&mut engine).unwrap();
+        let callback = late.callback.clone();
+        let _ = lifecycle.invoke_async_delivery(&engine, late).unwrap();
+        assert!(
+            lifecycle
+                .invoke_callback(&engine, &callback, UiValue::Null)
+                .is_err()
         );
     }
 
@@ -3351,5 +4888,152 @@ mod tests {
             error.contains("subscriptions must be started by a declarative component effect"),
             "unexpected error: {error}"
         );
+    }
+
+    fn assert_table_panel_marker(
+        lifecycle: &ScriptLifecycle,
+        runtime: &UiRuntimeState,
+        track: bool,
+        internal: bool,
+        count: i32,
+    ) {
+        let root = lifecycle.root().unwrap();
+        let panel = if track {
+            root
+        } else {
+            let UiNodeKind::Box { children } = root.kind() else {
+                panic!("expected track")
+            };
+            &children[0]
+        };
+        assert_eq!(
+            panel.style().base.width,
+            Some(crate::LayoutLength::Definite(
+                crate::Length::pixels(123.0).unwrap()
+            ))
+        );
+        if track {
+            let Some(crate::table_layout::TableLayout::Columns(columns)) = panel.table_layout()
+            else {
+                panic!("track marker lost: internal={internal}, count={count}")
+            };
+            let plan = crate::table_layout::resolve(columns.as_slice(), 400.0, &runtime.signals);
+            assert_eq!(
+                plan.widths,
+                vec![120.0 + if internal { f64::from(count) } else { 0.0 }, 140.0]
+            );
+        } else {
+            assert_eq!(
+                panel.table_column(),
+                Some(if internal {
+                    usize::try_from(count % 2).unwrap()
+                } else {
+                    0
+                })
+            );
+        }
+        let UiNodeKind::Box { children } = panel.kind() else {
+            panic!("expected panel")
+        };
+        assert!(
+            matches!(children[0].kind(), UiNodeKind::Text { text } if text.as_str() == count.to_string())
+        );
+    }
+
+    fn assert_table_modifier_replay(track: bool) {
+        for internal in [true, false] {
+            let modifier = if track {
+                ".with_table_track(columns(120), [])"
+            } else {
+                ".with_table_column(0)"
+            };
+            let internal_modifier = if track {
+                ".with_table_track(columns(120 + count), [])"
+            } else {
+                ".with_table_column(count % 2)"
+            };
+            let panel = format!(
+                "render_component(\"tests/table_panel\", #{{key:\"panel\"}}){}.with_style(style().width(px(123)))",
+                if internal { "" } else { modifier }
+            );
+            let source = r#"
+                define_component(#{
+                    metadata:#{id:"tests/table_panel","export":"Panel",version:"0.1.8",
+                        runtime_api:#{min_inclusive: 3,max_exclusive: 4},dependencies:[],capabilities:#{}},
+                    schema:#{props:#{key:#{schema:#{type:"string"},required:true,sensitive:false}},
+                        state:#{fields:#{count:#{schema:#{type:"integer"},"default":#{type:"integer",value:0}}}},
+                        events:#{},slots:#{},parts:[]},render:Fn("render_panel")
+                });
+                fn columns(width) { [#{key:"a",width:#{kind:"fixed",value:width}},
+                    #{key:"b",width:#{kind:"fixed",value:140}}] }
+                fn render_panel(ctx, props) {
+                    let count = ctx.get_state("count");
+                    if count < 0 { throw "rejected panel candidate"; }
+                    column([text(`${count}`)])INTERNAL
+                }
+                fn view(ctx) { VIEW }
+            "#
+            .replace("INTERNAL", if internal { internal_modifier } else { "" })
+            .replace(
+                "VIEW",
+                &if track { panel } else { format!("column([{panel}]).with_table_track(columns(120), [])") },
+            );
+            let mut engine = RuntimeEngine::new();
+            let compiled = engine
+                .compile_named("table-modifier.rhai", &source)
+                .unwrap();
+            let runtime = Rc::new(RefCell::new(UiRuntimeState::new()));
+            let root = ComponentInstancePath::root("App", format!("table-{track}-{internal}"));
+            let component = root.child("Panel", "panel");
+            let mut lifecycle = ScriptLifecycle::new(
+                compiled,
+                Rc::clone(&runtime),
+                root,
+                Some("main".into()),
+                BTreeMap::new(),
+                &ComponentStateSchema::default(),
+            )
+            .unwrap();
+            lifecycle.start(&mut engine).unwrap();
+            assert_table_panel_marker(&lifecycle, &runtime.borrow(), track, internal, 0);
+            for count in [1, 2] {
+                runtime
+                    .borrow_mut()
+                    .set_component_state_from_host(
+                        &component,
+                        "count",
+                        UiValue::Integer(i64::from(count)),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    runtime.borrow().dirty_components(),
+                    &BTreeSet::from([component.clone()])
+                );
+                assert!(lifecycle.render_dirty(&mut engine).unwrap());
+                assert_table_panel_marker(&lifecycle, &runtime.borrow(), track, internal, count);
+            }
+            runtime
+                .borrow_mut()
+                .set_component_state_from_host(&component, "count", UiValue::Integer(-1))
+                .unwrap();
+            assert!(lifecycle.render_dirty(&mut engine).is_err());
+            assert_table_panel_marker(&lifecycle, &runtime.borrow(), track, internal, 2);
+            runtime
+                .borrow_mut()
+                .set_component_state_from_host(&component, "count", UiValue::Integer(3))
+                .unwrap();
+            assert!(lifecycle.render_dirty(&mut engine).unwrap());
+            assert_table_panel_marker(&lifecycle, &runtime.borrow(), track, internal, 3);
+        }
+    }
+
+    #[test]
+    fn table_modifiers_replay_track_across_incremental_updates_and_failed_candidates() {
+        assert_table_modifier_replay(true);
+    }
+
+    #[test]
+    fn table_modifiers_replay_column_across_incremental_updates_and_failed_candidates() {
+        assert_table_modifier_replay(false);
     }
 }

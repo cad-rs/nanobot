@@ -14,6 +14,7 @@ use std::rc::Rc;
 
 use gpui::{AnyElement, App, Context, IntoElement, ParentElement as _, Styled as _, Window};
 
+use crate::i18n::Locale;
 use crate::model::SessionView;
 use crate::shell::HarnessShell;
 
@@ -47,18 +48,18 @@ impl PanelArea {
     }
 }
 
+/// The product panel factory: the shell (shared selection state) and the
+/// active workspace in, the panel's element out.
+pub type ProductPanelFactory<S> = Rc<
+    dyn Fn(&HarnessShell<S>, &<S as SessionView>::Workspace, &mut Window, &mut Context<HarnessShell<S>>)
+        -> AnyElement,
+>;
+
 /// What a panel renders.
 pub enum PanelSource<S: SessionView> {
     /// A product-registered element factory. It receives the shell (for shared
     /// selection state) and the active session's workspace.
-    Product(Rc<
-        dyn Fn(
-            &HarnessShell<S>,
-            &S::Workspace,
-            &mut Window,
-            &mut Context<HarnessShell<S>>,
-        ) -> AnyElement,
-    >),
+    Product(ProductPanelFactory<S>),
     /// A script panel: a `gpui-rhai` view mounted on first show.
     Script(PathBuf),
 }
@@ -70,6 +71,13 @@ pub struct PanelDef<S: SessionView> {
     pub area: PanelArea,
     pub order: i32,
     pub source: PanelSource<S>,
+    /// The plugin that contributed this panel, when a script plugin did.
+    /// The plugins panel uses it to disable a plugin at runtime (removing
+    /// exactly its panels); product panels have none.
+    pub source_plugin: Option<String>,
+    /// The capability the current user needs for this panel to show (a name
+    /// the product's account provider answers for); `None` shows it always.
+    pub requires: Option<String>,
 }
 
 impl<S: SessionView> Clone for PanelDef<S> {
@@ -83,6 +91,8 @@ impl<S: SessionView> Clone for PanelDef<S> {
                 PanelSource::Product(render) => PanelSource::Product(render.clone()),
                 PanelSource::Script(path) => PanelSource::Script(path.clone()),
             },
+            source_plugin: self.source_plugin.clone(),
+            requires: self.requires.clone(),
         }
     }
 }
@@ -93,14 +103,7 @@ impl<S: SessionView> PanelDef<S> {
         title: impl Into<String>,
         area: PanelArea,
         order: i32,
-        render: Rc<
-            dyn Fn(
-                &HarnessShell<S>,
-                &S::Workspace,
-                &mut Window,
-                &mut Context<HarnessShell<S>>,
-            ) -> AnyElement,
-        >,
+        render: ProductPanelFactory<S>,
     ) -> Self {
         Self {
             id: id.into(),
@@ -108,6 +111,8 @@ impl<S: SessionView> PanelDef<S> {
             area,
             order,
             source: PanelSource::Product(render),
+            source_plugin: None,
+            requires: None,
         }
     }
 
@@ -124,7 +129,23 @@ impl<S: SessionView> PanelDef<S> {
             area,
             order,
             source: PanelSource::Script(script),
+            source_plugin: None,
+            requires: None,
         }
+    }
+
+    /// Names the plugin this panel came from (the plugins panel's disable
+    /// removes exactly these).
+    pub fn with_plugin(mut self, plugin: impl Into<String>) -> Self {
+        self.source_plugin = Some(plugin.into());
+        self
+    }
+
+    /// Shows the panel only while the current user has `capability` (see
+    /// [`PanelHost::set_entitlements`]).
+    pub fn with_requires(mut self, capability: impl Into<String>) -> Self {
+        self.requires = Some(capability.into());
+        self
     }
 }
 
@@ -178,9 +199,13 @@ impl ScriptRuntime {
     }
 
     /// The panel's element, or an error placeholder. Empty while not mounted.
-    pub fn element(&self, id: &str) -> AnyElement {
+    pub fn element(&self, id: &str, locale: Locale, cx: &App) -> AnyElement {
+        let danger = gpui_component::ActiveTheme::theme(cx).danger;
         if let Some(error) = self.errors.get(id) {
-            return error_box(format!("脚本面板加载失败：{error}"));
+            return error_box(
+                crate::i18n::t_replace(locale, "panel.script_load_failed", &[("error", error)]),
+                danger,
+            );
         }
         let Some(handle) = self.views.get(id) else {
             return gpui::div().into_any_element();
@@ -190,12 +215,15 @@ impl ScriptRuntime {
                 Some(host) => host.container(item),
                 None => item,
             },
-            Err(e) => error_box(format!("脚本视图错误：{e}")),
+            Err(e) => error_box(
+                crate::i18n::t_replace(locale, "panel.script_view_failed", &[("error", &e.to_string())]),
+                danger,
+            ),
         }
     }
 }
 
-fn error_box(message: String) -> AnyElement {
+fn error_box(message: String, color: gpui::Hsla) -> AnyElement {
     gpui::div()
         .flex()
         .flex_col()
@@ -204,15 +232,20 @@ fn error_box(message: String) -> AnyElement {
         .size_full()
         .p_2()
         .text_xs()
-        .text_color(gpui::red())
+        .text_color(color)
         .child(message)
         .into_any_element()
 }
+
+/// The product's answer to "may the current user use this capability".
+pub type Entitlements = Rc<dyn Fn(&str) -> bool>;
 
 /// The registry of product and script panels, plus the script runtime.
 pub struct PanelHost<S: SessionView> {
     panels: Vec<PanelDef<S>>,
     scripts: Rc<RefCell<ScriptRuntime>>,
+    /// Decides panels that name a capability; `None` allows everything.
+    entitlements: Option<Entitlements>,
 }
 
 impl<S: SessionView> Default for PanelHost<S> {
@@ -220,6 +253,7 @@ impl<S: SessionView> Default for PanelHost<S> {
         Self {
             panels: Vec::new(),
             scripts: Rc::new(RefCell::new(ScriptRuntime::default())),
+            entitlements: None,
         }
     }
 }
@@ -229,12 +263,29 @@ impl<S: SessionView> PanelHost<S> {
         self.panels.push(panel);
     }
 
-    /// Panels of one region, in registration order.
+    /// Injects what decides panels with a [`PanelDef::requires`]: typically
+    /// `|capability| harness.check_entitlement(capability).is_allowed()`. It
+    /// is asked on every frame, so a capability gained (an activation) shows
+    /// its panels and one lost hides them without a restart. With nothing
+    /// injected every panel shows.
+    pub fn set_entitlements(&mut self, entitlements: Entitlements) {
+        self.entitlements = Some(entitlements);
+    }
+
+    /// Whether the current user may see `panel`.
+    pub fn allows(&self, panel: &PanelDef<S>) -> bool {
+        match (&panel.requires, &self.entitlements) {
+            (Some(capability), Some(entitlements)) => entitlements(capability),
+            _ => true,
+        }
+    }
+
+    /// Panels of one region the current user may see, by their `order`.
     pub fn panels_in(&self, area: PanelArea) -> Vec<&PanelDef<S>> {
         let mut found: Vec<&PanelDef<S>> = self
             .panels
             .iter()
-            .filter(|p| p.area == area)
+            .filter(|p| p.area == area && self.allows(p))
             .collect();
         found.sort_by_key(|p| p.order);
         found
@@ -242,6 +293,15 @@ impl<S: SessionView> PanelHost<S> {
 
     pub fn panels(&self) -> &[PanelDef<S>] {
         &self.panels
+    }
+
+    /// Every panel the current user may see (what the shell renders).
+    pub fn visible_panels(&self) -> Vec<PanelDef<S>> {
+        self.panels
+            .iter()
+            .filter(|panel| self.allows(panel))
+            .cloned()
+            .collect()
     }
 
     /// The number of registered panels (selfcheck / smoke reporting).
@@ -275,15 +335,28 @@ impl<S: SessionView> PanelHost<S> {
             let Some(area) = PanelArea::parse(&panel.area) else {
                 continue;
             };
-            self.register(PanelDef::script(
-                panel.id.clone(),
-                panel.title.clone(),
-                area,
-                order,
-                panel.script.clone(),
-            ));
+            self.register(
+                PanelDef::script(
+                    panel.id.clone(),
+                    panel.title.clone(),
+                    area,
+                    order,
+                    panel.script.clone(),
+                )
+                .with_plugin(&panel.plugin),
+            );
             order += 1;
         }
+    }
+
+    /// Disables a plugin at runtime: removes exactly the panels it
+    /// contributed. Returns how many went away (the plugins panel shows
+    /// this; zero for an already-disabled or unknown plugin).
+    pub fn remove_plugin(&mut self, plugin: &str) -> usize {
+        let before = self.panels.len();
+        self.panels
+            .retain(|panel| panel.source_plugin.as_deref() != Some(plugin));
+        before - self.panels.len()
     }
 
     /// Mounts the script panel and returns its element.
@@ -291,11 +364,12 @@ impl<S: SessionView> PanelHost<S> {
         &self,
         id: &str,
         script: &Path,
+        locale: Locale,
         window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
         self.scripts.borrow_mut().mount(id, script, window, cx);
-        self.scripts.borrow().element(id)
+        self.scripts.borrow().element(id, locale, cx)
     }
 
     /// Renders a product panel.

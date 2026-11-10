@@ -53,14 +53,6 @@ impl ApprovalMode {
             _ => None,
         }
     }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ApprovalMode::Auto => "auto",
-            ApprovalMode::DenyAll => "deny-all",
-            ApprovalMode::Ui => "ui",
-        }
-    }
 }
 
 /// Provider descriptor from the optional `[provider]` section.
@@ -244,7 +236,7 @@ mod tests {
         )
         .unwrap();
 
-        let (profile, found) = load_from_dirs(&[dir.clone()]).expect("profile loads");
+        let (profile, found) = load_from_dirs(std::slice::from_ref(&dir)).expect("profile loads");
         assert_eq!(found, dir.join(HARNESS_TOML));
         assert_eq!(profile.id, "com.rcad.ocad");
         assert_eq!(profile.name, "ocad");
@@ -270,7 +262,7 @@ mod tests {
         )
         .unwrap();
 
-        let (profile, _) = load_from_dirs(&[dir.clone()]).expect("profile loads");
+        let (profile, _) = load_from_dirs(std::slice::from_ref(&dir)).expect("profile loads");
         assert_eq!(profile.id, "com.acme.cad");
         assert_eq!(profile.name, "Acme");
         // Everything else keeps the built-in defaults.
@@ -311,7 +303,7 @@ mod tests {
             "[defaults]\napproval = \"yolo\"\n",
         )
         .unwrap();
-        assert!(load_from_dirs(&[dir.clone()]).is_none());
+        assert!(load_from_dirs(std::slice::from_ref(&dir)).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

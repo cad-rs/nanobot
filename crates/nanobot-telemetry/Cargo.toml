@@ -1,0 +1,20 @@
+[package]
+name = "nanobot-telemetry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "nanobot telemetry seam: span/event contracts with a no-op default, so instrumentation is a choice"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+# Zero dependencies on purpose. Instrumentation is a *choice*: this leaf must
+# never drag a tracing backend, exporter or OpenTelemetry dependency into a
+# consumer that did not ask for one. The kernel's CI rule (design 3.2: kernel
+# crates keep a minimal dependency face) is what makes this crate worth having.
+
+[features]
+# In-memory recorder for tests: assert on emitted spans without a global
+# subscriber. Off by default; test-only consumers enable it.
+testing = []

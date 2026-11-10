@@ -9,14 +9,16 @@ use crate::{
 };
 
 #[derive(Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct NodeSlotRuntime {
-    pub now: std::time::Instant,
+    pub now: web_time::Instant,
     pub clock: crate::RuntimeClock,
     pub colors: OwnedColorResolver,
     pub primitives: PrimitiveRegistry,
     pub assets: AssetRegistry,
     pub dispatcher: NodeEventDispatcher,
     pub overlays: WindowOverlayCoordinator,
+    pub interactions: crate::interaction::WindowInteractionCoordinator,
     pub motions: BTreeMap<MotionKey, f64>,
     pub motion_preference: crate::MotionPreference,
     pub motion_quality: crate::MotionQuality,
@@ -24,8 +26,12 @@ pub(crate) struct NodeSlotRuntime {
     pub geometry: crate::GeometryRegistry,
     pub pointer_capture: crate::PointerCaptureRegistry,
     pub focus_handles: BTreeMap<crate::NodeId, gpui::FocusHandle>,
+    pub focus_owners: BTreeMap<crate::NodeId, gpui::FocusHandle>,
     pub scroll_handles: BTreeMap<crate::NodeId, gpui::ScrollHandle>,
     pub scroll_anchors: BTreeMap<crate::NodeId, gpui::ScrollAnchor>,
+    pub wheel_parents: Vec<crate::scrollbar::ScrollWheelSource>,
+    pub key_captures: Vec<crate::renderer::KeyCaptureScope>,
+    pub intrinsic_size: Option<crate::intrinsic::IntrinsicSizeInvalidator>,
     pub virtual_requests: crate::VirtualRequestRegistry,
     pub text_selection: crate::renderer::TextSelectionRegistry,
     pub host_focus: Option<gpui::FocusHandle>,
@@ -33,14 +39,51 @@ pub(crate) struct NodeSlotRuntime {
     pub locale: String,
     pub number: Option<crate::NumberMetadata>,
     pub ambient_text_color: Option<crate::Rgba8>,
+    pub environment: crate::Environment,
+    pub inherited_disabled: bool,
+    pub focus_path: Vec<crate::NodeId>,
+    pub focus_indicators: bool,
+    pub owner_focused: bool,
     pub base_path: String,
     pub view_id: String,
+    pub semantics: crate::CommittedSemanticFrame,
+    pub a11y_active: bool,
+    pub window_drag: bool,
     pub retained_roots: BTreeMap<String, crate::NodeId>,
     pub retained_links: BTreeMap<crate::NodeId, Vec<crate::RetainedChildLink>>,
 }
 
 impl NodeSlotRuntime {
-    pub(crate) fn render(&self, node: &UiNode, slot: &str) -> AnyElement {
+    pub(crate) fn render_with_intrinsic_size(
+        &self,
+        node: &UiNode,
+        slot: &str,
+        intrinsic_size: Option<&crate::intrinsic::IntrinsicSizeInvalidator>,
+    ) -> AnyElement {
+        self.render_at_with_intrinsic_size(
+            node,
+            &format!("{}/{slot}", self.base_path),
+            self.retained_roots.get(slot).copied(),
+            intrinsic_size,
+        )
+    }
+
+    pub(crate) fn render_at(
+        &self,
+        node: &UiNode,
+        path: &str,
+        root: Option<crate::NodeId>,
+    ) -> AnyElement {
+        self.render_at_with_intrinsic_size(node, path, root, self.intrinsic_size.as_ref())
+    }
+
+    fn render_at_with_intrinsic_size(
+        &self,
+        node: &UiNode,
+        path: &str,
+        root: Option<crate::NodeId>,
+        intrinsic_size: Option<&crate::intrinsic::IntrinsicSizeInvalidator>,
+    ) -> AnyElement {
         let resources = WindowRenderResources {
             now: self.now,
             clock: &self.clock,
@@ -49,13 +92,18 @@ impl NodeSlotRuntime {
             assets: &self.assets,
             dispatcher: &self.dispatcher,
             overlays: &self.overlays,
+            interactions: &self.interactions,
             motions: &self.motions,
             signals: &self.signals,
             geometry: &self.geometry,
             pointer_capture: &self.pointer_capture,
             focus_handles: &self.focus_handles,
+            focus_owners: &self.focus_owners,
             scroll_handles: &self.scroll_handles,
             scroll_anchors: &self.scroll_anchors,
+            wheel_parents: &self.wheel_parents,
+            key_captures: &self.key_captures,
+            intrinsic_size,
             virtual_requests: &self.virtual_requests,
             text_selection: &self.text_selection,
             host_focus: self.host_focus.as_ref(),
@@ -63,8 +111,17 @@ impl NodeSlotRuntime {
             locale: &self.locale,
             number: self.number.as_ref(),
             ambient_text_color: self.ambient_text_color,
+            environment: self.environment,
+            inherited_disabled: self.inherited_disabled,
+            focus_path: &self.focus_path,
+            focus_indicators: self.focus_indicators,
+            owner_focused: self.owner_focused,
             root_path: &self.base_path,
             view_id: &self.view_id,
+            semantics: &self.semantics,
+            a11y_active: self.a11y_active,
+            window_drag: self.window_drag,
+            islands: None,
         };
         GpuiNodeRenderer::render_subtree_with_window_runtime_at(
             node,
@@ -72,9 +129,9 @@ impl NodeSlotRuntime {
             &InteractionState::default(),
             &self.primitives,
             &resources,
-            &format!("{}/{slot}", self.base_path),
+            path,
             crate::renderer::RetainedSubtree {
-                root: self.retained_roots.get(slot).copied(),
+                root,
                 links: &self.retained_links,
             },
         )

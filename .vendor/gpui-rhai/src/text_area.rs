@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
@@ -10,13 +11,12 @@ use gpui::{
     TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, div, fill,
     point, prelude::*, px, relative, rgba, size,
 };
-use gpui::AppContext as _;
 use rhai::{Engine, FuncRegistration, INT, ImmutableString};
 
 use crate::text_edit::TextBuffer;
 use crate::text_input::{NativeTypography, TextInputCallbacks, native_typography};
 use crate::{
-    ComponentStateSchema, EventSchema, ObjectField, PrimitiveDescriptor, PrimitiveEventEmitter,
+    ComponentStateSchema, EventSchema, ObjectField, PrimitiveContext, PrimitiveDescriptor,
     PrimitiveHandler, PrimitiveId, PrimitiveInstance, PrimitiveInstanceId, PrimitiveProps,
     PrimitiveValue, Rgba8, UiValue, ValueSchema,
 };
@@ -41,6 +41,7 @@ actions!(
         Home,
         End,
         Newline,
+        Submit,
         ShowCharacterPalette,
         Paste,
         Cut,
@@ -71,6 +72,17 @@ pub fn init_text_area(cx: &mut App) {
         KeyBinding::new("home", Home, Some("GPUIRhaiTextarea")),
         KeyBinding::new("end", End, Some("GPUIRhaiTextarea")),
         KeyBinding::new("enter", Newline, Some("GPUIRhaiTextarea")),
+        KeyBinding::new("shift-enter", Newline, Some("GPUIRhaiTextarea")),
+        KeyBinding::new("enter", Submit, Some("GPUIRhaiTextarea && submit_enter")),
+        KeyBinding::new(
+            if cfg!(target_os = "macos") {
+                "cmd-enter"
+            } else {
+                "ctrl-enter"
+            },
+            Submit,
+            Some("GPUIRhaiTextarea && submit_mod_enter"),
+        ),
         KeyBinding::new(
             "ctrl-cmd-space",
             ShowCharacterPalette,
@@ -95,6 +107,7 @@ struct TextAreaConfig {
     placeholder: SharedString,
     disabled: bool,
     read_only: bool,
+    submit_key: Option<String>,
     min_rows: usize,
     max_rows: usize,
     rows: Option<usize>,
@@ -199,7 +212,22 @@ impl TextAreaEntity {
         self.scroll.set_offset(point(px(0.0), -top));
     }
 
-    fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
+    /// Whether a script capture handler above the editor takes the key that
+    /// triggered the binding being run; then the binding does nothing. Not
+    /// while an input method composes text: its keys are the composition's.
+    fn script_takes_key(&self, window: &mut Window, cx: &mut App) -> bool {
+        self.buffer.marked.is_none()
+            && self
+                .callbacks
+                .key_capture
+                .as_ref()
+                .is_some_and(|take| take(window, cx))
+    }
+
+    fn left(&mut self, _: &Left, window: &mut Window, cx: &mut Context<Self>) {
+        if self.script_takes_key(window, cx) {
+            return;
+        }
         let offset = if self.buffer.selected.is_empty() {
             self.buffer.previous_boundary(self.buffer.cursor_offset())
         } else {
@@ -211,7 +239,10 @@ impl TextAreaEntity {
         cx.notify();
     }
 
-    fn right(&mut self, _: &Right, _: &mut Window, cx: &mut Context<Self>) {
+    fn right(&mut self, _: &Right, window: &mut Window, cx: &mut Context<Self>) {
+        if self.script_takes_key(window, cx) {
+            return;
+        }
         let offset = if self.buffer.selected.is_empty() {
             self.buffer.next_boundary(self.buffer.selected.end)
         } else {
@@ -223,7 +254,10 @@ impl TextAreaEntity {
         cx.notify();
     }
 
-    fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
+    fn select_left(&mut self, _: &SelectLeft, window: &mut Window, cx: &mut Context<Self>) {
+        if self.script_takes_key(window, cx) {
+            return;
+        }
         let offset = self.buffer.previous_boundary(self.buffer.cursor_offset());
         self.buffer.select_to(offset);
         self.reset_preferred_x();
@@ -231,7 +265,10 @@ impl TextAreaEntity {
         cx.notify();
     }
 
-    fn select_right(&mut self, _: &SelectRight, _: &mut Window, cx: &mut Context<Self>) {
+    fn select_right(&mut self, _: &SelectRight, window: &mut Window, cx: &mut Context<Self>) {
+        if self.script_takes_key(window, cx) {
+            return;
+        }
         let offset = self.buffer.next_boundary(self.buffer.cursor_offset());
         self.buffer.select_to(offset);
         self.reset_preferred_x();
@@ -239,22 +276,34 @@ impl TextAreaEntity {
         cx.notify();
     }
 
-    fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
+    fn up(&mut self, _: &Up, window: &mut Window, cx: &mut Context<Self>) {
+        if self.script_takes_key(window, cx) {
+            return;
+        }
         self.move_vertical(-1, false);
         cx.notify();
     }
 
-    fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
+    fn down(&mut self, _: &Down, window: &mut Window, cx: &mut Context<Self>) {
+        if self.script_takes_key(window, cx) {
+            return;
+        }
         self.move_vertical(1, false);
         cx.notify();
     }
 
-    fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
+    fn select_up(&mut self, _: &SelectUp, window: &mut Window, cx: &mut Context<Self>) {
+        if self.script_takes_key(window, cx) {
+            return;
+        }
         self.move_vertical(-1, true);
         cx.notify();
     }
 
-    fn select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
+    fn select_down(&mut self, _: &SelectDown, window: &mut Window, cx: &mut Context<Self>) {
+        if self.script_takes_key(window, cx) {
+            return;
+        }
         self.move_vertical(1, true);
         cx.notify();
     }
@@ -283,7 +332,10 @@ impl TextAreaEntity {
         self.ensure_cursor_visible();
     }
 
-    fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
+    fn select_all(&mut self, _: &SelectAll, window: &mut Window, cx: &mut Context<Self>) {
+        if self.script_takes_key(window, cx) {
+            return;
+        }
         self.buffer.move_to(0);
         self.buffer.select_to(self.buffer.content.len());
         self.reset_preferred_x();
@@ -291,7 +343,10 @@ impl TextAreaEntity {
         cx.notify();
     }
 
-    fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
+    fn home(&mut self, _: &Home, window: &mut Window, cx: &mut Context<Self>) {
+        if self.script_takes_key(window, cx) {
+            return;
+        }
         self.buffer
             .move_to(self.buffer.line_start(self.buffer.cursor_offset()));
         self.reset_preferred_x();
@@ -299,7 +354,10 @@ impl TextAreaEntity {
         cx.notify();
     }
 
-    fn end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
+    fn end(&mut self, _: &End, window: &mut Window, cx: &mut Context<Self>) {
+        if self.script_takes_key(window, cx) {
+            return;
+        }
         self.buffer
             .move_to(self.buffer.line_end(self.buffer.cursor_offset()));
         self.reset_preferred_x();
@@ -308,6 +366,9 @@ impl TextAreaEntity {
     }
 
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
+        if self.script_takes_key(window, cx) {
+            return;
+        }
         if self.config.disabled || self.config.read_only {
             return;
         }
@@ -323,6 +384,9 @@ impl TextAreaEntity {
     }
 
     fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
+        if self.script_takes_key(window, cx) {
+            return;
+        }
         if self.config.disabled || self.config.read_only {
             return;
         }
@@ -338,6 +402,9 @@ impl TextAreaEntity {
     }
 
     fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
+        if self.script_takes_key(window, cx) {
+            return;
+        }
         if self.config.disabled || self.config.read_only {
             return;
         }
@@ -348,7 +415,28 @@ impl TextAreaEntity {
         cx.notify();
     }
 
-    fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+    fn submit(&mut self, _: &Submit, window: &mut Window, cx: &mut Context<Self>) {
+        if self.script_takes_key(window, cx) {
+            return;
+        }
+        // Platform IME normally consumes confirmation before key dispatch. Keep
+        // this guard as well for hosts which deliver a key while text is marked.
+        if !self
+            .buffer
+            .permits_submit(self.config.disabled, self.config.read_only)
+        {
+            return;
+        }
+        if let Some(submit) = self.callbacks.submit.clone() {
+            let value = self.buffer.content.clone();
+            window.defer(cx, move |window, cx| submit(value, window, cx));
+        }
+    }
+
+    fn copy(&mut self, _: &Copy, window: &mut Window, cx: &mut Context<Self>) {
+        if self.script_takes_key(window, cx) {
+            return;
+        }
         if !self.buffer.selected.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 self.buffer.content[self.buffer.selected.clone()].to_owned(),
@@ -357,6 +445,9 @@ impl TextAreaEntity {
     }
 
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
+        if self.script_takes_key(window, cx) {
+            return;
+        }
         if self.config.disabled || self.config.read_only || self.buffer.selected.is_empty() {
             return;
         }
@@ -368,6 +459,9 @@ impl TextAreaEntity {
     }
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+        if self.script_takes_key(window, cx) {
+            return;
+        }
         if self.config.disabled || self.config.read_only {
             return;
         }
@@ -380,6 +474,9 @@ impl TextAreaEntity {
     }
 
     fn undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
+        if self.script_takes_key(window, cx) {
+            return;
+        }
         if !self.config.disabled && !self.config.read_only && self.buffer.undo() {
             self.reset_preferred_x();
             self.ensure_cursor_visible();
@@ -389,6 +486,9 @@ impl TextAreaEntity {
     }
 
     fn redo(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
+        if self.script_takes_key(window, cx) {
+            return;
+        }
         if !self.config.disabled && !self.config.read_only && self.buffer.redo() {
             self.reset_preferred_x();
             self.ensure_cursor_visible();
@@ -557,7 +657,7 @@ impl EntityInputHandler for TextAreaEntity {
 
 #[derive(Clone, Debug)]
 struct TextAreaLayout {
-    lines: std::sync::Arc<[WrappedLine]>,
+    lines: Vec<Arc<WrappedLine>>,
     starts: Vec<usize>,
     row_starts: Vec<usize>,
     line_height: Pixels,
@@ -565,7 +665,6 @@ struct TextAreaLayout {
 
 impl TextAreaLayout {
     fn new(lines: Vec<WrappedLine>, content: &str, line_height: Pixels) -> Self {
-        let lines: std::sync::Arc<[WrappedLine]> = lines.into();
         let mut starts = Vec::with_capacity(lines.len());
         let mut offset = 0;
         for line in content.split('\n') {
@@ -578,12 +677,12 @@ impl TextAreaLayout {
         starts.truncate(lines.len());
         let mut row_starts = Vec::with_capacity(lines.len());
         let mut row = 0;
-        for line in lines.iter() {
+        for line in &lines {
             row_starts.push(row);
             row += line.wrap_boundaries().len() + 1;
         }
         Self {
-            lines,
+            lines: lines.into_iter().map(Arc::new).collect(),
             starts,
             row_starts,
             line_height,
@@ -750,12 +849,11 @@ impl Element for TextAreaElement {
         };
         let text_style = window.text_style();
         let color = if input.buffer.content.is_empty() {
-            gpui::rgb_to_hsla(rgba(input.config.placeholder_color.as_rgba_hex()))
+            rgba(input.config.placeholder_color.as_rgba_hex()).into()
         } else {
             text_style.color
         };
         let base = TextRun {
-            letter_spacing: None,
             len: content.len(),
             font: text_style.font(),
             color,
@@ -779,7 +877,7 @@ impl Element for TextAreaElement {
             window
                 .text_system()
                 .shape_text(
-                    gpui::SharedString::from(" "),
+                    " ".into(),
                     input.config.typography.font_size,
                     &[base],
                     Some(bounds.size.width),
@@ -899,8 +997,17 @@ fn marked_runs(base: &TextRun, marked: Option<&Range<usize>>, len: usize) -> Vec
 
 impl Render for TextAreaEntity {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::app::read_host_frame_epoch(cx);
         let viewport_rows = self.config.viewport_rows(self.measured_rows);
         let viewport_height = self.config.typography.line_height * viewport_rows;
+        let key_context = match (
+            self.callbacks.submit.is_some(),
+            self.config.submit_key.as_deref(),
+        ) {
+            (true, Some("enter")) => "GPUIRhaiTextarea submit_enter",
+            (true, Some("mod_enter")) => "GPUIRhaiTextarea submit_mod_enter",
+            _ => "GPUIRhaiTextarea",
+        };
         let mut root = div().flex();
         if let Some(family) = &self.config.typography.family {
             root = root.font_family(family.clone());
@@ -911,7 +1018,7 @@ impl Render for TextAreaEntity {
             ));
         }
         root.font_weight(FontWeight(f32::from(self.config.typography.weight)))
-            .key_context("GPUIRhaiTextarea")
+            .key_context(key_context)
             .track_focus(&self.focus)
             .on_key_down(|event: &KeyDownEvent, window, cx| {
                 if event.keystroke.key.as_str() == "tab" {
@@ -938,6 +1045,7 @@ impl Render for TextAreaEntity {
             .on_action(cx.listener(Self::home))
             .on_action(cx.listener(Self::end))
             .on_action(cx.listener(Self::newline))
+            .on_action(cx.listener(Self::submit))
             .on_action(cx.listener(Self::show_character_palette))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::cut))
@@ -957,6 +1065,7 @@ impl Render for TextAreaEntity {
                     .h(viewport_height)
                     .w_full()
                     .overflow_y_scroll()
+                    .restrict_scroll_to_axis()
                     .track_scroll(&self.scroll)
                     .when_some(self.config.scroll_color, |scroll, color| {
                         scroll.bg(rgba(color.as_rgba_hex()))
@@ -978,10 +1087,69 @@ pub struct TextAreaPrimitiveHandler {
 }
 
 impl PrimitiveHandler for TextAreaPrimitiveHandler {
+    fn uses_primary_focus(&self) -> bool {
+        true
+    }
+
+    fn accessibility_actions(
+        &self,
+        _instance: &PrimitiveInstanceId,
+    ) -> Vec<gpui::AccessibleAction> {
+        vec![
+            gpui::AccessibleAction::Focus,
+            gpui::AccessibleAction::SetValue,
+        ]
+    }
+
+    fn perform_accessibility_action(
+        &mut self,
+        instance: &PrimitiveInstanceId,
+        action: gpui::AccessibleAction,
+        data: Option<&gpui::accesskit::ActionData>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Result<(), String> {
+        let entity = self
+            .instances
+            .get(instance)
+            .cloned()
+            .ok_or_else(|| "textarea accessibility target is stale".to_owned())?;
+        match action {
+            gpui::AccessibleAction::Focus => {
+                let (disabled, focus) = {
+                    let input = entity.read(cx);
+                    (input.config.disabled, input.focus.clone())
+                };
+                if disabled {
+                    return Err("disabled textarea cannot receive focus".to_owned());
+                }
+                focus.focus(window, cx);
+                Ok(())
+            }
+            gpui::AccessibleAction::SetValue => {
+                let Some(gpui::accesskit::ActionData::Value(value)) = data else {
+                    return Err("textarea SetValue requires string data".to_owned());
+                };
+                let callback = {
+                    let input = entity.read(cx);
+                    if input.config.disabled || input.config.read_only {
+                        return Err("textarea is disabled or read-only".to_owned());
+                    }
+                    input.callbacks.change.clone()
+                };
+                if let Some(callback) = callback {
+                    callback(value.to_string(), window, cx);
+                }
+                Ok(())
+            }
+            _ => Err("unsupported textarea accessibility action".to_owned()),
+        }
+    }
+
     fn render(
         &mut self,
         instance: &PrimitiveInstance,
-        events: &PrimitiveEventEmitter,
+        events: &PrimitiveContext,
         theme: &crate::PrimitiveTheme,
         window: &mut Window,
         cx: &mut App,
@@ -993,15 +1161,25 @@ impl PrimitiveHandler for TextAreaPrimitiveHandler {
         if id.key().trim().is_empty() {
             return Err("TextareaPrimitive key cannot be empty".to_owned());
         }
-        let value = string_prop(&instance.node.props, "value").unwrap_or_default();
+        let value = instance
+            .node
+            .props
+            .string("value")
+            .unwrap_or_default()
+            .to_owned();
         let config = config_from_props(&instance.node.props, theme, window)?;
         let callbacks = primitive_callbacks(events);
+        let shared_focus = instance.focus_handle().cloned();
         let entity = if let Some(entity) = self.instances.get(&id) {
             entity.clone()
         } else {
             let entity = cx.new(|cx| {
-                TextAreaEntity::new(&value, config.clone(), callbacks.clone(), cx)
-                    .expect("validated Textarea props remain valid during entity creation")
+                let mut input = TextAreaEntity::new(&value, config.clone(), callbacks.clone(), cx)
+                    .expect("validated Textarea props remain valid during entity creation");
+                if let Some(focus) = shared_focus.clone() {
+                    input.focus = focus.tab_stop(!config.disabled);
+                }
+                input
             });
             entity.update(cx, |input, cx| {
                 let focus = input.focus.clone();
@@ -1021,7 +1199,7 @@ impl PrimitiveHandler for TextAreaPrimitiveHandler {
                     input.focus.focus(window, cx);
                 }
             });
-            self.instances.insert(id, entity.clone());
+            self.instances.insert(id.clone(), entity.clone());
             entity
         };
         entity.update(cx, |input, cx| {
@@ -1061,66 +1239,49 @@ fn config_from_props(
         .color("accent")
         .unwrap_or_else(|| Rgba8::from_rgba_hex(0x3b82_f6ff));
     Ok(TextAreaConfig {
-        placeholder: string_prop(props, "placeholder").unwrap_or_default().into(),
-        disabled: bool_prop(props, "disabled").unwrap_or(false),
-        read_only: bool_prop(props, "read_only").unwrap_or(false),
+        placeholder: props.string("placeholder").unwrap_or_default().into(),
+        disabled: props.boolean("disabled").unwrap_or(false),
+        read_only: props.boolean("read_only").unwrap_or(false),
+        submit_key: props.string("submit_key").map(str::to_owned),
         min_rows: usize_prop(props, "min_rows")?.unwrap_or(3),
         max_rows: usize_prop(props, "max_rows")?.unwrap_or(8),
         rows: usize_prop(props, "rows")?,
         max_length: usize_prop(props, "max_length")?,
-        typography: native_typography(
-            theme,
-            &string_prop(props, "typography").unwrap_or_else(|| "body".to_owned()),
-            window,
-        )?,
-        autofocus: bool_prop(props, "autofocus").unwrap_or(false),
-        placeholder_color: part_color(props, "placeholder_style", theme, false)
+        typography: native_typography(theme, props.string("typography").unwrap_or("body"), window)?,
+        autofocus: props.boolean("autofocus").unwrap_or(false),
+        placeholder_color: theme
+            .part_color(props, "placeholder_style", false)
             .or_else(|| theme.color("text_muted"))
             .unwrap_or_else(|| Rgba8::from_rgba_hex(0xa1a1_aaff)),
-        selection_color: part_color(props, "selection_style", theme, true)
+        selection_color: theme
+            .part_color(props, "selection_style", true)
             .unwrap_or_else(|| with_alpha(accent, 0x55)),
-        caret_color: part_color(props, "caret_style", theme, true).unwrap_or(accent),
-        scroll_color: part_color(props, "scroll_style", theme, true),
+        caret_color: theme
+            .part_color(props, "caret_style", true)
+            .unwrap_or(accent),
+        scroll_color: theme.part_color(props, "scroll_style", true),
     })
-}
-
-fn part_color(
-    props: &PrimitiveProps,
-    name: &str,
-    theme: &crate::PrimitiveTheme,
-    prefer_background: bool,
-) -> Option<Rgba8> {
-    let Some(PrimitiveValue::Style(style)) = props.get(name) else {
-        return None;
-    };
-    let resolved = style.resolve(&crate::InteractionState::default());
-    let value = if prefer_background {
-        resolved
-            .background
-            .as_ref()
-            .or(resolved.text_color.as_ref())
-    } else {
-        resolved
-            .text_color
-            .as_ref()
-            .or(resolved.background.as_ref())
-    }?;
-    theme.resolve_color(value)
 }
 
 fn with_alpha(color: Rgba8, alpha: u8) -> Rgba8 {
     Rgba8::from_rgba_hex((color.as_rgba_hex() & 0xffff_ff00) | u32::from(alpha))
 }
 
-fn primitive_callbacks(events: &PrimitiveEventEmitter) -> TextInputCallbacks {
+fn primitive_callbacks(events: &PrimitiveContext) -> TextInputCallbacks {
+    let key_events = events.clone();
     let change_events = events.clone();
     let focus_events = events.clone();
     let blur_events = events.clone();
+    let submit_events = events.clone();
     TextInputCallbacks {
         change: Some(Rc::new(move |value, window, cx| {
             let _ = change_events.emit("change", UiValue::String(value), window, cx);
         })),
-        submit: None,
+        submit: events.observes("submit").then(|| {
+            Rc::new(move |value, window: &mut Window, cx: &mut App| {
+                let _ = submit_events.emit("submit", UiValue::String(value), window, cx);
+            }) as crate::text_input::TextValueHandler
+        }),
         focus: Some(Rc::new(move |window, cx| {
             let _ = focus_events.emit("focus", UiValue::Null, window, cx);
         })),
@@ -1128,20 +1289,9 @@ fn primitive_callbacks(events: &PrimitiveEventEmitter) -> TextInputCallbacks {
             let _ = blur_events.emit("blur", UiValue::Null, window, cx);
         })),
         tab: None,
-    }
-}
-
-fn string_prop(props: &PrimitiveProps, name: &str) -> Option<String> {
-    match props.get(name) {
-        Some(PrimitiveValue::Data(UiValue::String(value))) => Some(value.clone()),
-        _ => None,
-    }
-}
-
-fn bool_prop(props: &PrimitiveProps, name: &str) -> Option<bool> {
-    match props.get(name) {
-        Some(PrimitiveValue::Data(UiValue::Bool(value))) => Some(*value),
-        _ => None,
+        key_capture: Some(Rc::new(move |window, cx| {
+            key_events.script_takes_key(window, cx)
+        })),
     }
 }
 
@@ -1165,6 +1315,7 @@ fn pixels_to_usize(value: f32) -> usize {
 ///
 /// Panics only if the static built-in primitive ID becomes invalid.
 #[must_use]
+#[allow(clippy::too_many_lines)] // One declarative list of documented props and events.
 pub fn text_area_primitive_descriptor() -> PrimitiveDescriptor {
     let optional_callback = || ObjectField::optional(ValueSchema::optional(ValueSchema::Callback));
     PrimitiveDescriptor {
@@ -1173,19 +1324,26 @@ pub fn text_area_primitive_descriptor() -> PrimitiveDescriptor {
         props: BTreeMap::from([
             (
                 "value".to_owned(),
-                ObjectField::required(ValueSchema::string()),
+                ObjectField::required(ValueSchema::string()).with_doc(
+                    "The field's text; controlled, so store each `change` payload here; more than `max_length` graphemes is an error.",
+                ),
             ),
             (
                 "placeholder".to_owned(),
-                ObjectField::optional(ValueSchema::optional(ValueSchema::string())),
+                ObjectField::optional(ValueSchema::optional(ValueSchema::string()))
+                    .with_doc("Hint text shown in the `placeholder_style` color while `value` is empty."),
             ),
             (
                 "disabled".to_owned(),
-                ObjectField::optional(ValueSchema::Bool).with_default(UiValue::Bool(false)),
+                ObjectField::optional(ValueSchema::Bool)
+                    .with_default(UiValue::Bool(false))
+                    .with_doc("Blocks focus, clicks and edits and dims the field."),
             ),
             (
                 "read_only".to_owned(),
-                ObjectField::optional(ValueSchema::Bool).with_default(UiValue::Bool(false)),
+                ObjectField::optional(ValueSchema::Bool)
+                    .with_default(UiValue::Bool(false))
+                    .with_doc("Keeps focus, selection and copy but blocks every edit."),
             ),
             (
                 "min_rows".to_owned(),
@@ -1193,7 +1351,10 @@ pub fn text_area_primitive_descriptor() -> PrimitiveDescriptor {
                     Some(1),
                     Some(MAX_TEXTAREA_ROWS),
                 ))
-                .with_default(UiValue::Integer(3)),
+                .with_default(UiValue::Integer(3))
+                .with_doc(
+                    "Fewest visible rows when `rows` is unset; the field grows with its wrapped text from here up to `max_rows`.",
+                ),
             ),
             (
                 "max_rows".to_owned(),
@@ -1201,54 +1362,91 @@ pub fn text_area_primitive_descriptor() -> PrimitiveDescriptor {
                     Some(1),
                     Some(MAX_TEXTAREA_ROWS),
                 ))
-                .with_default(UiValue::Integer(8)),
+                .with_default(UiValue::Integer(8))
+                .with_doc(
+                    "Most visible rows when `rows` is unset, at least `min_rows`; longer text scrolls vertically.",
+                ),
             ),
             (
                 "rows".to_owned(),
                 ObjectField::optional(ValueSchema::optional(ValueSchema::bounded_integer(
                     Some(1),
                     Some(MAX_TEXTAREA_ROWS),
-                ))),
+                )))
+                .with_doc(
+                    "Fixed number of visible rows that overrides `min_rows` and `max_rows`; `()` lets the height follow the text.",
+                ),
             ),
             (
                 "max_length".to_owned(),
                 ObjectField::optional(ValueSchema::optional(ValueSchema::bounded_integer(
                     Some(0),
                     Some(MAX_TEXTAREA_GRAPHEMES),
-                ))),
+                )))
+                .with_doc(
+                    "Most graphemes the text may hold; typing, pasting and IME commits are cut to fit, and `()` means no limit.",
+                ),
             ),
             (
                 "typography".to_owned(),
-                ObjectField::required(ValueSchema::String {
-                    allowed: crate::REQUIRED_TYPOGRAPHY
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect(),
-                }),
+                ObjectField::required(ValueSchema::string()).with_doc(
+                    "Theme typography role, such as `body`, that sets the font family, size, weight and row height.",
+                ),
             ),
             (
                 "autofocus".to_owned(),
-                ObjectField::optional(ValueSchema::Bool).with_default(UiValue::Bool(false)),
+                ObjectField::optional(ValueSchema::Bool)
+                    .with_default(UiValue::Bool(false))
+                    .with_doc("Focuses the field once when it first mounts, unless it is disabled."),
             ),
             (
                 "placeholder_style".to_owned(),
-                ObjectField::required(ValueSchema::Style),
+                ObjectField::required(ValueSchema::Style).with_doc(
+                    "Its text color, or else its background, colors the placeholder; theme `text_muted` when it sets neither.",
+                ),
             ),
             (
                 "selection_style".to_owned(),
-                ObjectField::required(ValueSchema::Style),
+                ObjectField::required(ValueSchema::Style).with_doc(
+                    "Its background, or else its text color, fills selected text; a translucent theme `accent` when it sets neither.",
+                ),
             ),
             (
                 "caret_style".to_owned(),
-                ObjectField::required(ValueSchema::Style),
+                ObjectField::required(ValueSchema::Style).with_doc(
+                    "Its background, or else its text color, colors the caret; theme `accent` when it sets neither.",
+                ),
             ),
             (
                 "scroll_style".to_owned(),
-                ObjectField::required(ValueSchema::Style),
+                ObjectField::required(ValueSchema::Style).with_doc(
+                    "Its background, or else its text color, fills the scrolling text viewport; transparent when it sets neither.",
+                ),
             ),
-            ("on_change".to_owned(), optional_callback()),
-            ("on_focus".to_owned(), optional_callback()),
-            ("on_blur".to_owned(), optional_callback()),
+            (
+                "on_change".to_owned(),
+                optional_callback().with_doc(
+                    "Called with the full new text after each edit, newline, paste, cut, undo, redo or committed IME composition.",
+                ),
+            ),
+            (
+                "submit_key".to_owned(),
+                ObjectField::optional(ValueSchema::optional(ValueSchema::String {
+                    allowed: vec!["enter".to_owned(), "mod_enter".to_owned()],
+                })).with_doc("With a submit handler: `enter` sends and Shift+Enter inserts a newline; `mod_enter` sends with Cmd+Enter on macOS or Ctrl+Enter elsewhere. Unset preserves native Enter newlines."),
+            ),
+            (
+                "on_submit".to_owned(),
+                optional_callback().with_doc("Called with the full text on the configured submit key; disabled, read-only and composing fields never submit."),
+            ),
+            (
+                "on_focus".to_owned(),
+                optional_callback().with_doc("Called when the field gains keyboard focus."),
+            ),
+            (
+                "on_blur".to_owned(),
+                optional_callback().with_doc("Called when the field loses keyboard focus."),
+            ),
         ]),
         events: text_area_events(),
         state: ComponentStateSchema::default(),
@@ -1260,20 +1458,35 @@ pub fn text_area_primitive_descriptor() -> PrimitiveDescriptor {
 fn text_area_events() -> BTreeMap<String, EventSchema> {
     BTreeMap::from([
         (
+            "submit".to_owned(),
+            EventSchema {
+                doc: Some("Emitted with the full text on the configured submit key, without editing or clearing the buffer.".to_owned()),
+                payload: ValueSchema::string(),
+            },
+        ),
+        (
             "change".to_owned(),
             EventSchema {
+                doc: Some(
+                    "Emitted after each edit and when IME composition commits, not during it; the payload is the full new text."
+                        .to_owned(),
+                ),
                 payload: ValueSchema::string(),
             },
         ),
         (
             "focus".to_owned(),
             EventSchema {
+                doc: Some(
+                    "Emitted when the field gains keyboard focus; the payload is `()`.".to_owned(),
+                ),
                 payload: ValueSchema::Null,
             },
         ),
         (
             "blur".to_owned(),
             EventSchema {
+                doc: Some("Emitted when the field loses keyboard focus; the payload is `()`.".to_owned()),
                 payload: ValueSchema::Null,
             },
         ),
@@ -1303,6 +1516,7 @@ mod tests {
             placeholder: "".into(),
             disabled: false,
             read_only: false,
+            submit_key: None,
             min_rows: 3,
             max_rows: 8,
             rows: None,

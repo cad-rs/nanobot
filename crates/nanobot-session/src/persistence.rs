@@ -9,6 +9,7 @@
 //! returns an explicit error instead of relying on std's silent stubs.
 
 use crate::session::LogEntry;
+#[cfg(not(target_family = "wasm"))]
 use std::fs;
 #[cfg(not(target_family = "wasm"))]
 use std::io::{BufRead, BufReader, Write};
@@ -17,25 +18,27 @@ use std::path::Path;
 /// Save the event log to a JSONL file.
 ///
 /// Each entry is serialized as one JSON object per line. The file is
-/// truncated and rewritten in full (MVP snapshot strategy).
+/// rewritten in full (MVP snapshot strategy) and replaced atomically.
 #[cfg(not(target_family = "wasm"))]
 pub fn save(path: &Path, entries: &[LogEntry]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
 
-    let mut file = fs::File::create(path)?;
+    let mut bytes = Vec::new();
     for entry in entries {
-        let line = serde_json::to_string(entry)?;
-        writeln!(file, "{line}")?;
+        serde_json::to_writer(&mut bytes, entry)?;
+        bytes.push(b'\n');
     }
-    Ok(())
+    // All or nothing: a crash mid-save keeps the previous snapshot whole.
+    crate::atomic::write(path, &bytes)
 }
 
 /// Map a `.ocad/...` path to the OPFS-safe form (`_ocad/...`).
 ///
 /// OPFS rejects dot-prefixed directory names, so the state directory is
 /// `_ocad` rather than `.ocad` (same convention as `ocad-engine`).
+#[cfg(target_arch = "wasm32")]
 fn opfs_path(path: &Path) -> String {
     let s = path.to_string_lossy();
     s.replace(".ocad", "_ocad")
@@ -73,23 +76,6 @@ pub async fn append_opfs(path: &Path, value: &serde_json::Value) -> Result<(), S
         format!("{existing}\n{line}\n")
     };
     opfs::write_file(&opfs_path(path), &content).await
-}
-
-/// Load the event log from an OPFS JSONL file.
-#[cfg(target_family = "wasm")]
-pub async fn load_opfs(path: &Path) -> Result<Vec<LogEntry>, String> {
-    let content = opfs::read_file(&opfs_path(path)).await?;
-    let mut entries = Vec::new();
-    for line in content.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        match serde_json::from_str(line) {
-            Ok(entry) => entries.push(entry),
-            Err(e) => return Err(e.to_string()),
-        }
-    }
-    Ok(entries)
 }
 
 /// Append one JSON value as a line, creating the file and its parents.
@@ -132,20 +118,9 @@ pub fn load(path: &Path) -> std::io::Result<Vec<LogEntry>> {
     Ok(entries)
 }
 
-/// Get the default persistence path for a session ID.
-///
-/// Returns `.ocad/conversations/<session-id>/events.jsonl`.
-pub fn default_path(session_id: &str) -> std::path::PathBuf {
-    Path::new(".ocad")
-        .join("conversations")
-        .join(session_id)
-        .join("events.jsonl")
-}
-
 /// OPFS helpers (wasm only).
 #[cfg(target_family = "wasm")]
 mod opfs {
-    use js_sys::Reflect;
     use wasm_bindgen::{JsCast, JsValue};
     use wasm_bindgen_futures::JsFuture;
     use web_sys::{
@@ -253,11 +228,5 @@ mod opfs {
             .map_err(|_| "read failed")?
             .as_string()
             .ok_or_else(|| "text not a string".to_string())
-    }
-
-    /// Reflect import for future use (keeps the import from being flagged).
-    #[allow(dead_code)]
-    fn _reflect_import() {
-        let _ = Reflect::get;
     }
 }

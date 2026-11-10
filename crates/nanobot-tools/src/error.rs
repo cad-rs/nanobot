@@ -11,19 +11,10 @@ pub enum ToolError {
     /// Attempted to register a tool with a duplicate name.
     #[error("duplicate tool: {0}")]
     DuplicateTool(String),
-    /// Parameter validation failed against the tool's JSON Schema.
-    #[error("parameter validation failed: {0}")]
-    ValidationError(String),
-    /// Tool execution failed.
-    #[error("execution failed: {0}")]
-    ExecutionError(String),
     /// Approval was denied by the user or policy.
     #[error("approval denied")]
     ApprovalDenied,
     /// The tool pipeline was cancelled mid-execution.
     #[error("cancelled")]
     Cancelled,
-    /// The tool is registered but its handler is not implemented yet.
-    #[error("not implemented: {0}")]
-    NotImplemented(String),
 }

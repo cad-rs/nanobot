@@ -55,6 +55,12 @@ impl ComponentInstancePath {
         self.0.starts_with(&ancestor.0)
     }
 
+    pub(crate) fn segments(&self) -> impl ExactSizeIterator<Item = (&str, &str)> {
+        self.0
+            .iter()
+            .map(|segment| (segment.component.as_str(), segment.key.as_str()))
+    }
+
     pub(crate) fn single_root_key(&self, component: &str) -> Option<&str> {
         (self.0.len() == 1 && self.0[0].component == component).then_some(self.0[0].key.as_str())
     }
@@ -67,6 +73,18 @@ impl fmt::Display for ComponentInstancePath {
         }
         Ok(())
     }
+}
+
+pub(crate) fn topmost_paths(paths: &BTreeSet<ComponentInstancePath>) -> Vec<ComponentInstancePath> {
+    let mut roots = Vec::<ComponentInstancePath>::new();
+    // Lexicographic component paths place each ancestor before its contiguous
+    // subtree. Keep disjoint roots without a quadratic all-pairs scan.
+    for path in paths {
+        if roots.last().is_none_or(|root| !path.is_within(root)) {
+            roots.push(path.clone());
+        }
+    }
+    roots
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -191,15 +209,45 @@ impl StateStore {
         }
     }
 
-    pub fn commit_render(&mut self, mut transaction: RenderStateTransaction) {
-        Rc::make_mut(&mut transaction.instances).retain(|path, _| {
-            transaction.seen.contains(path)
-                || transaction
+    pub fn commit_render(&mut self, transaction: RenderStateTransaction) {
+        let active = transaction.seen.clone();
+        self.commit_render_batch([transaction], &active);
+    }
+
+    pub(crate) fn commit_render_batch(
+        &mut self,
+        transactions: impl IntoIterator<Item = RenderStateTransaction>,
+        active: &BTreeSet<ComponentInstancePath>,
+    ) {
+        let candidate = Rc::make_mut(&mut self.instances);
+        let mut scopes = BTreeSet::new();
+        let mut global = false;
+        for transaction in transactions {
+            for path in &transaction.seen {
+                if transaction
                     .scope
                     .as_ref()
-                    .is_some_and(|scope| !path.is_within(scope))
+                    .is_none_or(|scope| path.is_within(scope))
+                    && let Some(state) = transaction.instances.get(path)
+                {
+                    candidate.insert(path.clone(), state.clone());
+                }
+            }
+            if let Some(scope) = transaction.scope {
+                scopes.insert(scope);
+            } else {
+                global = true;
+            }
+        }
+        let scopes = topmost_paths(&scopes).into_iter().collect::<BTreeSet<_>>();
+        candidate.retain(|path, _| {
+            let covered = global
+                || scopes
+                    .range((std::ops::Bound::Unbounded, std::ops::Bound::Included(path)))
+                    .next_back()
+                    .is_some_and(|scope| path.is_within(scope));
+            !covered || active.contains(path)
         });
-        self.instances = transaction.instances;
     }
 
     /// Remove one component subtree, including every descendant instance.
@@ -353,6 +401,11 @@ pub struct RenderStateTransaction {
 }
 
 impl RenderStateTransaction {
+    pub(crate) fn retains_root(&self) -> bool {
+        self.scope
+            .as_ref()
+            .is_some_and(|root| self.seen.contains(root))
+    }
     /// Retain a previously mounted instance without changing its schema.
     #[must_use]
     pub fn retain_existing(&mut self, path: &ComponentInstancePath) -> bool {
@@ -472,6 +525,31 @@ pub enum StateError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scoped_candidates_preserve_latest_outside_writes_and_deletions() {
+        let first = ComponentInstancePath::root("View", "first");
+        let second = ComponentInstancePath::root("View", "second");
+        let removed = second.child("Counter", "gone");
+        let schema = ComponentStateSchema::new(BTreeMap::from([(
+            "count".into(),
+            StateField::new(ValueSchema::integer(), UiValue::Integer(7)),
+        )]))
+        .unwrap();
+        let mut states = StateStore::new();
+        let mut initial = states.begin_render();
+        for path in [&first, &second, &removed] {
+            initial.mount(path.clone(), &schema).unwrap();
+        }
+        states.commit_render(initial);
+        let mut candidate = states.begin_render_scope(first.clone());
+        candidate.mount(first.clone(), &schema).unwrap();
+        states.set(&second, "count", UiValue::Integer(9)).unwrap();
+        states.remove_scope(&removed);
+        states.commit_render(candidate);
+        assert_eq!(states.get(&second, "count"), Some(&UiValue::Integer(9)));
+        assert!(states.get(&removed, "count").is_none());
+    }
 
     fn schema(value_schema: ValueSchema, default: UiValue) -> ComponentStateSchema {
         ComponentStateSchema::new(BTreeMap::from([(

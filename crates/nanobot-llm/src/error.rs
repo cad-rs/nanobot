@@ -25,11 +25,13 @@ pub enum LlmError {
     #[error("unknown provider: {0}")]
     UnknownProvider(String),
 
-    /// The adapter was cancelled mid-stream.
-    #[error("cancelled")]
-    Cancelled,
+    /// No route is declared for the requested model id, and no fallback
+    /// provider is registered to carry it.
+    #[error("unknown model: {0}")]
+    UnknownModel(String),
 }
 
+#[cfg(feature = "providers")]
 impl From<reqwest::Error> for LlmError {
     fn from(e: reqwest::Error) -> Self {
         LlmError::Http(e.to_string())

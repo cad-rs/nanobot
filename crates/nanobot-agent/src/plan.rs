@@ -86,20 +86,12 @@ impl Plan {
         self.state = PlanState::Executing;
     }
 
-    /// Transition to `Verifying` (tools done, checking intent).
-    pub fn begin_verification(&mut self) {
-        self.state = PlanState::Verifying;
-    }
 
     /// Transition to `Settled` (terminal — intent satisfied or no intent).
     pub fn settle(&mut self) {
         self.state = PlanState::Settled;
     }
 
-    /// Transition to `Rejected`.
-    pub fn reject(&mut self) {
-        self.state = PlanState::Rejected;
-    }
 
     /// Send the plan back to `Drafting`, keeping its context so the model can
     /// revise it (design-harness 14.3, the decision bar's Modify).
@@ -117,21 +109,6 @@ impl Plan {
         self.state = PlanState::Clarify;
     }
 
-    /// Resume from `Clarify` back to `Drafting` (information provided).
-    pub fn resume_drafting(&mut self) {
-        self.state = PlanState::Drafting;
-    }
 
-    /// Check whether the plan is in a terminal state.
-    pub fn is_terminal(&self) -> bool {
-        matches!(
-            self.state,
-            PlanState::Settled | PlanState::Rejected | PlanState::Contingent
-        )
-    }
 
-    /// Check whether the plan is awaiting human input (Clarify or Contingent).
-    pub fn awaits_decision(&self) -> bool {
-        matches!(self.state, PlanState::Clarify | PlanState::Contingent)
-    }
 }

@@ -1,7 +1,8 @@
 use std::cell::Cell;
 use std::fmt;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 pub trait RuntimeClockSource {
     fn now(&self) -> Instant;

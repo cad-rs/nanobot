@@ -1,0 +1,94 @@
+# The three gates the framework promises, enforced mechanically:
+#
+# 1. kernel — the 9 GUI-free crates lint clean (`-D warnings`) and test green
+#    on the cheapest runner, with no GUI stack installed. This is the
+#    "CLI / test / MCP server can consume the kernel without dragging a UI
+#    along" guarantee (design §1.2).
+# 2. wasm — the kernel compiles for wasm32-unknown-unknown: no tokio runtime
+#    entry points, host-owned loop (design §1.3, risk NR4 — "written into CI
+#    checks, not documentation conventions").
+# 3. shell — the full workspace (gpui / wgpu / rhai shells) on macOS and on
+#    Windows, where the viewport takes the DirectComposition path that no
+#    other platform compiles.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  kernel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy (kernel, deny warnings)
+        run: cargo clippy
+          -p nanobot-telemetry -p nanobot-cordis -p nanobot-session -p nanobot-agent
+          -p nanobot-tools -p nanobot-skills -p nanobot-llm -p nanobot-boot -p nanobot-auth
+          --lib --tests -- -D warnings
+      - name: test (kernel)
+        run: cargo test
+          -p nanobot-telemetry --features testing -p nanobot-cordis -p nanobot-session
+          -p nanobot-agent -p nanobot-tools -p nanobot-skills -p nanobot-llm -p nanobot-boot
+          -p nanobot-auth
+
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: check (kernel, wasm32-unknown-unknown)
+        run: cargo check
+          -p nanobot-telemetry -p nanobot-cordis -p nanobot-session -p nanobot-agent
+          -p nanobot-tools -p nanobot-skills -p nanobot-llm -p nanobot-boot -p nanobot-auth
+          --target wasm32-unknown-unknown
+      - name: check (kernel, network-free)
+        # The HTTP provider is a choice: the core builds without it.
+        run: cargo check
+          -p nanobot-llm -p nanobot-boot --no-default-features
+
+  shell:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy (workspace, deny warnings)
+        run: cargo clippy --workspace --lib --tests -- -D warnings
+      - name: test (workspace)
+        run: cargo test --workspace
+
+  dependencies:
+    # A product built on the framework inherits its dependency tree, so the
+    # tree is held to licenses that put no limit on commercial use and to
+    # known sources (deny.toml).
+    name: dependency licenses and sources
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses sources

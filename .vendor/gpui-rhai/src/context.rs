@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -96,18 +96,25 @@ pub struct UiRuntimeState {
     #[cfg(feature = "charts")]
     pub native_chart_data: BTreeMap<String, crate::NativeChartData>,
     pub actions: ActionRegistry,
+    /// Key bindings declared to this view, used to display shortcuts.
+    pub key_bindings: Vec<crate::KeyBindingSpec>,
+    /// Composition audit rules from the application profile.
+    pub audit_rules: crate::AuditRules,
     pub capabilities: CapabilityRegistry,
     pub tasks: TaskRegistry,
     pub subscriptions: SubscriptionRegistry,
     pub timers: crate::TimerRegistry,
     pub locale: Option<LocaleManager>,
     pub calendar_clock: CalendarClock,
+    pub wall_clock: crate::WallClock,
     pub clock: crate::RuntimeClock,
     pub theme: Option<ThemeManager>,
     component_styles: crate::ComponentStyleSheet,
     pub assets: AssetRegistry,
     pub motions: MotionRuntime,
+    pub(crate) page_visibility: crate::retained_page::PageVisibility,
     pub effects: crate::EffectRegistry,
+    pub(crate) effect_cascades: crate::effect::EffectCascadeBudget,
     pub signals: crate::SignalRegistry,
     pub element_refs: crate::ElementRefRegistry,
     pub(crate) geometry: crate::GeometryRegistry,
@@ -133,9 +140,62 @@ pub struct UiRuntimeState {
     pending_element_commands: Vec<crate::element_ref::ElementCommand>,
     repaint_windows: BTreeSet<String>,
     component_style_generation: u64,
+    /// What the running script invocation responds to.
+    origin: crate::InvocationOrigin,
+    /// Current semantic derivation, restored with invocation origin, not UI state.
+    pub(crate) dispatch_owner: Option<SemanticDispatchOwner>,
+    /// Tentative semantic publications, retained across nested commits.
+    dispatch_leases: Vec<Rc<SemanticDispatchSource>>,
 }
 
 impl UiRuntimeState {
+    pub(crate) fn reconcile_page_visibility(
+        &mut self,
+        tree: &crate::RetainedUiTree,
+        root: &ComponentInstancePath,
+        domain: &str,
+    ) {
+        let dirty =
+            self.page_visibility
+                .reconcile(tree, root, domain, &mut self.motions, self.clock.now());
+        self.mark_dirty(dirty);
+    }
+
+    /// What the running script invocation responds to.
+    #[must_use]
+    pub fn invocation_origin(&self) -> &crate::InvocationOrigin {
+        &self.origin
+    }
+
+    /// Set the origin of the invocation about to run; returns the previous one
+    /// for the caller to restore.
+    pub(crate) fn replace_origin(
+        &mut self,
+        origin: crate::InvocationOrigin,
+    ) -> crate::InvocationOrigin {
+        self.tasks.set_origin_root(&origin);
+        self.timers.set_origin_root(&origin);
+        std::mem::replace(&mut self.origin, origin)
+    }
+
+    pub(crate) fn update_window_appearance(
+        &mut self,
+        window: &str,
+        appearance: crate::SystemAppearance,
+    ) -> bool {
+        let previous = self
+            .window_appearances
+            .insert(window.to_owned(), appearance)
+            .unwrap_or(crate::SystemAppearance::Dark);
+        let changed = previous != appearance;
+        if changed {
+            let invalidated = self
+                .environment_dependencies
+                .invalidate_theme_window(window);
+            self.mark_dirty(invalidated);
+        }
+        changed
+    }
     const SUSPENDED_DELIVERY_CAPACITY: usize = 256;
     #[must_use]
     pub fn new() -> Self {
@@ -217,7 +277,7 @@ impl UiRuntimeState {
     ) -> Result<bool, crate::StateError> {
         let changed = self.component_state.set(component, field, value)?;
         if changed {
-            self.dirty.insert(component.clone());
+            self.mark_dirty_from_host([component.clone()]);
         }
         Ok(changed)
     }
@@ -234,7 +294,56 @@ impl UiRuntimeState {
     ) -> Result<bool, crate::NativeCollectionError> {
         let invalidated = self.native_collections.replace(name, collection)?;
         let changed = !invalidated.is_empty();
-        self.dirty.extend(invalidated);
+        self.mark_dirty_from_host(invalidated);
+        Ok(changed)
+    }
+
+    /// Register one new Host-owned collection after mount and invalidate the
+    /// owning view so its next render can resolve the new name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-name or duplicate-collection error.
+    pub fn register_native_collection_from_host(
+        &mut self,
+        _root: &ComponentInstancePath,
+        name: &str,
+        collection: crate::NativeCollection,
+    ) -> Result<(), crate::NativeCollectionError> {
+        let invalidated = self
+            .native_collections
+            .register_with_invalidated(name.to_owned(), collection)?;
+        self.mark_dirty_from_host(invalidated);
+        Ok(())
+    }
+
+    /// Register a mounted Host document and invalidate exact pending readers.
+    ///
+    /// # Errors
+    /// Returns for invalid or duplicate names without changing the registry.
+    pub fn register_native_text_document_from_host(
+        &mut self,
+        name: &str,
+        document: crate::NativeTextDocument,
+    ) -> Result<(), crate::DocumentError> {
+        let invalidated = self
+            .native_documents
+            .register_with_invalidated(name.to_owned(), document)?;
+        self.mark_dirty_from_host(invalidated);
+        Ok(())
+    }
+
+    /// Release registry ownership and invalidate the document's exact readers.
+    ///
+    /// # Errors
+    /// Returns when the name is not registered.
+    pub fn release_native_text_document_from_host(
+        &mut self,
+        name: &str,
+    ) -> Result<bool, crate::DocumentError> {
+        let invalidated = self.native_documents.release(name)?;
+        let changed = !invalidated.is_empty();
+        self.mark_dirty_from_host(invalidated);
         Ok(changed)
     }
 
@@ -250,7 +359,7 @@ impl UiRuntimeState {
     ) -> Result<bool, crate::DocumentError> {
         let invalidated = self.native_documents.replace(name, document)?;
         let changed = !invalidated.is_empty();
-        self.dirty.extend(invalidated);
+        self.mark_dirty_from_host(invalidated);
         Ok(changed)
     }
 
@@ -296,8 +405,71 @@ impl UiRuntimeState {
             .as_mut()
             .ok_or(crate::ThemeError::NoVariants)?
             .replace_variant(variant)?;
-        self.dirty.extend(self.component_state.paths());
+        self.mark_dirty_from_host(self.component_state.paths());
         Ok(())
+    }
+
+    /// Select the app-level theme from trusted Host code without resetting script state.
+    ///
+    /// # Errors
+    ///
+    /// Returns when no theme manager is installed or the selection is unknown.
+    pub fn select_theme_from_host(
+        &mut self,
+        family: &str,
+        variant: &str,
+    ) -> Result<bool, crate::ThemeError> {
+        let theme = self.theme.as_mut().ok_or(crate::ThemeError::NoVariants)?;
+        let previous = theme.generation();
+        theme.set_app(ThemePreference::Fixed {
+            selection: ThemeSelection::new(family, variant),
+        })?;
+        let changed = theme.generation() != previous;
+        if changed {
+            let invalidated = self.environment_dependencies.invalidate_theme_app();
+            self.mark_dirty_from_host(invalidated);
+            self.mark_all_windows_dirty();
+        }
+        Ok(changed)
+    }
+
+    /// Select the app-level locale from trusted Host code without resetting script state.
+    ///
+    /// # Errors
+    ///
+    /// Returns when no locale manager is installed or the locale is unknown.
+    pub fn select_locale_from_host(&mut self, locale: &str) -> Result<bool, crate::LocaleError> {
+        let locales = self
+            .locale
+            .as_mut()
+            .ok_or_else(|| crate::LocaleError::UnknownLocale(locale.to_owned()))?;
+        let previous = locales.generation();
+        locales.set_app(locale)?;
+        let changed = locales.generation() != previous;
+        if changed {
+            let invalidated = self.environment_dependencies.invalidate_locale_app();
+            self.mark_dirty_from_host(invalidated);
+            self.mark_all_windows_repaint();
+        }
+        Ok(changed)
+    }
+
+    /// Replace the Host-owned motion preference without resetting script state.
+    ///
+    /// Returns whether the effective preference changed. Reduced and disabled
+    /// motion settle active work through the same central runtime policy used
+    /// during initial view construction.
+    pub fn set_motion_preference_from_host(&mut self, preference: crate::MotionPreference) -> bool {
+        let previous = self.motions.preference();
+        self.motions.set_preference(preference);
+        let changed = self.motions.preference() != previous;
+        if changed {
+            let now = self.clock.now();
+            self.motion_values = self.motions.snapshot(now);
+            self.mark_dirty_from_host(self.component_state.paths());
+            self.mark_all_windows_dirty();
+        }
+        changed
     }
 
     /// Atomically replace application-wide formal-component style rules.
@@ -313,7 +485,7 @@ impl UiRuntimeState {
         }
         self.component_styles = styles;
         self.component_style_generation = self.component_style_generation.saturating_add(1);
-        self.dirty.extend(self.component_state.paths());
+        self.mark_dirty_from_host(self.component_state.paths());
         true
     }
 
@@ -368,7 +540,9 @@ impl UiRuntimeState {
         self.stores.remove_window(window);
         self.native_collections.remove_reader_scope(root);
         self.native_documents.remove_reader_scope(root);
+        self.virtual_requests.release_scope(root);
         self.component_state.remove_scope(root);
+        self.effect_cascades.remove_scope(root);
         self.component_event_handlers
             .retain(|(path, _), _| !path.is_within(root));
         self.component_incarnations
@@ -405,6 +579,8 @@ impl UiRuntimeState {
             locale.remove_scope(root);
         }
         let window_scope = format!("window:{window}");
+        self.page_visibility
+            .remove_scope(root, &format!("{window_scope}/"));
         self.motions.release_node_scope(&window_scope);
         let removed_ghosts = self
             .motion_ghosts
@@ -422,6 +598,10 @@ impl UiRuntimeState {
         self.effects.remove_scope(root);
         self.signals.remove_scope(root);
         self.element_refs.remove_scope(root);
+        self.geometry.remove_scope(root);
+        for presentation in self.presentations.values() {
+            presentation.geometry.remove_scope(root);
+        }
         self.windows.remove(window);
         self.responsive.remove_window(window);
         Ok(())
@@ -459,6 +639,18 @@ impl UiRuntimeState {
         self.subscriptions.cancel_scope(scope);
         self.pending_async
             .retain(|delivery| &delivery.scope != scope);
+        self.pending_actions.retain(|pending| {
+            pending
+                .owner
+                .as_ref()
+                .is_none_or(|owner| owner.source.effect.as_ref() != Some(scope))
+        });
+        self.pending_events.retain(|pending| {
+            pending
+                .owner
+                .as_ref()
+                .is_none_or(|owner| owner.source.effect.as_ref() != Some(scope))
+        });
         self.trace_subscription_closures();
         Ok(())
     }
@@ -495,6 +687,14 @@ impl UiRuntimeState {
         });
     }
 
+    /// Put commands back to run with the next frame's commands.
+    pub(crate) fn requeue_element_commands(
+        &mut self,
+        commands: Vec<crate::element_ref::ElementCommand>,
+    ) {
+        self.pending_element_commands.extend(commands);
+    }
+
     pub(crate) fn take_window_element_commands(
         &mut self,
         window: &str,
@@ -508,10 +708,13 @@ impl UiRuntimeState {
     }
 
     pub(crate) fn has_window_dirty(&self, root: &ComponentInstancePath) -> bool {
-        self.dirty.iter().any(|path| path.is_within(root))
+        self.dirty
+            .iter()
+            .any(|path| path.is_within(root) && !self.effect_cascades.blocked_component(path))
     }
 
     pub(crate) fn flush_geometry_dependencies(&mut self) {
+        self.dirty.extend(self.element_refs.take_dirty());
         self.dirty.extend(self.geometry.take_dirty());
         for presentation in self.presentations.values() {
             self.dirty.extend(presentation.geometry.take_dirty());
@@ -528,16 +731,74 @@ impl UiRuntimeState {
         selected
     }
 
-    pub(crate) fn drain_pending_actions(&mut self) -> Vec<ActionInvocation> {
-        std::mem::take(&mut self.pending_actions)
-    }
-
-    pub(crate) fn drain_pending_events(&mut self) -> Vec<PendingEvent> {
-        std::mem::take(&mut self.pending_events)
-    }
-
     pub(crate) fn has_pending_dispatch(&self) -> bool {
-        !self.pending_actions.is_empty() || !self.pending_events.is_empty()
+        self.pending_actions
+            .iter()
+            .any(|pending| self.dispatch_owner_active(pending.owner.as_ref()))
+            || self
+                .pending_events
+                .iter()
+                .any(|pending| self.dispatch_owner_active(pending.owner.as_ref()))
+    }
+
+    pub(crate) fn has_window_pending_dispatch(&self, root: &ComponentInstancePath) -> bool {
+        self.pending_actions.iter().any(|pending| {
+            pending
+                .callback
+                .component()
+                .is_none_or(|path| path.is_within(root))
+                && self.dispatch_owner_active(pending.owner.as_ref())
+        }) || self.pending_events.iter().any(|pending| {
+            pending.target.is_within(root) && self.dispatch_owner_active(pending.owner.as_ref())
+        })
+    }
+
+    pub(crate) fn drain_window_dispatch(
+        &mut self,
+        root: &ComponentInstancePath,
+    ) -> (Vec<ActionInvocation>, Vec<PendingEvent>) {
+        self.prune_pending_dispatch();
+        let (actions, retained) = std::mem::take(&mut self.pending_actions)
+            .into_iter()
+            .partition(|pending| {
+                pending
+                    .callback
+                    .component()
+                    .is_none_or(|path| path.is_within(root))
+            });
+        self.pending_actions = retained;
+        let (events, retained) = std::mem::take(&mut self.pending_events)
+            .into_iter()
+            .partition(|pending| pending.target.is_within(root));
+        self.pending_events = retained;
+        (actions, events)
+    }
+
+    pub(crate) fn dispatch_owner_active(&self, owner: Option<&SemanticDispatchOwner>) -> bool {
+        owner.is_none_or(|owner| {
+            owner.source.runtime_id == self.runtime_id
+                && owner.source.active(
+                    &self.component_incarnations,
+                    &self.effects,
+                    &self.effect_cascades,
+                )
+        })
+    }
+
+    pub(crate) fn prune_pending_dispatch(&mut self) {
+        let incarnations = &self.component_incarnations;
+        let effects = &self.effects;
+        let cascades = &self.effect_cascades;
+        let runtime_id = self.runtime_id;
+        let active = |owner: &SemanticDispatchOwner| {
+            owner.source.runtime_id == runtime_id
+                && owner.source.active(incarnations, effects, cascades)
+        };
+        self.pending_actions
+            .retain(|pending| pending.owner.as_ref().is_none_or(active));
+        self.pending_events
+            .retain(|pending| pending.owner.as_ref().is_none_or(active));
+        self.effect_cascades.prune_dispatches(incarnations, effects);
     }
 
     pub(crate) fn has_virtual_requests(&self) -> bool {
@@ -555,10 +816,42 @@ impl UiRuntimeState {
     }
 
     pub(crate) fn reset_component_readers(&mut self, component: &ComponentInstancePath) {
+        self.page_visibility.reset_reader(component);
         self.stores.reset_reader(component);
         self.native_collections.reset_reader(component);
         self.native_documents.reset_reader(component);
         self.environment_dependencies.reset_reader(component);
+        self.reset_geometry_read_contribution(&crate::read_dependency::ReadDependency::component(
+            component,
+        ));
+    }
+
+    pub(crate) fn retain_virtual_read_contributions(
+        &mut self,
+        scope: &ComponentInstancePath,
+        active: &BTreeSet<crate::read_dependency::ReadContribution>,
+    ) {
+        self.native_collections.retain_contributions(scope, active);
+        self.native_documents.retain_contributions(scope, active);
+        self.stores.retain_contributions(scope, active);
+        self.environment_dependencies
+            .retain_contributions(scope, active);
+        self.element_refs.retain_contributions(scope, active);
+        self.geometry.retain_contributions(scope, active);
+        for presentation in self.presentations.values() {
+            presentation.geometry.retain_contributions(scope, active);
+        }
+    }
+
+    fn reset_geometry_read_contribution(
+        &mut self,
+        reader: &crate::read_dependency::ReadDependency,
+    ) {
+        self.element_refs.reset_contribution(reader);
+        self.geometry.reset_contribution(reader);
+        for presentation in self.presentations.values() {
+            presentation.geometry.reset_contribution(reader);
+        }
     }
 
     pub(crate) fn component_event_handlers_in_scope(
@@ -583,7 +876,7 @@ impl UiRuntimeState {
     }
 
     pub(crate) fn mark_all_windows_dirty(&mut self) {
-        self.dirty.extend(
+        self.mark_dirty(
             self.windows
                 .open_ids()
                 .into_iter()
@@ -595,15 +888,82 @@ impl UiRuntimeState {
         &mut self,
         components: impl IntoIterator<Item = ComponentInstancePath>,
     ) {
-        self.dirty.extend(components);
+        let mut invalidated = false;
+        for component in components {
+            self.dirty.insert(component);
+            invalidated = true;
+        }
+        if invalidated {
+            self.publish_committed_work();
+        }
+    }
+
+    fn mark_dirty_from_host(
+        &mut self,
+        components: impl IntoIterator<Item = ComponentInstancePath>,
+    ) {
+        let components = components.into_iter().collect::<Vec<_>>();
+        if self.origin != crate::InvocationOrigin::Effect {
+            for component in &components {
+                self.effect_cascades.restart_containing(component);
+            }
+        }
+        self.mark_dirty(components);
+    }
+
+    /// A successful mutation outside an explicit transaction is already
+    /// committed. Inside one, only the outermost successful commit may publish.
+    fn publish_committed_work(&mut self) {
+        if self.transaction_depth != 0 {
+            return;
+        }
+        self.prune_pending_dispatch();
+        let pending_effect_scopes = self
+            .pending_events
+            .iter()
+            .filter(|pending| pending.origin == crate::InvocationOrigin::Effect)
+            .map(|pending| {
+                pending
+                    .owner
+                    .as_ref()
+                    .map_or(&pending.target, |owner| &owner.source.component)
+            })
+            .chain(
+                self.pending_actions
+                    .iter()
+                    .filter(|pending| pending.origin == crate::InvocationOrigin::Effect)
+                    .filter_map(|pending| {
+                        pending
+                            .owner
+                            .as_ref()
+                            .map(|owner| &owner.source.component)
+                            .or_else(|| pending.callback.component())
+                    }),
+            );
+        self.effect_cascades
+            .settle(&self.dirty, pending_effect_scopes);
+        if self
+            .dirty
+            .iter()
+            .any(|path| !self.effect_cascades.blocked_component(path))
+            || self.has_pending_dispatch()
+            || !self.repaint_windows.is_empty()
+        {
+            // The existing foreground delivery pump drains all runtime work,
+            // not only task deliveries. It coalesces these post-commit edges;
+            // never evaluate script synchronously from a mutation or draw.
+            self.tasks.wake().notify();
+        }
     }
 
     pub(crate) fn mark_all_windows_repaint(&mut self) {
         self.repaint_windows.extend(self.windows.open_ids());
+        self.publish_committed_work();
     }
 
     pub(crate) fn mark_window_repaint(&mut self, window: impl Into<String>) {
         self.repaint_windows.insert(window.into());
+        self.publish_committed_work();
     }
 
     pub(crate) fn take_window_repaint(&mut self, window: &str) -> bool {
@@ -642,9 +1002,17 @@ impl UiRuntimeState {
             !event.target.is_within(root) || active.contains(&event.target) || event.target == *root
         });
         self.stores.retain_reader_scope(root, active);
+        self.component_event_handlers
+            .retain(|(path, _), _| !path.is_within(root) || path == root || active.contains(path));
         self.native_collections.retain_reader_scope(root, active);
         self.native_documents.retain_reader_scope(root, active);
+        self.element_refs.retain_scope(root, active);
+        self.geometry.retain_reader_scope(root, active);
+        for presentation in self.presentations.values() {
+            presentation.geometry.retain_reader_scope(root, active);
+        }
         self.environment_dependencies.retain_scope(root, active);
+        self.page_visibility.retain_scope(root, active);
         self.dirty
             .retain(|path| !path.is_within(root) || path == root || active.contains(path));
         self.component_incarnations
@@ -654,6 +1022,7 @@ impl UiRuntimeState {
 
     #[must_use]
     pub fn drain_batch(&mut self) -> UiMutationBatch {
+        self.prune_pending_dispatch();
         UiMutationBatch {
             dirty: std::mem::take(&mut self.dirty),
             events: std::mem::take(&mut self.pending_events),
@@ -670,6 +1039,7 @@ impl UiRuntimeState {
         Ok(UiStateSnapshot {
             runtime_id: self.runtime_id,
             transaction_depth: self.transaction_depth,
+            dispatch_lease_checkpoint: self.dispatch_leases.len(),
             component_state: self.component_state.clone(),
             stores: self.stores.clone(),
             native_collections: self.native_collections.clone(),
@@ -688,7 +1058,9 @@ impl UiRuntimeState {
             component_styles: self.component_styles.clone(),
             component_style_generation: self.component_style_generation,
             motions: self.motions.transaction_snapshot(),
+            page_visibility: self.page_visibility.clone(),
             effects: self.effects.clone(),
+            effect_cascades: self.effect_cascades.checkpoint(),
             signals: self.signals.clone(),
             element_refs: self.element_refs.clone(),
             geometry: self.geometry.snapshot(),
@@ -724,6 +1096,12 @@ impl UiRuntimeState {
                 actual: self.transaction_depth,
             });
         }
+        for lease in self
+            .dispatch_leases
+            .drain(snapshot.dispatch_lease_checkpoint..)
+        {
+            lease.publication_valid.set(false);
+        }
         self.tasks.restore(snapshot.tasks);
         self.subscriptions.restore(snapshot.subscriptions);
         self.timers = snapshot.timers;
@@ -746,7 +1124,10 @@ impl UiRuntimeState {
         self.component_styles = snapshot.component_styles;
         self.component_style_generation = snapshot.component_style_generation;
         self.motions = snapshot.motions;
+        self.page_visibility = snapshot.page_visibility;
         self.effects = snapshot.effects;
+        self.effect_cascades.restore(snapshot.effect_cascades);
+        self.prune_pending_dispatch();
         self.signals = snapshot.signals;
         self.element_refs = snapshot.element_refs;
         self.geometry.restore(snapshot.geometry);
@@ -767,7 +1148,11 @@ impl UiRuntimeState {
         self.environment_dependencies = snapshot.environment_dependencies;
         self.repaint_windows = snapshot.repaint_windows;
         self.transaction_depth = snapshot.transaction_depth;
-        decode_result.map_err(UiTransactionError::from)
+        decode_result.map_err(UiTransactionError::from)?;
+        if self.transaction_depth == 0 {
+            self.effect_cascades.collect_retired_rejections();
+        }
+        Ok(())
     }
 
     /// Begin an explicit rollback-capable runtime transaction.
@@ -804,6 +1189,11 @@ impl UiRuntimeState {
         self.tasks.commit_transaction();
         self.subscriptions.commit_transaction();
         self.transaction_depth -= 1;
+        if self.transaction_depth == 0 {
+            self.dispatch_leases.clear();
+            self.effect_cascades.collect_retired_rejections();
+        }
+        self.publish_committed_work();
         Ok(())
     }
 
@@ -855,6 +1245,7 @@ pub enum UiTransactionError {
 pub struct UiStateSnapshot {
     runtime_id: RuntimeStateId,
     transaction_depth: usize,
+    dispatch_lease_checkpoint: usize,
     component_state: StateStore,
     stores: StoreRegistry,
     native_collections: crate::NativeCollectionRegistry,
@@ -873,7 +1264,9 @@ pub struct UiStateSnapshot {
     component_styles: crate::ComponentStyleSheet,
     component_style_generation: u64,
     motions: MotionRuntime,
+    page_visibility: crate::retained_page::PageVisibility,
     effects: crate::EffectRegistry,
+    effect_cascades: crate::effect::EffectCascadeCheckpoint,
     signals: crate::SignalRegistry,
     element_refs: crate::ElementRefRegistry,
     geometry: crate::geometry::GeometrySnapshot,
@@ -898,6 +1291,7 @@ impl Clone for UiStateSnapshot {
         Self {
             runtime_id: self.runtime_id,
             transaction_depth: self.transaction_depth,
+            dispatch_lease_checkpoint: self.dispatch_lease_checkpoint,
             component_state: self.component_state.clone(),
             stores: self.stores.clone(),
             native_collections: self.native_collections.clone(),
@@ -916,7 +1310,9 @@ impl Clone for UiStateSnapshot {
             component_styles: self.component_styles.clone(),
             component_style_generation: self.component_style_generation,
             motions: self.motions.transaction_snapshot(),
+            page_visibility: self.page_visibility.clone(),
             effects: self.effects.clone(),
+            effect_cascades: self.effect_cascades.clone(),
             signals: self.signals.clone(),
             element_refs: self.element_refs.clone(),
             geometry: self.geometry.clone(),
@@ -948,6 +1344,64 @@ impl UiStateSnapshot {
 pub struct PendingEvent {
     pub target: ComponentInstancePath,
     pub event: UiEvent,
+    /// What the invocation that emitted the event responds to; its handler
+    /// runs with it.
+    pub origin: crate::InvocationOrigin,
+    /// Opaque generation/mount/effect derivation supplied by the runtime.
+    /// Hand-built Host events use `None`; Effect origin still consumes budget.
+    pub owner: Option<SemanticDispatchOwner>,
+}
+
+/// Cloneable provenance of a queued semantic callback. Hosts retain this
+/// unchanged when forwarding a runtime-produced event/action. Its fields are
+/// deliberately opaque: `None` is an explicit Host entry, not a new Effect turn.
+#[derive(Clone, Debug)]
+pub struct SemanticDispatchOwner {
+    source: Rc<SemanticDispatchSource>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SemanticDispatchSource {
+    runtime_id: RuntimeStateId,
+    pub(crate) generation: ScriptGeneration,
+    pub(crate) component: ComponentInstancePath,
+    incarnation: ComponentIncarnation,
+    pub(crate) effect: Option<AsyncScope>,
+    cascade: Option<(ComponentInstancePath, u64)>,
+    publication_valid: Cell<bool>,
+}
+
+impl SemanticDispatchSource {
+    pub(crate) fn publication_valid(&self) -> bool {
+        self.publication_valid.get()
+    }
+
+    pub(crate) fn active(
+        &self,
+        incarnations: &BTreeMap<ComponentInstancePath, ComponentIncarnation>,
+        effects: &crate::EffectRegistry,
+        cascades: &crate::effect::EffectCascadeBudget,
+    ) -> bool {
+        self.publication_valid.get()
+            && incarnations.get(&self.component) == Some(&self.incarnation)
+            && cascades
+                .generation_for(&self.component)
+                .is_none_or(|generation| generation == self.generation)
+            && self
+                .effect
+                .as_ref()
+                .is_none_or(|scope| effects.contains_scope(scope))
+            && self
+                .cascade
+                .as_ref()
+                .is_none_or(|(root, epoch)| cascades.accepts_dispatch(root, *epoch))
+    }
+}
+
+impl SemanticDispatchOwner {
+    pub(crate) fn cascade_root(&self) -> Option<&ComponentInstancePath> {
+        self.source.cascade.as_ref().map(|(root, _)| root)
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -962,6 +1416,10 @@ pub struct UiContext {
     runtime: Rc<RefCell<UiRuntimeState>>,
     component: ComponentInstancePath,
     incarnation: ComponentIncarnation,
+    callback_component: ComponentInstancePath,
+    callback_incarnation: ComponentIncarnation,
+    callback_events: BTreeMap<String, EventSchema>,
+    read_dependency: crate::read_dependency::ReadDependency,
     window: Option<String>,
     view: Option<String>,
     phase: ExecutionPhase,
@@ -977,6 +1435,23 @@ pub struct UiContext {
 }
 
 impl UiContext {
+    /// Last committed retained-page visibility, tracked during render.
+    /// Returns false before first placement. Hiding never cancels work; use
+    /// this value in application-owned effect dependencies/pause policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UiContextError::Borrowed`] during a conflicting runtime borrow.
+    pub fn is_visible(&self) -> Result<bool, UiContextError> {
+        let mut runtime = self
+            .runtime
+            .try_borrow_mut()
+            .map_err(|_| UiContextError::Borrowed)?;
+        Ok(runtime
+            .page_visibility
+            .read(&self.component, self.phase == ExecutionPhase::Render))
+    }
+
     #[must_use]
     pub fn new(
         runtime: Rc<RefCell<UiRuntimeState>>,
@@ -994,10 +1469,15 @@ impl UiContext {
             .try_borrow_mut()
             .map(|mut runtime| runtime.ensure_component_incarnation(&component))
             .unwrap_or_default();
+        let read_dependency = crate::read_dependency::ReadDependency::component(&component);
         let context = Self {
             runtime,
-            component,
+            component: component.clone(),
             incarnation,
+            callback_component: component,
+            read_dependency,
+            callback_incarnation: incarnation,
+            callback_events: events.clone(),
             window,
             view: None,
             phase,
@@ -1056,10 +1536,15 @@ impl UiContext {
             .try_borrow_mut()
             .map(|mut runtime| runtime.ensure_component_incarnation(&component))
             .unwrap_or_default();
+        let read_dependency = crate::read_dependency::ReadDependency::component(&component);
         let context = Self {
             runtime: Rc::clone(&self.runtime),
-            component,
+            component: component.clone(),
             incarnation,
+            callback_component: component,
+            read_dependency,
+            callback_incarnation: incarnation,
+            callback_events: events.clone(),
             window: self.window.clone(),
             view: self.view.clone(),
             phase: self.phase,
@@ -1077,6 +1562,48 @@ impl UiContext {
             && let Ok(mut runtime) = context.runtime.try_borrow_mut()
         {
             runtime.reset_component_readers(&context.component);
+        }
+        context
+    }
+
+    pub(crate) fn for_structural_scope(
+        &self,
+        component: ComponentInstancePath,
+        events: BTreeMap<String, EventSchema>,
+    ) -> Self {
+        // Structure supplies child identity, while callbacks and observable
+        // reads must still belong to an executable formal/root component.
+        let mut context = self.for_component(component, events);
+        context.callback_component = self.callback_component.clone();
+        context.callback_incarnation = self.callback_incarnation;
+        context.callback_events = self.callback_events.clone();
+        context.read_dependency = self.read_dependency.clone();
+        context
+    }
+
+    pub(crate) fn for_virtual_item(
+        &self,
+        collection: &crate::VirtualCollectionId,
+        key: &str,
+    ) -> Self {
+        let mut context = self.clone();
+        context.read_dependency = crate::read_dependency::ReadDependency::virtual_item(
+            &self.callback_component,
+            collection,
+            key,
+        );
+        if let Ok(mut runtime) = context.runtime.try_borrow_mut() {
+            runtime
+                .native_collections
+                .reset_contribution(&context.read_dependency);
+            runtime
+                .native_documents
+                .reset_contribution(&context.read_dependency);
+            runtime.stores.reset_contribution(&context.read_dependency);
+            runtime
+                .environment_dependencies
+                .reset_contribution(&context.read_dependency);
+            runtime.reset_geometry_read_contribution(&context.read_dependency);
         }
         context
     }
@@ -1122,11 +1649,17 @@ impl UiContext {
             .contains(&self.component)
     }
 
+    /// The reader a dependency read subscribes: only a render does, because
+    /// only a render's output depends on what it read.
+    fn render_reader(&self) -> Option<&crate::read_dependency::ReadDependency> {
+        (self.phase == ExecutionPhase::Render).then_some(&self.read_dependency)
+    }
+
     fn mark_non_reusable_render_read(&self) {
         if self.phase == ExecutionPhase::Render {
             self.non_reusable_render_reads
                 .borrow_mut()
-                .insert(self.component.clone());
+                .insert(self.callback_component.clone());
         }
     }
 
@@ -1145,12 +1678,44 @@ impl UiContext {
         base
     }
 
+    /// The Node factory `renderer` names, scoped as a callback created here.
+    /// `render_node` (registered with the component render API) calls it.
+    pub(crate) fn node_factory_callback(
+        &self,
+        renderer: Dynamic,
+    ) -> Result<ScriptCallback, Box<EvalAltResult>> {
+        if self.phase != ExecutionPhase::Render {
+            return Err(Box::new(EvalAltResult::ErrorRuntime(
+                "render_node is only available during component rendering".into(),
+                Position::NONE,
+            )));
+        }
+        let renderer = renderer.try_cast::<FnPtr>().ok_or_else(|| {
+            Box::new(EvalAltResult::ErrorRuntime(
+                "render_node requires a named Rhai Fn; native event handlers are not Node factories"
+                    .into(),
+                Position::NONE,
+            ))
+        })?;
+        let callback = self
+            .scoped_callback(renderer)
+            .map_err(|error| Box::new(context_runtime_error(&error)))?;
+        if !callback.is_node_factory() {
+            return Err(Box::new(EvalAltResult::ErrorRuntime(
+                "bind the Node factory with ctx.node_factory(Fn(...)) at its declaration site"
+                    .into(),
+                Position::NONE,
+            )));
+        }
+        Ok(callback)
+    }
+
     fn scoped_callback(&self, function: FnPtr) -> Result<ScriptCallback, UiContextError> {
         let mut callback = ScriptCallback::try_from_fn_ptr(function, self.generation)?;
         callback.bind_component_scope_if_unset(
-            &self.component,
-            self.incarnation,
-            self.events.clone(),
+            &self.callback_component,
+            self.callback_incarnation,
+            self.callback_events.clone(),
         );
         if let Some(context) = &self.native_context {
             callback.bind_native_context_if_unset(context.clone());
@@ -1175,6 +1740,18 @@ impl UiContext {
         &self.events
     }
 
+    pub(crate) fn callback_component_path(&self) -> &ComponentInstancePath {
+        &self.callback_component
+    }
+
+    pub(crate) const fn callback_component_incarnation(&self) -> ComponentIncarnation {
+        self.callback_incarnation
+    }
+
+    pub(crate) fn callback_event_schemas(&self) -> &BTreeMap<String, EventSchema> {
+        &self.callback_events
+    }
+
     pub(crate) fn native_context(&self) -> Option<&crate::invocation::ScriptInvocationContext> {
         self.native_context.as_ref()
     }
@@ -1190,10 +1767,10 @@ impl UiContext {
             .try_borrow()
             .map_err(|_| UiContextError::Borrowed)?
             .component_state
-            .get(&self.component, field)
+            .get(&self.callback_component, field)
             .cloned()
             .ok_or_else(|| UiContextError::UnknownState {
-                component: self.component.clone(),
+                component: self.callback_component.clone(),
                 field: field.to_owned(),
             })
     }
@@ -1233,7 +1810,10 @@ impl UiContext {
             .component_state
             .set(&self.component, field, value.clone())?;
         if changed {
-            runtime.dirty.insert(self.component.clone());
+            if runtime.origin != crate::InvocationOrigin::Effect {
+                runtime.effect_cascades.restart_containing(&self.component);
+            }
+            runtime.mark_dirty([self.component.clone()]);
         }
         runtime.traces.push(
             crate::RuntimeTraceKind::State,
@@ -1274,7 +1854,10 @@ impl UiContext {
         root.set_path(path, value.clone())?;
         let sensitive = runtime.component_state.is_sensitive(&self.component, field);
         if runtime.component_state.set(&self.component, field, root)? {
-            runtime.dirty.insert(self.component.clone());
+            if runtime.origin != crate::InvocationOrigin::Effect {
+                runtime.effect_cascades.restart_containing(&self.component);
+            }
+            runtime.mark_dirty([self.component.clone()]);
         }
         runtime.traces.push(
             crate::RuntimeTraceKind::State,
@@ -1353,17 +1936,19 @@ impl UiContext {
         Ok(runtime.signals.read(&signal)?.into_dynamic())
     }
 
-    /// Resolve an optional-float signal owned by the nearest parent component.
-    /// This is intended for retained render scopes, such as virtual collection
-    /// item renderers, that consume a signal declared by their owner while the
-    /// owner's initial render transaction is still in progress.
+    /// Resolve an optional-float signal declared by the nearest ancestor scope
+    /// that declares `key`. This is intended for retained render scopes, such
+    /// as virtual collection item renderers, that consume a signal declared by
+    /// their owner; `pending` holds the signals declared by the render in
+    /// progress, so the owner's initial render can bind them before commit.
     ///
     /// # Errors
     ///
-    /// Returns a borrow, identity, type, or unknown-signal error.
+    /// Returns a borrow, type, or unknown-signal error.
     pub(crate) fn parent_optional_float_signal_ref(
         &self,
         key: &str,
+        pending: &[crate::SignalId],
     ) -> Result<crate::NativeSignal, UiContextError> {
         let runtime = self
             .runtime
@@ -1371,7 +1956,13 @@ impl UiContext {
             .map_err(|_| UiContextError::Borrowed)?;
         let mut scope = self.component.parent();
         while let Some(component) = scope {
-            if let Ok(signal) = runtime.signals.resolve(&component, key) {
+            let signal = pending
+                .iter()
+                .find(|id| id.component() == &component && id.key() == key)
+                .cloned()
+                .map(crate::NativeSignal::new)
+                .or_else(|| runtime.signals.resolve(&component, key).ok());
+            if let Some(signal) = signal {
                 if signal.id().kind() == crate::SignalKind::OptionalFloat {
                     return Ok(signal);
                 }
@@ -1380,15 +1971,6 @@ impl UiContext {
                     actual: signal.id().kind(),
                 }
                 .into());
-            }
-            if let Some(incarnation) = runtime.component_incarnation(&component) {
-                let id = crate::SignalId::new_scoped(
-                    component,
-                    incarnation,
-                    key,
-                    crate::SignalKind::OptionalFloat,
-                )?;
-                return Ok(crate::NativeSignal::new(id));
             }
             scope = component.parent();
         }
@@ -1424,24 +2006,11 @@ impl UiContext {
     ///
     /// Returns for stale refs, unavailable geometry, or runtime borrow conflicts.
     pub fn element_bounds(&self, reference: &crate::ElementRef) -> Result<UiValue, UiContextError> {
-        let mut runtime = self
-            .runtime
-            .try_borrow_mut()
-            .map_err(|_| UiContextError::Borrowed)?;
-        let node = if self.phase == ExecutionPhase::Render {
-            runtime
-                .element_refs
-                .resolve_and_track_geometry(reference, &self.component)
-        } else {
-            Some(runtime.element_refs.resolve(reference)?)
-        };
-        let Some(node) = node else {
-            return Ok(UiValue::Null);
-        };
-        let geometry_registry =
-            runtime.geometry_for(self.view.as_deref().or(self.window.as_deref()));
-        drop(runtime);
-        let Some(geometry) = geometry_registry.read_tracked(node, &self.component) else {
+        let Some(geometry) = self.element_geometry(
+            reference,
+            crate::element_ref::ElementRefGeometryRead::Bounds,
+        )?
+        else {
             return Ok(UiValue::Null);
         };
         Ok(UiValue::Map(BTreeMap::from([
@@ -1452,6 +2021,78 @@ impl UiContext {
                 geometry.clip.map_or(UiValue::Null, geometry_bounds_value),
             ),
         ])))
+    }
+
+    /// Read a ref's committed logical layout width and height.
+    ///
+    /// Returns null until measured or while unmounted. In render, observes size
+    /// and binding changes, but not position, visual transforms or clipping.
+    /// Reading bounds as well preserves the stronger full-geometry dependency.
+    ///
+    /// # Errors
+    ///
+    /// Returns for runtime borrow conflicts.
+    pub fn element_size(&self, reference: &crate::ElementRef) -> Result<UiValue, UiContextError> {
+        let Some(geometry) = self.element_geometry(
+            reference,
+            crate::element_ref::ElementRefGeometryRead::LayoutSize,
+        )?
+        else {
+            return Ok(UiValue::Null);
+        };
+        Ok(UiValue::Map(BTreeMap::from([
+            ("width".to_owned(), UiValue::Float(geometry.layout.width)),
+            ("height".to_owned(), UiValue::Float(geometry.layout.height)),
+        ])))
+    }
+
+    fn element_geometry(
+        &self,
+        reference: &crate::ElementRef,
+        observation: crate::element_ref::ElementRefGeometryRead,
+    ) -> Result<Option<crate::ElementGeometry>, UiContextError> {
+        use crate::element_ref::ElementRefGeometryRead;
+
+        let mut runtime = self
+            .runtime
+            .try_borrow_mut()
+            .map_err(|_| UiContextError::Borrowed)?;
+        let node = if self.phase == ExecutionPhase::Render {
+            match observation {
+                ElementRefGeometryRead::Bounds => runtime
+                    .element_refs
+                    .resolve_and_track_geometry(reference, &self.read_dependency),
+                ElementRefGeometryRead::LayoutSize => runtime
+                    .element_refs
+                    .resolve_and_track_geometry_read(reference, &self.read_dependency, observation),
+            }
+        } else if observation == ElementRefGeometryRead::LayoutSize {
+            runtime.element_refs.resolve(reference).ok()
+        } else {
+            Some(runtime.element_refs.resolve(reference)?)
+        };
+        let Some(node) = node else {
+            return Ok(None);
+        };
+        let geometry_registry =
+            runtime.geometry_for(self.view.as_deref().or(self.window.as_deref()));
+        drop(runtime);
+        let geometry = if self.phase == ExecutionPhase::Render {
+            match observation {
+                ElementRefGeometryRead::Bounds => {
+                    geometry_registry.read_ref_tracked(reference.id(), node, &self.read_dependency)
+                }
+                ElementRefGeometryRead::LayoutSize => geometry_registry.read_ref_observation(
+                    reference.id(),
+                    node,
+                    &self.read_dependency,
+                    observation,
+                ),
+            }
+        } else {
+            geometry_registry.get(node)
+        };
+        Ok(geometry)
     }
 
     /// Resolve and read a committed component-local ref by its stable key.
@@ -1470,6 +2111,47 @@ impl UiContext {
             .element_refs
             .resolve_key(&self.component, key)?;
         self.element_bounds(&reference)
+    }
+
+    /// Read logical layout size through a component-local ref key.
+    ///
+    /// A missing binding returns null and, during render, remains subscribed so
+    /// first mount or a later remount wakes the reader.
+    ///
+    /// # Errors
+    ///
+    /// Returns for invalid keys or runtime borrow conflicts.
+    pub fn element_size_by_key(&self, key: &str) -> Result<UiValue, UiContextError> {
+        let reference =
+            crate::ElementRef::new(crate::ElementRefId::new(self.component.clone(), key)?);
+        self.element_size(&reference)
+    }
+
+    /// The window bounds of a laid-out item of one of this component's virtual
+    /// collections, by its display index; `null` when it is not laid out. An
+    /// event-time read: it establishes no render dependency.
+    ///
+    /// # Errors
+    ///
+    /// Returns for runtime borrow conflicts.
+    pub fn virtual_item_bounds(
+        &self,
+        collection: &str,
+        index: usize,
+    ) -> Result<UiValue, UiContextError> {
+        let id = crate::VirtualCollectionId {
+            component: self.component.clone(),
+            key: collection.to_owned(),
+        };
+        let registry = self
+            .runtime
+            .try_borrow()
+            .map_err(|_| UiContextError::Borrowed)?
+            .virtual_requests
+            .clone();
+        Ok(registry
+            .item_bounds(&id, index)
+            .map_or(UiValue::Null, crate::GeometryBounds::into_value))
     }
 
     /// Read the current handler node's committed visual bounds without
@@ -1523,6 +2205,93 @@ impl UiContext {
             .element_refs
             .resolve_key(&self.component, key)?;
         self.focus_element(&reference)
+    }
+
+    /// Queue a jump to this component's collection tail after the invocation
+    /// commits. Tail-enabled collections resume native following.
+    ///
+    /// # Errors
+    /// Returns during render, outside a window, or while the runtime is borrowed.
+    pub fn scroll_collection_to_end(&self, key: &str) -> Result<(), UiContextError> {
+        self.scroll_collection_to_edge(key, true)
+    }
+
+    /// Queue a jump to this component's collection start, pausing following.
+    ///
+    /// # Errors
+    /// Returns the same errors as [`Self::scroll_collection_to_end`].
+    pub fn scroll_collection_to_start(&self, key: &str) -> Result<(), UiContextError> {
+        self.scroll_collection_to_edge(key, false)
+    }
+
+    /// Queue native pixel scrolling (positive toward the end). This lets the
+    /// semantic viewport own Page Up/Down without a second position engine.
+    ///
+    /// # Errors
+    /// Returns during render, outside a window, for nonfinite distance, or while borrowed.
+    pub fn scroll_collection_by(&self, key: &str, distance: f64) -> Result<(), UiContextError> {
+        self.require_mutation()?;
+        if !distance.is_finite() {
+            return Err(UiContextError::InvalidScrollOffset {
+                x: 0.0,
+                y: distance,
+            });
+        }
+        let window = self.window.clone().ok_or(UiContextError::MissingWindow)?;
+        self.runtime
+            .try_borrow_mut()
+            .map_err(|_| UiContextError::Borrowed)?
+            .pending_element_commands
+            .push(crate::element_ref::ElementCommand::ScrollCollectionBy {
+                window,
+                id: crate::VirtualCollectionId {
+                    component: self.component.clone(),
+                    key: key.to_owned(),
+                },
+                distance,
+            });
+        Ok(())
+    }
+
+    fn scroll_collection_to_edge(&self, key: &str, end: bool) -> Result<(), UiContextError> {
+        self.require_mutation()?;
+        let window = self.window.clone().ok_or(UiContextError::MissingWindow)?;
+        self.runtime
+            .try_borrow_mut()
+            .map_err(|_| UiContextError::Borrowed)?
+            .pending_element_commands
+            .push(crate::element_ref::ElementCommand::ScrollCollection {
+                window,
+                id: crate::VirtualCollectionId {
+                    component: self.component.clone(),
+                    key: key.to_owned(),
+                },
+                end,
+            });
+        Ok(())
+    }
+
+    /// Read this component's last presented native follow status. Missing or
+    /// not-yet-mounted collections return `None`; this is an event-time query,
+    /// not a render dependency (use `on_follow_change` for reactive UI).
+    ///
+    /// # Errors
+    /// Returns while the runtime is borrowed.
+    pub fn collection_follow_status(
+        &self,
+        key: &str,
+    ) -> Result<Option<crate::VirtualCollectionFollowStatus>, UiContextError> {
+        let runtime = self
+            .runtime
+            .try_borrow()
+            .map_err(|_| UiContextError::Borrowed)?;
+        Ok(runtime
+            .virtual_requests
+            .scroll_handle(&crate::VirtualCollectionId {
+                component: self.component.clone(),
+                key: key.to_owned(),
+            })
+            .map(|handle| handle.status()))
     }
 
     /// Queue a positive visible scroll offset for a retained scroll container.
@@ -1595,6 +2364,35 @@ impl UiContext {
         Ok(())
     }
 
+    /// Queue a clipboard write after the current transaction commits.
+    ///
+    /// # Errors
+    ///
+    /// Requires an attached view/window and direct user input or an explicit
+    /// automation command. Render, timers, effects and asynchronous deliveries
+    /// cannot write, even when originally started by user input. Text uses the
+    /// ordinary bounded `UiValue` string validation.
+    pub fn copy_text(&self, text: String) -> Result<(), UiContextError> {
+        self.require_mutation()?;
+        self.view.as_ref().ok_or(UiContextError::MissingView)?;
+        let window = self.window.clone().ok_or(UiContextError::MissingWindow)?;
+        UiValue::String(text.clone()).validate()?;
+        let mut runtime = self
+            .runtime
+            .try_borrow_mut()
+            .map_err(|_| UiContextError::Borrowed)?;
+        if !matches!(
+            runtime.origin,
+            crate::InvocationOrigin::UserInput { .. } | crate::InvocationOrigin::Automation
+        ) {
+            return Err(UiContextError::ClipboardRequiresUserInput);
+        }
+        runtime
+            .pending_element_commands
+            .push(crate::element_ref::ElementCommand::CopyText { window, text });
+        Ok(())
+    }
+
     /// Resolve and reveal a component-local ref key.
     ///
     /// # Errors
@@ -1622,7 +2420,7 @@ impl UiContext {
             .map_err(|_| UiContextError::Borrowed)?;
         Ok(runtime
             .stores
-            .read_tracked(&self.component, &StoreId::app(store), field)?)
+            .read_dependency(self.render_reader(), &StoreId::app(store), field)?)
     }
 
     /// Read one Rust-owned collection and subscribe the current component.
@@ -1643,7 +2441,7 @@ impl UiContext {
             .map_err(|_| UiContextError::Borrowed)?;
         Ok(runtime
             .native_collections
-            .read_tracked(&self.component, name)?)
+            .read_dependency(self.render_reader(), name, true)?)
     }
 
     /// Read and subscribe to one immutable Host-owned text revision.
@@ -1661,7 +2459,7 @@ impl UiContext {
             .map_err(|_| UiContextError::Borrowed)?;
         Ok(runtime
             .native_documents
-            .read_tracked(&self.component, name)?)
+            .read_dependency(self.render_reader(), name)?)
     }
 
     /// Read one Host-owned chart data handle. The handle performs its own
@@ -1700,9 +2498,12 @@ impl UiContext {
             .runtime
             .try_borrow_mut()
             .map_err(|_| UiContextError::Borrowed)?;
-        Ok(runtime
-            .stores
-            .read_path_tracked(&self.component, &StoreId::app(store), field, path)?)
+        Ok(runtime.stores.read_path_dependency(
+            self.render_reader(),
+            &StoreId::app(store),
+            field,
+            path,
+        )?)
     }
 
     /// Queue a schema-checked app store mutation.
@@ -1725,7 +2526,7 @@ impl UiContext {
         let id = StoreId::app(store);
         let sensitive = runtime.stores.is_sensitive(&id, field);
         let invalidated = runtime.stores.write(&id, field, value.clone())?;
-        runtime.dirty.extend(invalidated);
+        runtime.mark_dirty(invalidated);
         runtime.traces.push(
             crate::RuntimeTraceKind::Store,
             format!("app:{store}"),
@@ -1757,7 +2558,7 @@ impl UiContext {
         let id = StoreId::app(store);
         let sensitive = runtime.stores.is_sensitive(&id, field);
         let invalidated = runtime.stores.write_path(&id, field, path, value.clone())?;
-        runtime.dirty.extend(invalidated);
+        runtime.mark_dirty(invalidated);
         runtime.traces.push(
             crate::RuntimeTraceKind::Store,
             format!("app:{store}"),
@@ -1780,9 +2581,11 @@ impl UiContext {
             .runtime
             .try_borrow_mut()
             .map_err(|_| UiContextError::Borrowed)?;
-        Ok(runtime
-            .stores
-            .read_tracked(&self.component, &StoreId::window(window, store), field)?)
+        Ok(runtime.stores.read_dependency(
+            self.render_reader(),
+            &StoreId::window(window, store),
+            field,
+        )?)
     }
 
     /// Read and subscribe to one exact path in the current window's store.
@@ -1801,8 +2604,8 @@ impl UiContext {
             .runtime
             .try_borrow_mut()
             .map_err(|_| UiContextError::Borrowed)?;
-        Ok(runtime.stores.read_path_tracked(
-            &self.component,
+        Ok(runtime.stores.read_path_dependency(
+            self.render_reader(),
             &StoreId::window(window, store),
             field,
             path,
@@ -1830,7 +2633,7 @@ impl UiContext {
         let id = StoreId::window(window, store);
         let sensitive = runtime.stores.is_sensitive(&id, field);
         let invalidated = runtime.stores.write(&id, field, value.clone())?;
-        runtime.dirty.extend(invalidated);
+        runtime.mark_dirty(invalidated);
         runtime.traces.push(
             crate::RuntimeTraceKind::Store,
             format!("window:{window}:{store}"),
@@ -1864,7 +2667,7 @@ impl UiContext {
         let id = StoreId::window(window, store);
         let sensitive = runtime.stores.is_sensitive(&id, field);
         let invalidated = runtime.stores.write_path(&id, field, path, value.clone())?;
-        runtime.dirty.extend(invalidated);
+        runtime.mark_dirty(invalidated);
         runtime.traces.push(
             crate::RuntimeTraceKind::Store,
             format!("window:{window}:{store}"),
@@ -1895,13 +2698,18 @@ impl UiContext {
             .runtime
             .try_borrow_mut()
             .map_err(|_| UiContextError::Borrowed)?;
+        let origin = runtime.origin.clone();
+        let owner = Some(self.semantic_dispatch_owner(&mut runtime));
         runtime.pending_events.push(PendingEvent {
             target: self.component.clone(),
             event: UiEvent {
                 name: event.to_owned(),
                 payload,
             },
+            origin,
+            owner,
         });
+        runtime.publish_committed_work();
         runtime.traces.push(
             crate::RuntimeTraceKind::Event,
             self.component.to_string(),
@@ -1925,8 +2733,11 @@ impl UiContext {
             .runtime
             .try_borrow_mut()
             .map_err(|_| UiContextError::Borrowed)?;
-        let invocation = runtime.actions.dispatch(&id, payload)?;
+        let mut invocation = runtime.actions.dispatch(&id, payload)?;
+        invocation.origin = runtime.origin.clone();
+        invocation.owner = Some(self.semantic_dispatch_owner(&mut runtime));
         runtime.pending_actions.push(invocation);
+        runtime.publish_committed_work();
         runtime.traces.push(
             crate::RuntimeTraceKind::Action,
             self.component.to_string(),
@@ -1935,6 +2746,35 @@ impl UiContext {
             true,
         );
         Ok(())
+    }
+
+    fn semantic_dispatch_owner(&self, runtime: &mut UiRuntimeState) -> SemanticDispatchOwner {
+        let source = runtime.dispatch_owner.as_ref().map_or_else(
+            || SemanticDispatchSource {
+                runtime_id: runtime.runtime_id,
+                generation: self.generation,
+                component: self.component.clone(),
+                incarnation: self.incarnation,
+                effect: self
+                    .async_scope
+                    .clone()
+                    .filter(|scope| matches!(scope, AsyncScope::Effect { .. })),
+                cascade: (runtime.origin == crate::InvocationOrigin::Effect)
+                    .then(|| runtime.effect_cascades.dispatch_token(&self.component))
+                    .flatten(),
+                publication_valid: Cell::new(true),
+            },
+            |owner| owner.source.as_ref().clone(),
+        );
+        source.publication_valid.set(true);
+        let source = Rc::new(source);
+        if runtime.transaction_depth > 0 {
+            runtime.dispatch_leases.push(Rc::clone(&source));
+        }
+        if let Some((root, _)) = &source.cascade {
+            runtime.effect_cascades.track_dispatch(root, &source);
+        }
+        SemanticDispatchOwner { source }
     }
 
     /// Register or refresh an app-scoped semantic action callback.
@@ -1970,6 +2810,76 @@ impl UiContext {
         Ok(())
     }
 
+    /// The shortcut bound to an action, from the key bindings declared to
+    /// this view; `None` when the action has no binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns identifier or borrow errors.
+    pub fn action_shortcut(
+        &self,
+        action: &str,
+    ) -> Result<Option<crate::ActionShortcut>, UiContextError> {
+        let id = ActionId::parse(action)?;
+        let runtime = self
+            .runtime
+            .try_borrow()
+            .map_err(|_| UiContextError::Borrowed)?;
+        Ok(runtime
+            .key_bindings
+            .iter()
+            .find(|binding| binding.action == id)
+            .map(crate::KeyBindingSpec::shortcut))
+    }
+
+    /// Whether an action is registered and enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns identifier or borrow errors.
+    pub fn action_enabled(&self, action: &str) -> Result<bool, UiContextError> {
+        let id = ActionId::parse(action)?;
+        Ok(self
+            .runtime
+            .try_borrow()
+            .map_err(|_| UiContextError::Borrowed)?
+            .actions
+            .is_enabled(&id)
+            .unwrap_or(false))
+    }
+
+    /// Every registered action with its enabled state and shortcut, for a
+    /// command palette: `[#{ id, enabled, shortcut }]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns borrow errors.
+    pub fn actions(&self) -> Result<Vec<UiValue>, UiContextError> {
+        let runtime = self
+            .runtime
+            .try_borrow()
+            .map_err(|_| UiContextError::Borrowed)?;
+        Ok(runtime
+            .actions
+            .ids()
+            .map(|id| {
+                let shortcut = runtime
+                    .key_bindings
+                    .iter()
+                    .find(|binding| &binding.action == id)
+                    .map_or(UiValue::Null, |binding| binding.shortcut().to_ui_value());
+                UiValue::Map(BTreeMap::from([
+                    ("id".to_owned(), UiValue::String(id.as_str().to_owned())),
+                    (
+                        "enabled".to_owned(),
+                        UiValue::Bool(runtime.actions.is_enabled(id).unwrap_or(false)),
+                    ),
+                    ("shortcut".to_owned(), shortcut),
+                ]))
+            })
+            .collect())
+    }
+
     /// Invoke a manifest-declared Rust capability.
     ///
     /// # Errors
@@ -1988,7 +2898,10 @@ impl UiContext {
             .runtime
             .try_borrow_mut()
             .map_err(|_| UiContextError::Borrowed)?;
-        let output = runtime.capabilities.call(&id, method, input)?;
+        let context = self.invocation_context(&runtime);
+        let output = runtime
+            .capabilities
+            .call_with(&context, &id, method, input)?;
         runtime.traces.push(
             crate::RuntimeTraceKind::Capability,
             self.component.to_string(),
@@ -1997,6 +2910,15 @@ impl UiContext {
             true,
         );
         Ok(output)
+    }
+
+    /// The context a capability handler receives for a call made here.
+    fn invocation_context(&self, runtime: &UiRuntimeState) -> crate::InvocationContext {
+        crate::InvocationContext {
+            origin: runtime.origin.clone(),
+            view_id: self.view.clone(),
+            component: self.component.clone(),
+        }
     }
 
     fn read_locale<T>(
@@ -2011,9 +2933,11 @@ impl UiContext {
             .runtime
             .try_borrow_mut()
             .map_err(|_| UiContextError::Borrowed)?;
-        runtime
-            .environment_dependencies
-            .track_locale(self.window.as_deref(), &self.component);
+        if let Some(reader) = self.render_reader() {
+            runtime
+                .environment_dependencies
+                .track_locale(self.window.as_deref(), reader);
+        }
         let locale = runtime
             .locale
             .as_ref()
@@ -2031,14 +2955,20 @@ impl UiContext {
     }
 
     /// Resolve the logical text direction for this component scope.
+    /// Defaults to left-to-right without a locale manager, like native rendering.
     ///
     /// # Errors
     ///
-    /// Returns [`UiContextError::LocaleUnavailable`], locale, or borrow errors.
+    /// Returns locale or borrow errors.
     pub fn text_direction(&self) -> Result<String, UiContextError> {
-        match self
-            .read_locale(|locale, window, component| locale.direction(window, Some(component)))?
+        let direction = match self
+            .read_locale(|locale, window, component| locale.direction(window, Some(component)))
         {
+            Ok(direction) => direction,
+            Err(UiContextError::LocaleUnavailable) => TextDirection::LeftToRight,
+            Err(error) => return Err(error),
+        };
+        match direction {
             TextDirection::LeftToRight => Ok("ltr".to_owned()),
             TextDirection::RightToLeft => Ok("rtl".to_owned()),
         }
@@ -2052,13 +2982,109 @@ impl UiContext {
     ///
     /// Returns a borrow error when another callback owns the runtime state.
     pub fn today(&self) -> Result<String, UiContextError> {
+        let runtime = self
+            .runtime
+            .try_borrow()
+            .map_err(|_| UiContextError::Borrowed)?;
+        runtime
+            .calendar_clock
+            .presentation_today(&runtime.wall_clock)
+            .map(crate::GregorianDate::to_iso)
+            .map_err(|error| LocaleError::Decode(error.to_string()).into())
+    }
+
+    /// Current epoch milliseconds from the Host presentation wall clock.
+    ///
+    /// # Errors
+    /// Returns a runtime borrow error.
+    pub fn now(&self) -> Result<i64, UiContextError> {
         Ok(self
             .runtime
             .try_borrow()
             .map_err(|_| UiContextError::Borrowed)?
-            .calendar_clock
-            .today()
-            .to_iso())
+            .wall_clock
+            .now_ms())
+    }
+
+    /// Format an epoch instant with selected locale metadata and an explicit zone.
+    ///
+    /// # Errors
+    /// Returns locale, instant, style, timezone or runtime borrow errors.
+    pub fn format_time(&self, ms: i64, style: &str, zone: &str) -> Result<String, UiContextError> {
+        self.read_locale(|locale, window, component| {
+            let bundle = locale.selected_bundle(window, Some(component))?;
+            crate::time::format_time(
+                ms,
+                style,
+                zone,
+                &bundle.time,
+                &bundle.calendar,
+                &bundle.number,
+            )
+            .map_err(|e| LocaleError::Decode(e.to_string()))
+        })
+    }
+
+    /// Format a signed elapsed duration with selected locale units and digits.
+    ///
+    /// # Errors
+    /// Returns locale-selection or runtime borrow errors.
+    pub fn format_duration(&self, ms: i64) -> Result<String, UiContextError> {
+        self.read_locale(|locale, window, component| {
+            let bundle = locale.selected_bundle(window, Some(component))?;
+            Ok(crate::time::format_duration(
+                ms,
+                &bundle.time,
+                &bundle.number,
+            ))
+        })
+    }
+
+    /// Format an instant relative to the injected wall clock.
+    ///
+    /// # Errors
+    /// Returns locale-selection or runtime borrow errors.
+    pub fn format_relative(&self, ms: i64) -> Result<String, UiContextError> {
+        let now = self.now()?;
+        self.read_locale(|locale, window, component| {
+            let bundle = locale.selected_bundle(window, Some(component))?;
+            Ok(crate::time::format_relative(
+                ms,
+                now,
+                &bundle.time,
+                &bundle.number,
+            ))
+        })
+    }
+
+    /// Detached locale time patterns, periods, duration units and relative messages.
+    ///
+    /// # Errors
+    /// Returns locale-selection, serialization or runtime borrow errors.
+    pub fn time_metadata(&self) -> Result<Map, UiContextError> {
+        let metadata = self.read_locale(|locale, window, component| {
+            Ok(locale
+                .selected_bundle(window, Some(component))?
+                .time
+                .clone())
+        })?;
+        rhai::serde::to_dynamic(metadata)
+            .map(Dynamic::cast::<Map>)
+            .map_err(|e| LocaleError::Decode(e.to_string()).into())
+    }
+
+    /// Parse a localized time field; incomplete/invalid text returns no value.
+    ///
+    /// # Errors
+    /// Returns locale-selection or runtime borrow errors.
+    pub fn parse_time(&self, value: &str, precision: &str) -> Result<Dynamic, UiContextError> {
+        self.read_locale(|locale, window, component| {
+            let bundle = locale.selected_bundle(window, Some(component))?;
+            Ok(
+                crate::time::parse_time(value, precision, &bundle.time, &bundle.number)
+                    .map_or(Dynamic::UNIT, Dynamic::from),
+            )
+        })
     }
 
     /// Format a strict ISO date through the selected locale.
@@ -2164,7 +3190,7 @@ impl UiContext {
         };
         if changed {
             let invalidated = runtime.environment_dependencies.invalidate_locale_app();
-            runtime.dirty.extend(invalidated);
+            runtime.mark_dirty(invalidated);
             runtime.mark_all_windows_repaint();
         }
         runtime.traces.push(
@@ -2238,9 +3264,11 @@ impl UiContext {
             .runtime
             .try_borrow_mut()
             .map_err(|_| UiContextError::Borrowed)?;
-        runtime
-            .environment_dependencies
-            .track_viewport(window, &self.component);
+        if let Some(reader) = self.render_reader() {
+            runtime
+                .environment_dependencies
+                .track_viewport(window, reader);
+        }
         Ok(runtime.responsive.class(window).as_str().to_owned())
     }
 
@@ -2373,7 +3401,7 @@ impl UiContext {
             let invalidated = runtime
                 .environment_dependencies
                 .invalidate_locale_window(&window);
-            runtime.dirty.extend(invalidated);
+            runtime.mark_dirty(invalidated);
             runtime.mark_window_repaint(window.clone());
         }
         runtime.traces.push(
@@ -2410,7 +3438,7 @@ impl UiContext {
             let invalidated = runtime
                 .environment_dependencies
                 .invalidate_locale_scope(&self.component);
-            runtime.dirty.extend(invalidated);
+            runtime.mark_dirty(invalidated);
             if let Some(window) = &self.window {
                 runtime.mark_window_repaint(window.clone());
             }
@@ -2519,9 +3547,9 @@ impl UiContext {
         if app_target {
             runtime.mark_all_windows_dirty();
         } else {
-            runtime.dirty.insert(self.component.clone());
+            runtime.mark_dirty([self.component.clone()]);
         }
-        runtime.dirty.extend(invalidated);
+        runtime.mark_dirty(invalidated);
         runtime.traces.push(
             crate::RuntimeTraceKind::Theme,
             self.component.to_string(),
@@ -2551,7 +3579,7 @@ impl UiContext {
         });
         let now = runtime.clock.now();
         runtime.motion_values = runtime.motions.snapshot(now);
-        runtime.dirty.insert(self.component.clone());
+        runtime.mark_dirty([self.component.clone()]);
         runtime.traces.push(
             crate::RuntimeTraceKind::State,
             self.component.to_string(),
@@ -2585,12 +3613,72 @@ impl UiContext {
 
     #[must_use]
     pub fn motion_tokens(&self) -> crate::ThemeMotion {
-        let Ok(mut runtime) = self.runtime.try_borrow_mut() else {
-            return crate::ThemeMotion::default();
+        self.with_resolved_theme(|variant| variant.tokens.motion.clone())
+            .unwrap_or_default()
+    }
+
+    /// The active theme variant metadata for this context's window/component scope.
+    /// Read during render to track its theme dependency. Effects restart only
+    /// when this metadata is explicitly included in their declared deps.
+    /// Headless/pre-native contexts resolve System using Dark until an actual
+    /// window appearance is known. Returns None for missing/unresolvable themes
+    /// or an unavailable runtime borrow; it does not clone theme tokens.
+    #[must_use]
+    pub fn resolved_theme_variant(&self) -> Option<crate::ThemeVariantInfo> {
+        self.with_resolved_theme(|variant| crate::ThemeVariantInfo {
+            family: variant.family.clone(),
+            name: variant.name.clone(),
+            mode: variant.mode,
+        })
+    }
+
+    /// Every loaded theme variant, ordered by family and name, for a theme
+    /// picker. The set only changes when sources reload, which renders again.
+    #[must_use]
+    pub fn theme_variants(&self) -> Vec<crate::ThemeVariantInfo> {
+        let Ok(runtime) = self.runtime.try_borrow() else {
+            return Vec::new();
         };
         runtime
-            .environment_dependencies
-            .track_theme(self.window.as_deref(), &self.component);
+            .theme
+            .as_ref()
+            .map(|theme| {
+                theme
+                    .variants()
+                    .map(|variant| crate::ThemeVariantInfo {
+                        family: variant.family.clone(),
+                        name: variant.name.clone(),
+                        mode: variant.mode,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Every color of the theme variant `family`/`name` (as the token base,
+    /// color expressions and Host overrides resolve them), keyed by token name,
+    /// namespaced colors as `namespace.name`; `None` when no variant has that
+    /// name. A theme picker draws its swatches from these without the Host.
+    #[must_use]
+    pub fn theme_colors(&self, family: &str, name: &str) -> Option<BTreeMap<String, crate::Rgba8>> {
+        let runtime = self.runtime.try_borrow().ok()?;
+        runtime
+            .theme
+            .as_ref()?
+            .variants()
+            .find(|variant| variant.family == family && variant.name == name)
+            .map(|variant| variant.tokens.color_snapshot())
+    }
+
+    fn with_resolved_theme<R>(&self, project: impl FnOnce(&crate::ThemeVariant) -> R) -> Option<R> {
+        let Ok(mut runtime) = self.runtime.try_borrow_mut() else {
+            return None;
+        };
+        if self.phase == ExecutionPhase::Render {
+            runtime
+                .environment_dependencies
+                .track_theme(self.window.as_deref(), &self.read_dependency);
+        }
         let appearance = self
             .window
             .as_deref()
@@ -2604,9 +3692,13 @@ impl UiContext {
                     .resolve(self.window.as_deref(), Some(&self.component), appearance)
                     .ok()
             })
-            .map_or_else(crate::ThemeMotion::default, |theme| {
-                theme.variant().tokens.motion.clone()
-            })
+            .map(|theme| project(theme.variant()))
+    }
+
+    /// Resolved identity, not the app/window/local preference selecting it.
+    #[must_use]
+    pub fn resolved_theme_selection(&self) -> Option<ThemeSelection> {
+        self.with_resolved_theme(|variant| ThemeSelection::new(&variant.family, &variant.name))
     }
 
     /// Resolve a semantic motion duration.
@@ -2855,6 +3947,7 @@ impl UiContext {
         error: FnPtr,
     ) -> Result<ImageDecodeHandle, UiContextError> {
         self.require_mutation()?;
+        self.require_async_start()?;
         self.require_generation()?;
         let success = self.scoped_callback(success)?;
         let error = self.scoped_callback(error)?;
@@ -2886,49 +3979,49 @@ impl UiContext {
         Ok(handle)
     }
 
-    /// Cancel a pending image decode owned by this runtime.
+    /// Cancel a pending image decode this component started.
     ///
     /// # Errors
     ///
-    /// Returns phase or borrow errors.
+    /// Returns phase, foreign-owner, or borrow errors.
     pub fn cancel_image_decode(&self, handle: ImageDecodeHandle) -> Result<bool, UiContextError> {
         self.require_mutation()?;
-        Ok(self
+        let runtime = self
             .runtime
             .try_borrow()
-            .map_err(|_| UiContextError::Borrowed)?
-            .assets
-            .cancel_image_decode(handle)?)
+            .map_err(|_| UiContextError::Borrowed)?;
+        self.require_async_owner(runtime.assets.image_decode_scope(handle)?.as_ref())?;
+        Ok(runtime.assets.cancel_image_decode(handle)?)
     }
 
-    /// Cancel a one-shot task owned by this runtime.
+    /// Cancel a one-shot task this component started.
     ///
     /// # Errors
     ///
-    /// Returns phase or borrow errors.
+    /// Returns phase, foreign-owner, or borrow errors.
     pub fn cancel_task(&self, handle: TaskHandle) -> Result<bool, UiContextError> {
         self.require_mutation()?;
-        Ok(self
+        let mut runtime = self
             .runtime
             .try_borrow_mut()
-            .map_err(|_| UiContextError::Borrowed)?
-            .tasks
-            .cancel(handle))
+            .map_err(|_| UiContextError::Borrowed)?;
+        self.require_async_owner(runtime.tasks.scope(handle))?;
+        Ok(runtime.tasks.cancel(handle))
     }
 
-    /// Cancel a continuous subscription owned by this runtime.
+    /// Cancel a continuous subscription this component started.
     ///
     /// # Errors
     ///
-    /// Returns phase or borrow errors.
+    /// Returns phase, foreign-owner, or borrow errors.
     pub fn cancel_subscription(&self, handle: SubscriptionHandle) -> Result<bool, UiContextError> {
         self.require_mutation()?;
-        Ok(self
+        let mut runtime = self
             .runtime
             .try_borrow_mut()
-            .map_err(|_| UiContextError::Borrowed)?
-            .subscriptions
-            .cancel(handle))
+            .map_err(|_| UiContextError::Borrowed)?;
+        self.require_async_owner(runtime.subscriptions.scope(handle))?;
+        Ok(runtime.subscriptions.cancel(handle))
     }
 
     /// Pause a declared timer by its component-local key.
@@ -3008,7 +4101,10 @@ impl UiContext {
             runtime.tasks.active_count().saturating_add(1),
             runtime.budgets.background_tasks,
         )?;
-        let (work, output) = runtime.capabilities.start_task(&id, method, input)?;
+        let context = self.invocation_context(&runtime);
+        let (work, output) = runtime
+            .capabilities
+            .start_task_with(&context, &id, method, input)?;
         let handle = runtime.tasks.spawn_cancellable(
             self.async_scope
                 .clone()
@@ -3062,9 +4158,10 @@ impl UiContext {
             runtime.subscriptions.active_count().saturating_add(1),
             runtime.budgets.subscriptions,
         )?;
+        let context = self.invocation_context(&runtime);
         let (work, output) = runtime
             .capabilities
-            .start_subscription(&id, method, input)?;
+            .start_subscription_with(&context, &id, method, input)?;
         let registration = SubscriptionRegistration::new(
             format!("{capability}.{method}"),
             self.async_scope
@@ -3113,6 +4210,23 @@ impl UiContext {
         }
     }
 
+    /// Async work belongs to the component whose scope started it; app- and
+    /// window-scoped work has no component owner.
+    fn require_async_owner(&self, scope: Option<&AsyncScope>) -> Result<(), UiContextError> {
+        let Some(owner) = scope.and_then(AsyncScope::component) else {
+            return Ok(());
+        };
+        if owner == &self.component
+            || self.async_scope.as_ref().and_then(AsyncScope::component) == Some(owner)
+        {
+            Ok(())
+        } else {
+            Err(UiContextError::ForeignAsyncHandle {
+                owner: owner.clone(),
+            })
+        }
+    }
+
     fn require_generation(&self) -> Result<(), UiContextError> {
         if self.generation == ScriptGeneration::default() {
             Err(UiContextError::MissingGeneration)
@@ -3135,6 +4249,21 @@ impl CustomType for UiContext {
     fn build(mut builder: TypeBuilder<Self>) {
         builder
             .with_name("UiContext")
+            .with_fn(
+                "node_factory",
+                |call: NativeCallContext<'_>, context: &mut Self, renderer: FnPtr| {
+                    if context.phase != ExecutionPhase::Render {
+                        return Err(Box::new(EvalAltResult::ErrorRuntime(
+                            "node_factory is only available during component rendering".into(),
+                            Position::NONE,
+                        )));
+                    }
+                    context
+                        .scoped_callback(renderer.clone())
+                        .map_err(|error| Box::new(context_runtime_error(&error)))?;
+                    Ok(ScriptCallback::bind_node_factory(renderer, context, &call))
+                },
+            )
             .with_fn(
                 "emit",
                 |context: &mut Self, event: ImmutableString, payload: Dynamic| {
@@ -3466,6 +4595,24 @@ fn register_signal_context_methods(builder: &mut TypeBuilder<UiContext>) {
 fn register_element_ref_context_methods(builder: &mut TypeBuilder<UiContext>) {
     builder
         .with_fn(
+            "element_size",
+            |context: &mut UiContext, reference: crate::ElementRef| {
+                context
+                    .element_size(&reference)
+                    .map(UiValue::into_dynamic)
+                    .map_err(|error| Box::new(context_runtime_error(&error)))
+            },
+        )
+        .with_fn(
+            "element_size",
+            |context: &mut UiContext, key: ImmutableString| {
+                context
+                    .element_size_by_key(key.as_str())
+                    .map(UiValue::into_dynamic)
+                    .map_err(|error| Box::new(context_runtime_error(&error)))
+            },
+        )
+        .with_fn(
             "element_bounds",
             |context: &mut UiContext, reference: crate::ElementRef| {
                 context
@@ -3490,6 +4637,21 @@ fn register_element_ref_context_methods(builder: &mut TypeBuilder<UiContext>) {
                 .map_err(|error| Box::new(context_runtime_error(&error)))
         })
         .with_fn(
+            "virtual_item_bounds",
+            |context: &mut UiContext, collection: ImmutableString, index: rhai::INT| {
+                let index = usize::try_from(index).map_err(|_| {
+                    Box::new(EvalAltResult::ErrorRuntime(
+                        "virtual item index must be non-negative".into(),
+                        Position::NONE,
+                    ))
+                })?;
+                context
+                    .virtual_item_bounds(collection.as_str(), index)
+                    .map(UiValue::into_dynamic)
+                    .map_err(|error| Box::new(context_runtime_error(&error)))
+            },
+        )
+        .with_fn(
             "focus",
             |context: &mut UiContext, reference: crate::ElementRef| {
                 context
@@ -3508,8 +4670,44 @@ fn geometry_bounds_value(bounds: crate::GeometryBounds) -> UiValue {
     bounds.into_value()
 }
 
+#[allow(clippy::too_many_lines)]
 fn register_action_context_methods(builder: &mut TypeBuilder<UiContext>) {
     builder
+        .with_fn(
+            "scroll_collection_by",
+            |context: &mut UiContext, key: ImmutableString, distance: Dynamic| {
+                context
+                    .scroll_collection_by(key.as_str(), scroll_number(&distance)?)
+                    .map_err(|error| Box::new(context_runtime_error(&error)))
+            },
+        )
+        .with_fn(
+            "scroll_collection_to_end",
+            |context: &mut UiContext, key: ImmutableString| {
+                context
+                    .scroll_collection_to_end(key.as_str())
+                    .map_err(|error| Box::new(context_runtime_error(&error)))
+            },
+        )
+        .with_fn(
+            "scroll_collection_to_start",
+            |context: &mut UiContext, key: ImmutableString| {
+                context
+                    .scroll_collection_to_start(key.as_str())
+                    .map_err(|error| Box::new(context_runtime_error(&error)))
+            },
+        )
+        .with_fn(
+            "collection_follow_status",
+            |context: &mut UiContext, key: ImmutableString| {
+                context
+                    .collection_follow_status(key.as_str())
+                    .map(|status| {
+                        status.map_or(Dynamic::UNIT, |status| status.to_ui_value().into_dynamic())
+                    })
+                    .map_err(|error| Box::new(context_runtime_error(&error)))
+            },
+        )
         .with_fn(
             "dispatch_action",
             |context: &mut UiContext, action: ImmutableString, payload: Dynamic| {
@@ -3538,6 +4736,38 @@ fn register_action_context_methods(builder: &mut TypeBuilder<UiContext>) {
             },
         )
         .with_fn(
+            "action_shortcut",
+            |context: &mut UiContext, action: ImmutableString| {
+                context
+                    .action_shortcut(action.as_str())
+                    .map(|shortcut| {
+                        shortcut.map_or(Dynamic::UNIT, |shortcut| {
+                            shortcut.to_ui_value().into_dynamic()
+                        })
+                    })
+                    .map_err(|error| Box::new(context_runtime_error(&error)))
+            },
+        )
+        .with_fn(
+            "action_enabled",
+            |context: &mut UiContext, action: ImmutableString| {
+                context
+                    .action_enabled(action.as_str())
+                    .map_err(|error| Box::new(context_runtime_error(&error)))
+            },
+        )
+        .with_fn("actions", |context: &mut UiContext| {
+            context
+                .actions()
+                .map(|actions| {
+                    actions
+                        .into_iter()
+                        .map(UiValue::into_dynamic)
+                        .collect::<rhai::Array>()
+                })
+                .map_err(|error| Box::new(context_runtime_error(&error)))
+        })
+        .with_fn(
             "scroll_to",
             |context: &mut UiContext, reference: crate::ElementRef, x: FLOAT, y: FLOAT| {
                 context
@@ -3550,6 +4780,31 @@ fn register_action_context_methods(builder: &mut TypeBuilder<UiContext>) {
             |context: &mut UiContext, key: ImmutableString, x: FLOAT, y: FLOAT| {
                 context
                     .scroll_element_to_by_key(key.as_str(), x, y)
+                    .map_err(|error| Box::new(context_runtime_error(&error)))
+            },
+        )
+        // Integer and mixed offsets, as `ctx.scroll_to("list", 0, 0)`.
+        .with_fn(
+            "scroll_to",
+            |context: &mut UiContext,
+             reference: crate::ElementRef,
+             x: Dynamic,
+             y: Dynamic|
+             -> Result<(), Box<EvalAltResult>> {
+                context
+                    .scroll_element_to(&reference, scroll_number(&x)?, scroll_number(&y)?)
+                    .map_err(|error| Box::new(context_runtime_error(&error)))
+            },
+        )
+        .with_fn(
+            "scroll_to",
+            |context: &mut UiContext,
+             key: ImmutableString,
+             x: Dynamic,
+             y: Dynamic|
+             -> Result<(), Box<EvalAltResult>> {
+                context
+                    .scroll_element_to_by_key(key.as_str(), scroll_number(&x)?, scroll_number(&y)?)
                     .map_err(|error| Box::new(context_runtime_error(&error)))
             },
         )
@@ -3566,6 +4821,14 @@ fn register_action_context_methods(builder: &mut TypeBuilder<UiContext>) {
             |context: &mut UiContext, key: ImmutableString| {
                 context
                     .scroll_element_into_view_by_key(key.as_str())
+                    .map_err(|error| Box::new(context_runtime_error(&error)))
+            },
+        )
+        .with_fn(
+            "copy_text",
+            |context: &mut UiContext, text: ImmutableString| {
+                context
+                    .copy_text(text.to_string())
                     .map_err(|error| Box::new(context_runtime_error(&error)))
             },
         );
@@ -3716,7 +4979,53 @@ fn subscription_options(mut options: Map) -> Result<SubscriptionOptions, Box<Eva
     })
 }
 
+fn register_time_context_methods(builder: &mut TypeBuilder<UiContext>) {
+    builder
+        .with_fn("is_visible", |context: &mut UiContext| {
+            context
+                .is_visible()
+                .map_err(|error| Box::new(context_runtime_error(&error)))
+        })
+        .with_fn("now", |context: &mut UiContext| {
+            context
+                .now()
+                .map_err(|e| Box::new(context_runtime_error(&e)))
+        })
+        .with_fn("time", |context: &mut UiContext| {
+            context
+                .time_metadata()
+                .map_err(|e| Box::new(context_runtime_error(&e)))
+        })
+        .with_fn(
+            "parse_time",
+            |context: &mut UiContext, value: ImmutableString, precision: ImmutableString| {
+                context
+                    .parse_time(&value, &precision)
+                    .map_err(|e| Box::new(context_runtime_error(&e)))
+            },
+        )
+        .with_fn(
+            "format_time",
+            |context: &mut UiContext, ms: INT, style: ImmutableString, zone: ImmutableString| {
+                context
+                    .format_time(ms, &style, &zone)
+                    .map_err(|e| Box::new(context_runtime_error(&e)))
+            },
+        )
+        .with_fn("format_duration", |context: &mut UiContext, ms: INT| {
+            context
+                .format_duration(ms)
+                .map_err(|e| Box::new(context_runtime_error(&e)))
+        })
+        .with_fn("format_relative", |context: &mut UiContext, ms: INT| {
+            context
+                .format_relative(ms)
+                .map_err(|e| Box::new(context_runtime_error(&e)))
+        });
+}
+
 fn register_locale_context_methods(builder: &mut TypeBuilder<UiContext>) {
+    register_time_context_methods(builder);
     builder
         .with_fn("t", |context: &mut UiContext, key: ImmutableString| {
             context
@@ -3856,8 +5165,90 @@ fn number_format_options(mut options: Map) -> Result<NumberFormatOptions, Box<Ev
     Ok(parsed)
 }
 
+fn theme_variant_map(variant: &crate::ThemeVariantInfo) -> Dynamic {
+    let mut map = rhai::Map::new();
+    map.insert("family".into(), Dynamic::from(variant.family.clone()));
+    map.insert("name".into(), Dynamic::from(variant.name.clone()));
+    map.insert(
+        "mode".into(),
+        Dynamic::from(match variant.mode {
+            crate::ThemeMode::Light => "light",
+            crate::ThemeMode::Dark => "dark",
+        }),
+    );
+    Dynamic::from(map)
+}
+
+/// `ctx.theme_colors(family, name[, keys])`: the variant's colors as literal
+/// colors, every one or the named ones. An unknown variant or key throws.
+fn theme_color_map(
+    context: &UiContext,
+    family: &str,
+    name: &str,
+    keys: Option<rhai::Array>,
+) -> Result<rhai::Map, Box<EvalAltResult>> {
+    let error =
+        |message: String| Box::new(EvalAltResult::ErrorRuntime(message.into(), Position::NONE));
+    let colors = context
+        .theme_colors(family, name)
+        .ok_or_else(|| error(format!("no theme variant {family}/{name}")))?;
+    let color = |value: crate::Rgba8| Dynamic::from(crate::ColorValue::Literal(value));
+    match keys {
+        None => Ok(colors
+            .into_iter()
+            .map(|(key, value)| (key.into(), color(value)))
+            .collect()),
+        Some(keys) => keys
+            .into_iter()
+            .map(|key| {
+                let key = key
+                    .into_immutable_string()
+                    .map_err(|_| error("theme_colors keys are strings".to_owned()))?;
+                let value = colors.get(key.as_str()).copied().ok_or_else(|| {
+                    error(format!("theme variant {family}/{name} has no color {key}"))
+                })?;
+                Ok((key.as_str().into(), color(value)))
+            })
+            .collect(),
+    }
+}
+
 fn register_theme_context_methods(builder: &mut TypeBuilder<UiContext>) {
     builder
+        .with_fn(
+            "theme_variant",
+            |context: &mut UiContext| -> Result<Dynamic, Box<EvalAltResult>> {
+                Ok(context
+                    .resolved_theme_variant()
+                    .map_or(Dynamic::UNIT, |variant| theme_variant_map(&variant)))
+            },
+        )
+        .with_fn("theme_variants", |context: &mut UiContext| -> rhai::Array {
+            context
+                .theme_variants()
+                .iter()
+                .map(theme_variant_map)
+                .collect()
+        })
+        .with_fn(
+            "theme_colors",
+            |context: &mut UiContext,
+             family: ImmutableString,
+             name: ImmutableString|
+             -> Result<rhai::Map, Box<EvalAltResult>> {
+                theme_color_map(context, family.as_str(), name.as_str(), None)
+            },
+        )
+        .with_fn(
+            "theme_colors",
+            |context: &mut UiContext,
+             family: ImmutableString,
+             name: ImmutableString,
+             keys: rhai::Array|
+             -> Result<rhai::Map, Box<EvalAltResult>> {
+                theme_color_map(context, family.as_str(), name.as_str(), Some(keys))
+            },
+        )
         .with_fn(
             "set_theme",
             |context: &mut UiContext, family: ImmutableString, variant: ImmutableString| {
@@ -3941,13 +5332,7 @@ fn register_motion_context_methods(builder: &mut TypeBuilder<UiContext>) {
             |context: &mut UiContext, role: ImmutableString| {
                 context
                     .motion_easing(role.as_str())
-                    .map(|value| match value {
-                        crate::MotionEasing::Linear => "linear",
-                        crate::MotionEasing::EaseIn => "ease_in",
-                        crate::MotionEasing::EaseOut => "ease_out",
-                        crate::MotionEasing::EaseInOut => "ease_in_out",
-                    })
-                    .map(ImmutableString::from)
+                    .map(|value| ImmutableString::from(value.to_string()))
                     .map_err(|error| Box::new(context_runtime_error(&error)))
             },
         )
@@ -4160,15 +5545,22 @@ fn register_window_context_methods(builder: &mut TypeBuilder<UiContext>) {
 }
 
 fn context_at_call(context: &UiContext, call: &NativeCallContext<'_>) -> UiContext {
-    context
-        .clone()
-        .with_native_context(Some(crate::invocation::ScriptInvocationContext::capture(
-            call,
-        )))
+    context.clone().with_native_context(Some(
+        crate::invocation::ScriptInvocationContext::capture_retained(call),
+    ))
 }
 
 pub(crate) fn register_ui_context_api(engine: &mut Engine) {
     engine.build_type::<UiContext>();
+}
+
+fn scroll_number(value: &Dynamic) -> Result<f64, Box<EvalAltResult>> {
+    crate::value::script_number(value).ok_or_else(|| {
+        Box::new(EvalAltResult::ErrorRuntime(
+            format!("scroll offset must be a number, got {}", value.type_name()).into(),
+            Position::NONE,
+        ))
+    })
 }
 
 fn context_runtime_error(error: &UiContextError) -> EvalAltResult {
@@ -4177,6 +5569,8 @@ fn context_runtime_error(error: &UiContextError) -> EvalAltResult {
 
 #[derive(Debug, Error)]
 pub enum UiContextError {
+    #[error("clipboard writes require direct user input or an explicit automation command")]
+    ClipboardRequiresUserInput,
     #[error("UI runtime state is already mutably borrowed by another callback")]
     Borrowed,
     #[error("state mutation and effects are forbidden during view rendering")]
@@ -4189,6 +5583,8 @@ pub enum UiContextError {
     EventTargetOutsideEvent,
     #[error("async work requires a bound script generation")]
     MissingGeneration,
+    #[error("this async handle belongs to component `{owner}`; only that component may cancel it")]
+    ForeignAsyncHandle { owner: ComponentInstancePath },
     #[error("no locale manager is configured for this application")]
     LocaleUnavailable,
     #[error("no theme manager is configured for this application")]
@@ -4268,6 +5664,203 @@ mod tests {
     use super::*;
     use crate::{ComponentStateSchema, RuntimeEngine, StateField, SubscriptionWork, ValueSchema};
 
+    #[test]
+    fn dirty_delivery_wakes_only_after_a_successful_outermost_commit() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let mut runtime = UiRuntimeState::new();
+        let root = ComponentInstancePath::root("View", "main");
+        let wake = runtime.tasks.wake();
+        let mut listener = std::pin::pin!(wake.listen());
+        let mut context = Context::from_waker(Waker::noop());
+        let _outer = runtime.begin_transaction().unwrap();
+        let _inner = runtime.begin_transaction().unwrap();
+        runtime.dirty.insert(root.clone());
+        runtime.commit_transaction().unwrap();
+        assert_eq!(listener.as_mut().poll(&mut context), Poll::Pending);
+        runtime.commit_transaction().unwrap();
+        assert_eq!(listener.as_mut().poll(&mut context), Poll::Ready(()));
+
+        runtime.dirty.clear();
+        let mut listener = std::pin::pin!(wake.listen());
+        let failed = runtime.begin_transaction().unwrap();
+        runtime.dirty.insert(root.clone());
+        runtime.rollback_transaction(failed).unwrap();
+        assert_eq!(listener.as_mut().poll(&mut context), Poll::Pending);
+        let _quiescent = runtime.begin_transaction().unwrap();
+        runtime.commit_transaction().unwrap();
+        assert_eq!(listener.as_mut().poll(&mut context), Poll::Pending);
+
+        // A stale queued wake can drain the pump, but neither a rejected root
+        // nor an unrelated successful transaction may restart that cascade.
+        runtime.effect_cascades.restart(&root);
+        runtime.effect_cascades.charge(&root, 64).unwrap();
+        assert!(runtime.effect_cascades.charge(&root, 1).is_err());
+        let _unrelated = runtime.begin_transaction().unwrap();
+        runtime.dirty.insert(root.clone());
+        runtime.commit_transaction().unwrap();
+        assert!(!runtime.has_window_dirty(&root));
+        assert_eq!(listener.as_mut().poll(&mut context), Poll::Pending);
+    }
+
+    #[test]
+    fn host_document_and_state_writes_publish_without_a_transaction_but_failures_do_not() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let context = mounted_context(ExecutionPhase::Event);
+        let mut runtime = context.runtime.borrow_mut();
+        let root = context.component.clone();
+        runtime
+            .native_documents
+            .register(
+                "source",
+                crate::NativeTextDocument::new("source", 1, "first").unwrap(),
+            )
+            .unwrap();
+        runtime
+            .native_documents
+            .read_tracked(&root, "source")
+            .unwrap();
+        let wake = runtime.tasks.wake();
+        let mut listener = std::pin::pin!(wake.listen());
+        let mut poll_context = Context::from_waker(Waker::noop());
+        assert!(
+            runtime
+                .replace_native_text_document_from_host(
+                    "source",
+                    crate::NativeTextDocument::new("source", 1, "stale").unwrap()
+                )
+                .is_err()
+        );
+        assert_eq!(listener.as_mut().poll(&mut poll_context), Poll::Pending);
+        assert!(
+            runtime
+                .replace_native_text_document_from_host(
+                    "source",
+                    crate::NativeTextDocument::new("source", 2, "second").unwrap()
+                )
+                .unwrap()
+        );
+        assert_eq!(listener.as_mut().poll(&mut poll_context), Poll::Ready(()));
+
+        runtime.dirty.clear();
+        let mut listener = std::pin::pin!(wake.listen());
+        let rollback = runtime.begin_transaction().unwrap();
+        assert!(
+            runtime
+                .replace_native_text_document_from_host(
+                    "source",
+                    crate::NativeTextDocument::new("source", 3, "rolled back").unwrap()
+                )
+                .unwrap()
+        );
+        assert_eq!(listener.as_mut().poll(&mut poll_context), Poll::Pending);
+        runtime.rollback_transaction(rollback).unwrap();
+        assert_eq!(
+            runtime
+                .native_documents
+                .read_tracked(&root, "source")
+                .unwrap()
+                .revision(),
+            2
+        );
+        assert_eq!(listener.as_mut().poll(&mut poll_context), Poll::Pending);
+        assert!(
+            runtime
+                .set_component_state_from_host(&root, "count", UiValue::Integer(7))
+                .unwrap()
+        );
+        assert_eq!(listener.as_mut().poll(&mut poll_context), Poll::Ready(()));
+    }
+
+    #[test]
+    fn rollback_quarantine_removes_only_the_rejected_root_effect_derivations() {
+        let mut runtime = UiRuntimeState::new();
+        let first = ComponentInstancePath::root("App", "first");
+        let second = ComponentInstancePath::root("App", "second");
+        for root in [&first, &second] {
+            runtime.ensure_component_incarnation(root);
+            runtime.effect_cascades.restart(root);
+            runtime
+                .effect_cascades
+                .register_generation(root, ScriptGeneration::default());
+        }
+        let owner = |runtime: &UiRuntimeState, root: &ComponentInstancePath, effect: bool| {
+            SemanticDispatchOwner {
+                source: Rc::new(SemanticDispatchSource {
+                    runtime_id: runtime.runtime_id,
+                    generation: ScriptGeneration::default(),
+                    component: root.clone(),
+                    incarnation: runtime.component_incarnation(root).unwrap(),
+                    effect: None,
+                    cascade: effect
+                        .then(|| runtime.effect_cascades.dispatch_token(root))
+                        .flatten(),
+                    publication_valid: Cell::new(true),
+                }),
+            }
+        };
+        let stale = owner(&runtime, &first, true);
+        runtime.pending_events = vec![
+            PendingEvent {
+                target: first.clone(),
+                event: UiEvent {
+                    name: "rejected".into(),
+                    payload: UiValue::Null,
+                },
+                origin: crate::InvocationOrigin::Effect,
+                owner: Some(stale.clone()),
+            },
+            PendingEvent {
+                target: first.clone(),
+                event: UiEvent {
+                    name: "external".into(),
+                    payload: UiValue::Null,
+                },
+                origin: crate::InvocationOrigin::Automation,
+                owner: Some(owner(&runtime, &first, false)),
+            },
+            PendingEvent {
+                target: second.clone(),
+                event: UiEvent {
+                    name: "other_root".into(),
+                    payload: UiValue::Null,
+                },
+                origin: crate::InvocationOrigin::Effect,
+                owner: Some(owner(&runtime, &second, true)),
+            },
+        ];
+        let checkpoint = runtime.begin_transaction().unwrap();
+        runtime.effect_cascades.charge(&first, 64).unwrap();
+        assert!(runtime.effect_cascades.charge(&first, 1).is_err());
+        runtime.rollback_transaction(checkpoint).unwrap();
+        assert!(!runtime.dispatch_owner_active(Some(&stale)));
+        let (_, first_events) = runtime.drain_window_dispatch(&first);
+        assert_eq!(
+            first_events
+                .iter()
+                .map(|event| event.event.name.as_str())
+                .collect::<Vec<_>>(),
+            ["external"]
+        );
+        assert!(runtime.has_window_pending_dispatch(&second));
+        let (_, second_events) = runtime.drain_window_dispatch(&second);
+        assert_eq!(
+            second_events
+                .iter()
+                .map(|event| event.event.name.as_str())
+                .collect::<Vec<_>>(),
+            ["other_root"]
+        );
+        runtime.effect_cascades.restart(&first);
+        assert!(
+            !runtime.dispatch_owner_active(Some(&stale)),
+            "a fresh external operation cannot revive an old epoch"
+        );
+    }
+
     fn mounted_context(phase: ExecutionPhase) -> UiContext {
         let path = ComponentInstancePath::root("Counter", "counter");
         let schema = ComponentStateSchema::new(BTreeMap::from([
@@ -4299,10 +5892,100 @@ mod tests {
             BTreeMap::from([(
                 "change".to_owned(),
                 EventSchema {
+                    doc: None,
                     payload: ValueSchema::integer(),
                 },
             )]),
         )
+    }
+
+    #[test]
+    fn theme_variant_reads_the_resolved_selection() {
+        let context = mounted_context(ExecutionPhase::Event);
+        // No theme manager installed: the read is (), not an error.
+        assert!(context.resolved_theme_variant().is_none());
+        assert_eq!(context.resolved_theme_selection(), None);
+
+        let engine = RuntimeEngine::new();
+        let dark = crate::load_theme_source(
+            engine.engine(),
+            "default_dark.rhai",
+            include_str!("../../../registry/themes/default_dark.rhai"),
+        )
+        .unwrap();
+        let mut light = dark.clone();
+        light.name = "Light".to_owned();
+        light.mode = crate::ThemeMode::Light;
+        let manager = crate::ThemeManager::from_variants(
+            [dark, light],
+            crate::ThemeSelection::new("Default".to_owned(), "Dark".to_owned()),
+        )
+        .unwrap();
+        context.runtime.borrow_mut().theme = Some(manager);
+
+        let variant = context.resolved_theme_variant().expect("resolves");
+        assert_eq!(variant.mode, crate::ThemeMode::Dark);
+        assert_eq!(
+            context.resolved_theme_selection(),
+            Some(ThemeSelection::new("Default", "Dark"))
+        );
+    }
+
+    #[test]
+    fn first_native_appearance_replaces_dark_fallback_and_invalidates_render_readers_once() {
+        let context = mounted_context(ExecutionPhase::Render);
+        let engine = RuntimeEngine::new();
+        let dark = crate::load_theme_source(
+            engine.engine(),
+            "dark",
+            include_str!("../../../registry/themes/default_dark.rhai"),
+        )
+        .unwrap();
+        let light = crate::load_theme_source(
+            engine.engine(),
+            "light",
+            include_str!("../../../registry/themes/default_light.rhai"),
+        )
+        .unwrap();
+        let mut manager = crate::ThemeManager::from_variants(
+            [dark, light],
+            ThemeSelection::new("Default", "Dark"),
+        )
+        .unwrap();
+        manager
+            .set_app(ThemePreference::System {
+                family: "Default".into(),
+            })
+            .unwrap();
+        context.runtime.borrow_mut().theme = Some(manager);
+        assert_eq!(
+            context.resolved_theme_variant().unwrap().mode,
+            crate::ThemeMode::Dark
+        );
+        {
+            let mut runtime = context.runtime.borrow_mut();
+            runtime.dirty.clear();
+            assert!(runtime.update_window_appearance("main", crate::SystemAppearance::Light));
+            assert_eq!(
+                runtime.dirty,
+                BTreeSet::from([context.component_path().clone()])
+            );
+            runtime.dirty.clear();
+            assert!(!runtime.update_window_appearance("main", crate::SystemAppearance::Light));
+            assert!(runtime.dirty.is_empty());
+        }
+        assert_eq!(
+            context.resolved_theme_variant().unwrap().mode,
+            crate::ThemeMode::Light
+        );
+        context
+            .runtime
+            .borrow_mut()
+            .update_window_appearance("main", crate::SystemAppearance::Dark);
+        assert_eq!(
+            context.resolved_theme_variant().unwrap().mode,
+            crate::ThemeMode::Dark
+        );
     }
 
     #[test]
@@ -4318,6 +6001,167 @@ mod tests {
         );
         assert!(context.get_signal(&signal).is_err());
         assert!(!context.component_render_is_reusable());
+    }
+
+    #[test]
+    fn image_decodes_are_new_async_work_and_never_start_while_suspending() {
+        for phase in [ExecutionPhase::Suspend, ExecutionPhase::Dispose] {
+            assert!(
+                matches!(
+                    mounted_context(phase).start_image_decode(
+                        &AssetId::parse("app/avatar").unwrap(),
+                        FnPtr::new("loaded").unwrap(),
+                        FnPtr::new("failed").unwrap(),
+                    ),
+                    Err(UiContextError::AsyncDuringSuspend)
+                ),
+                "{phase:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn async_handles_cancel_only_from_the_component_that_owns_them() {
+        let mut engine = RuntimeEngine::new();
+        let compiled = engine
+            .compile(
+                "fn view() { text(\"owner\") } fn done(ctx, value) {} fn failed(ctx, error) {}",
+            )
+            .unwrap();
+        let generation = compiled.generation();
+        let callback = |name| engine.callback(&compiled, name).unwrap();
+        let owner = ComponentInstancePath::root("View", "main").child("Owner", "owner");
+        let other = ComponentInstancePath::root("View", "main").child("Other", "other");
+        let mut state = UiRuntimeState::new();
+        let spawn = |state: &mut UiRuntimeState, scope| {
+            state
+                .tasks
+                .spawn(
+                    scope,
+                    generation,
+                    callback("done"),
+                    callback("failed"),
+                    ValueSchema::Null,
+                    || Ok(UiValue::Null),
+                )
+                .unwrap()
+        };
+        let task = spawn(&mut state, AsyncScope::Component(owner.clone()));
+        let app_task = spawn(&mut state, AsyncScope::App);
+        let (subscription, _emitter) =
+            state.subscriptions.subscribe(SubscriptionRegistration::new(
+                "watch",
+                AsyncScope::Effect {
+                    component: owner.clone(),
+                    key: "watch".into(),
+                    activation: 1,
+                },
+                generation,
+                callback("done"),
+                callback("failed"),
+                ValueSchema::integer(),
+            ));
+        let runtime = Rc::new(RefCell::new(state));
+        let context = |component: &ComponentInstancePath| {
+            UiContext::new(
+                Rc::clone(&runtime),
+                component.clone(),
+                Some("main".to_owned()),
+                ExecutionPhase::Event,
+                BTreeMap::new(),
+            )
+        };
+
+        let foreign = context(&other);
+        assert!(matches!(
+            foreign.cancel_task(task),
+            Err(UiContextError::ForeignAsyncHandle { owner: found }) if found == owner
+        ));
+        assert!(matches!(
+            foreign.cancel_subscription(subscription),
+            Err(UiContextError::ForeignAsyncHandle { owner: found }) if found == owner
+        ));
+        assert!(
+            foreign.cancel_task(app_task).unwrap(),
+            "app-scoped work has no component owner"
+        );
+        let own = context(&owner);
+        assert!(own.cancel_task(task).unwrap());
+        assert!(own.cancel_subscription(subscription).unwrap());
+        assert!(
+            !foreign.cancel_task(task).unwrap(),
+            "a finished handle is no longer anyone's"
+        );
+    }
+
+    #[test]
+    fn only_render_reads_subscribe_to_stores_and_locale() {
+        let engine = Engine::new();
+        let en = crate::load_locale_source(
+            &engine,
+            "en.rhai",
+            include_str!("../../../registry/locales/en.rhai"),
+        )
+        .unwrap();
+        let zh = crate::load_locale_source(
+            &engine,
+            "zh_cn.rhai",
+            include_str!("../../../registry/locales/zh_cn.rhai"),
+        )
+        .unwrap();
+        let mut state = UiRuntimeState::new();
+        state.locale = Some(LocaleManager::new([en, zh], "en", "en").unwrap());
+        state.windows.register_open("main").unwrap();
+        for store in [StoreId::app("data"), StoreId::window("main", "data")] {
+            state
+                .stores
+                .declare(
+                    store,
+                    ComponentStateSchema::new(BTreeMap::from([(
+                        "count".to_owned(),
+                        StateField::new(ValueSchema::integer(), UiValue::Integer(0)),
+                    )]))
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        let runtime = Rc::new(RefCell::new(state));
+        let reader = ComponentInstancePath::root("View", "main").child("Reader", "reader");
+        let writer = ComponentInstancePath::root("View", "main").child("Writer", "writer");
+        let context = |component: &ComponentInstancePath, phase| {
+            UiContext::new(
+                Rc::clone(&runtime),
+                component.clone(),
+                Some("main".to_owned()),
+                phase,
+                BTreeMap::new(),
+            )
+        };
+        let read_everything = |context: &UiContext| {
+            context.get_app_store("data", "count").unwrap();
+            context.get_window_store("data", "count").unwrap();
+            context.text("common.loading").unwrap();
+        };
+        let write_everything = |value: i64, locale: &str| {
+            let writer = context(&writer, ExecutionPhase::Event);
+            writer
+                .set_app_store("data", "count", Dynamic::from(value))
+                .unwrap();
+            writer
+                .set_window_store("data", "count", Dynamic::from(value))
+                .unwrap();
+            writer.set_locale(locale).unwrap();
+            runtime.borrow_mut().drain_batch().dirty
+        };
+
+        read_everything(&context(&reader, ExecutionPhase::Event));
+        assert!(
+            !write_everything(1, "zh-CN").contains(&reader),
+            "a callback read is no dependency"
+        );
+
+        read_everything(&context(&reader, ExecutionPhase::Render));
+        assert!(write_everything(2, "en").contains(&reader));
     }
 
     #[test]
@@ -4395,7 +6239,7 @@ mod tests {
             ExecutionPhase::Render,
             BTreeMap::new(),
         );
-        assert!(!render_context.text("common.loading").unwrap().is_empty());
+        assert_ne!(render_context.text("common.loading").unwrap(), "");
         assert_eq!(render_context.viewport_class().unwrap(), "compact");
         let event = UiContext::new(
             Rc::clone(&runtime),
@@ -4471,6 +6315,7 @@ mod tests {
             BTreeMap::from([(
                 "change".to_owned(),
                 EventSchema {
+                    doc: None,
                     payload: ValueSchema::string(),
                 },
             )]),
@@ -4522,6 +6367,70 @@ mod tests {
             .invoke_callback(&compiled, &callback, (context.clone(),))
             .unwrap();
         assert_eq!(context.get_state("count").unwrap(), UiValue::Integer(1));
+    }
+
+    #[test]
+    fn structural_store_paths_invalidate_executable_owner_not_synthetic_scope() {
+        for window_store in [false, true] {
+            let runtime = Rc::new(RefCell::new(UiRuntimeState::new()));
+            let owner = ComponentInstancePath::root("Panel", "paths");
+            let store = if window_store {
+                StoreId::window("main", "data")
+            } else {
+                StoreId::app("data")
+            };
+            runtime
+                .borrow_mut()
+                .stores
+                .declare(
+                    store,
+                    ComponentStateSchema::new(BTreeMap::from([(
+                        "model".into(),
+                        StateField::new(
+                            ValueSchema::UiValue,
+                            UiValue::Map(BTreeMap::from([
+                                ("label".into(), UiValue::String("before".into())),
+                                ("sibling".into(), UiValue::String("untouched".into())),
+                            ])),
+                        ),
+                    )]))
+                    .unwrap(),
+                )
+                .unwrap();
+            let render = UiContext::new(
+                Rc::clone(&runtime),
+                owner.clone(),
+                Some("main".into()),
+                ExecutionPhase::Render,
+                BTreeMap::new(),
+            );
+            let structural = render
+                .for_structural_scope(owner.child("VirtualCollection", "rows"), BTreeMap::new());
+            let label = UiValuePath::new(vec![UiValuePathSegment::Key("label".into())]).unwrap();
+            let sibling =
+                UiValuePath::new(vec![UiValuePathSegment::Key("sibling".into())]).unwrap();
+            let value = if window_store {
+                structural.get_window_store_path("data", "model", &label)
+            } else {
+                structural.get_app_store_path("data", "model", &label)
+            }
+            .unwrap();
+            assert_eq!(value, UiValue::String("before".into()));
+            let mut event = render.clone();
+            event.phase = ExecutionPhase::Event;
+            let write = |path: &UiValuePath| {
+                if window_store {
+                    event.set_window_store_path("data", "model", path, Dynamic::from("after"))
+                } else {
+                    event.set_app_store_path("data", "model", path, Dynamic::from("after"))
+                }
+                .unwrap();
+            };
+            write(&sibling);
+            assert!(runtime.borrow().dirty.is_empty());
+            write(&label);
+            assert_eq!(runtime.borrow().dirty, BTreeSet::from([owner]));
+        }
     }
 
     #[test]
@@ -4670,6 +6579,33 @@ mod tests {
             state.theme.as_ref().unwrap().app_preference(),
             ThemePreference::System { family } if family == "Default"
         ));
+    }
+
+    #[test]
+    fn scroll_offsets_take_integers_and_floats() {
+        let mut engine = Engine::new();
+        register_ui_context_api(&mut engine);
+        let mut scope = rhai::Scope::new();
+        scope.push("ctx", mounted_context(ExecutionPhase::Event));
+        for script in [
+            r#"ctx.scroll_to("missing", 0, 0)"#,
+            r#"ctx.scroll_to("missing", 0, 12.5)"#,
+        ] {
+            let error = engine
+                .eval_with_scope::<()>(&mut scope, script)
+                .unwrap_err();
+            assert!(
+                !matches!(*error, EvalAltResult::ErrorFunctionNotFound(..)),
+                "{script}: {error}"
+            );
+        }
+        let error = engine
+            .eval_with_scope::<()>(&mut scope, r#"ctx.scroll_to("missing", "0", 0)"#)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("scroll offset must be a number"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -4845,13 +6781,13 @@ mod tests {
         });
         sender.send(UiValue::Integer(1)).unwrap();
         sender.send(UiValue::Integer(2)).unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let deadline = web_time::Instant::now() + Duration::from_secs(1);
         let first = loop {
             let values = subscriptions.drain(generation);
             if !values.is_empty() {
                 break values;
             }
-            assert!(std::time::Instant::now() < deadline);
+            assert!(web_time::Instant::now() < deadline);
             std::thread::yield_now();
         };
         assert_eq!(first[0].payload, UiValue::Integer(1));
@@ -4860,7 +6796,7 @@ mod tests {
             if !values.is_empty() {
                 break values;
             }
-            assert!(std::time::Instant::now() < deadline);
+            assert!(web_time::Instant::now() < deadline);
             std::thread::yield_now();
         };
         assert_eq!(second[0].payload, UiValue::Integer(2));
@@ -4956,7 +6892,7 @@ mod tests {
 
     #[test]
     fn window_release_uses_segment_boundaries_and_clears_suspend_tombstones() {
-        let now = std::time::Instant::now();
+        let now = web_time::Instant::now();
         let transition = || {
             let mut spec =
                 crate::MotionTransition::new(crate::MotionProperty::Opacity, 0.0, 1.0, 1_000);
@@ -5018,7 +6954,7 @@ mod tests {
     #[test]
     fn timeline_handles_cannot_cross_view_contexts() {
         let runtime = Rc::new(RefCell::new(UiRuntimeState::new()));
-        let now = std::time::Instant::now();
+        let now = web_time::Instant::now();
         let mut transition =
             crate::MotionTransition::new(crate::MotionProperty::Opacity, 0.0, 1.0, 1_000);
         transition.easing = crate::MotionEasing::Linear;
@@ -5056,6 +6992,103 @@ mod tests {
             runtime.borrow().motions.timeline_state(&handle),
             Some(crate::MotionPlaybackState::Playing)
         );
+    }
+
+    #[test]
+    fn element_size_is_a_pending_size_only_read_for_both_script_overloads() {
+        let context = mounted_context(ExecutionPhase::Render);
+        let owner = context.component_path().clone();
+        let reference =
+            crate::ElementRef::new(crate::ElementRefId::new(owner.clone(), "field").unwrap());
+        let mut engine = Engine::new();
+        register_ui_context_api(&mut engine);
+        let mut scope = rhai::Scope::new();
+        scope.push("ctx", context.clone());
+        scope.push("reference", reference.clone());
+        let read_script = |scope: &mut rhai::Scope<'_>| {
+            engine
+                .eval_with_scope::<rhai::Array>(
+                    scope,
+                    r#"[ctx.element_size(reference), ctx.element_size("field")]"#,
+                )
+                .unwrap()
+        };
+        let pending = read_script(&mut scope);
+        assert!(pending.iter().all(Dynamic::is_unit));
+        let mut tree = crate::RetainedUiTree::new();
+        tree.reconcile(crate::UiNode::text("field")).unwrap();
+        let node = tree.root_id().unwrap();
+        let geometry = context.runtime().borrow().geometry_for(Some("main"));
+        {
+            let mut runtime = context.runtime().borrow_mut();
+            runtime
+                .element_refs
+                .reconcile(&owner, BTreeMap::from([(reference.id().clone(), node)]));
+            geometry.sync_ref_readers(&owner, runtime.element_refs.geometry_bindings(&owner));
+            assert_eq!(
+                runtime.element_refs.take_dirty(),
+                BTreeSet::from([owner.clone()])
+            );
+        }
+        let mut measured = crate::ElementGeometry {
+            layout: crate::GeometryBounds::new(10.0, 20.0, 120.0, 24.0).unwrap(),
+            visual: crate::GeometryBounds::new(10.0, 20.0, 240.0, 48.0).unwrap(),
+            clip: None,
+        };
+        geometry.update(node, measured);
+        assert_eq!(geometry.take_dirty(), BTreeSet::from([owner.clone()]));
+        let ready = read_script(&mut scope);
+        for value in ready {
+            let size = value.cast::<rhai::Map>();
+            assert_eq!(size.len(), 2);
+            assert!((size["width"].clone_cast::<rhai::FLOAT>() - 120.0).abs() < f64::EPSILON);
+            assert!((size["height"].clone_cast::<rhai::FLOAT>() - 24.0).abs() < f64::EPSILON);
+        }
+        measured.layout.x = 30.0;
+        measured.visual.height = 96.0;
+        geometry.update(node, measured);
+        assert!(geometry.take_dirty().is_empty());
+        measured.layout.width = 140.0;
+        geometry.update(node, measured);
+        assert_eq!(geometry.take_dirty(), BTreeSet::from([owner]));
+    }
+
+    #[test]
+    fn element_size_event_reads_are_untracked_and_missing_refs_return_null() {
+        let context = mounted_context(ExecutionPhase::Event);
+        let reference = crate::ElementRef::new(
+            crate::ElementRefId::new(context.component_path().clone(), "field").unwrap(),
+        );
+        assert_eq!(context.element_size(&reference).unwrap(), UiValue::Null);
+        assert_eq!(context.element_size_by_key("field").unwrap(), UiValue::Null);
+        assert!(context.element_size_by_key("").is_err());
+        let mut tree = crate::RetainedUiTree::new();
+        tree.reconcile(crate::UiNode::text("field")).unwrap();
+        let node = tree.root_id().unwrap();
+        context.runtime().borrow_mut().element_refs.reconcile(
+            context.component_path(),
+            BTreeMap::from([(reference.id().clone(), node)]),
+        );
+        assert!(
+            context
+                .runtime()
+                .borrow_mut()
+                .element_refs
+                .take_dirty()
+                .is_empty()
+        );
+        let geometry = context.runtime().borrow().geometry_for(Some("main"));
+        let mut measured = crate::ElementGeometry {
+            layout: crate::GeometryBounds::new(0.0, 0.0, 120.0, 24.0).unwrap(),
+            visual: crate::GeometryBounds::new(0.0, 0.0, 120.0, 24.0).unwrap(),
+            clip: None,
+        };
+        geometry.update(node, measured);
+        context.element_size(&reference).unwrap();
+        context.element_size_by_key("field").unwrap();
+        measured.layout.width = 140.0;
+        geometry.update(node, measured);
+        assert!(geometry.take_dirty().is_empty());
     }
 
     #[test]
@@ -5108,6 +7141,129 @@ mod tests {
                     && reveal_node == node
                     && (*x - 12.0).abs() < f64::EPSILON
                     && (*y - 24.0).abs() < f64::EPSILON
+        ));
+    }
+
+    #[test]
+    fn copy_text_is_user_activated_window_scoped_bounded_and_transactional() {
+        let context = mounted_context(ExecutionPhase::Event).with_view_id("view");
+        assert!(matches!(
+            context.copy_text("path".into()),
+            Err(UiContextError::ClipboardRequiresUserInput)
+        ));
+        for origin in [
+            crate::InvocationOrigin::UserInput {
+                event: "click".into(),
+            },
+            crate::InvocationOrigin::Automation,
+        ] {
+            context.runtime().borrow_mut().replace_origin(origin);
+            let checkpoint = context.runtime().borrow_mut().begin_transaction().unwrap();
+            context
+                .copy_text("payments/checkout/timeout_ms".into())
+                .unwrap();
+            context
+                .runtime()
+                .borrow_mut()
+                .rollback_transaction(checkpoint)
+                .unwrap();
+            assert_eq!(
+                context
+                    .runtime()
+                    .borrow_mut()
+                    .take_window_element_commands("main"),
+                []
+            );
+        }
+        context.copy_text("committed".into()).unwrap();
+        assert_eq!(
+            context
+                .runtime()
+                .borrow_mut()
+                .take_window_element_commands("other"),
+            []
+        );
+        assert!(
+            matches!(context.runtime().borrow_mut().take_window_element_commands("main").as_slice(),
+            [crate::element_ref::ElementCommand::CopyText { text, .. }] if text == "committed")
+        );
+        context
+            .runtime()
+            .borrow_mut()
+            .replace_origin(crate::InvocationOrigin::Timer {
+                started_by: Box::new(crate::InvocationOrigin::UserInput {
+                    event: "click".into(),
+                }),
+            });
+        assert!(context.copy_text("late".into()).is_err());
+        assert!(
+            mounted_context(ExecutionPhase::Render)
+                .with_view_id("view")
+                .copy_text("render".into())
+                .is_err()
+        );
+        assert!(
+            mounted_context(ExecutionPhase::Event)
+                .copy_text("unbound".into())
+                .is_err()
+        );
+        context
+            .runtime()
+            .borrow_mut()
+            .replace_origin(crate::InvocationOrigin::Automation);
+        assert!(context.copy_text("x".repeat(16 * 1024 * 1024 + 1)).is_err());
+    }
+
+    #[test]
+    fn host_motion_preference_changes_without_replacing_runtime_state() {
+        let mut runtime = UiRuntimeState::new();
+        runtime.motions = crate::MotionRuntime::new(crate::MotionPreference::Normal);
+        runtime.responsive.update_window("main", 480.0).unwrap();
+
+        assert!(!runtime.set_motion_preference_from_host(crate::MotionPreference::Normal));
+        assert!(runtime.set_motion_preference_from_host(crate::MotionPreference::Reduced));
+        assert_eq!(
+            runtime.motions.preference(),
+            crate::MotionPreference::Reduced
+        );
+        assert_eq!(
+            runtime.responsive.class("main"),
+            crate::ViewportClass::Compact
+        );
+        assert!(runtime.set_motion_preference_from_host(crate::MotionPreference::None));
+        assert_eq!(runtime.motions.preference(), crate::MotionPreference::None);
+    }
+
+    #[test]
+    fn host_can_register_a_new_native_collection_after_mount() {
+        let mut runtime = UiRuntimeState::new();
+        let root = ComponentInstancePath::root("View", "live");
+        assert!(
+            runtime
+                .native_collections
+                .read_tracked(&root, "live_rows")
+                .is_err()
+        );
+        let collection = crate::NativeCollection::new(
+            "id",
+            [BTreeMap::from([(
+                "id".to_owned(),
+                UiValue::String("row-1".to_owned()),
+            )])],
+        )
+        .unwrap();
+        runtime
+            .register_native_collection_from_host(&root, "live_rows", collection)
+            .unwrap();
+        assert!(runtime.has_window_dirty(&root));
+        assert!(matches!(
+            runtime.register_native_collection_from_host(
+                &root,
+                "live_rows",
+                crate::NativeCollection::new("id", std::iter::empty::<BTreeMap<String, UiValue>>())
+                    .unwrap(),
+            ),
+            Err(crate::NativeCollectionError::DuplicateCollection(_))
         ));
     }
 }

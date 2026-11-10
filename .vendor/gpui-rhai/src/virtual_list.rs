@@ -8,6 +8,86 @@ use thiserror::Error;
 
 use crate::{ComponentInstancePath, UiNode};
 
+/// Items a scroll that needs unrendered items renders beyond them, unless the
+/// collection or the Host sets `batch_items`.
+pub const DEFAULT_VIRTUAL_BATCH_ITEMS: usize = 16;
+/// Rendered items a collection keeps after they leave its realized range,
+/// unless the collection or the Host sets `retain_items`.
+pub const DEFAULT_VIRTUAL_RETAIN_ITEMS: usize = 200;
+/// Largest `overscan_items` a collection or the Host may set.
+pub const MAX_VIRTUAL_OVERSCAN_ITEMS: usize = 1_000;
+/// Largest `batch_items` a collection or the Host may set.
+pub const MAX_VIRTUAL_BATCH_ITEMS: usize = 1_000;
+/// Largest `retain_items` a collection or the Host may set.
+pub const MAX_VIRTUAL_RETAIN_ITEMS: usize = 10_000;
+
+/// Host defaults for how data-backed virtual collections render ahead and keep
+/// what they rendered. A collection's own setting takes precedence over these;
+/// a field left `None` falls back to the built-in value.
+///
+/// - `overscan_items`: items rendered beyond each edge of the viewport. `None`
+///   keeps each collection's own `overdraw_pixels`.
+/// - `batch_items`: when scrolling needs items that are not rendered yet, the
+///   number rendered beyond them in the same direction, so the following
+///   scroll steps need no new render. `None` is [`DEFAULT_VIRTUAL_BATCH_ITEMS`].
+/// - `retain_items`: rendered items kept after they leave the realized range,
+///   reused without running the renderer when they come back. The kept items
+///   are dropped when the collection renders again. `None` is
+///   [`DEFAULT_VIRTUAL_RETAIN_ITEMS`]; `Some(0)` keeps none.
+///
+/// Values above the `MAX_VIRTUAL_*` bounds are clamped, and a batch of zero
+/// renders only the needed items, like a batch of one.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct VirtualCollectionPolicy {
+    pub overscan_items: Option<usize>,
+    pub batch_items: Option<usize>,
+    pub retain_items: Option<usize>,
+}
+
+impl VirtualCollectionPolicy {
+    /// The policy with every value inside its bounds.
+    #[must_use]
+    pub fn clamped(self) -> Self {
+        Self {
+            overscan_items: self
+                .overscan_items
+                .map(|items| items.min(MAX_VIRTUAL_OVERSCAN_ITEMS)),
+            batch_items: self
+                .batch_items
+                .map(|items| items.clamp(1, MAX_VIRTUAL_BATCH_ITEMS)),
+            retain_items: self
+                .retain_items
+                .map(|items| items.min(MAX_VIRTUAL_RETAIN_ITEMS)),
+        }
+    }
+
+    /// The batch a collection uses: its own value, else this policy's, else the
+    /// built-in default.
+    #[must_use]
+    pub fn batch_for(self, own: Option<usize>) -> usize {
+        own.or(self.batch_items)
+            .unwrap_or(DEFAULT_VIRTUAL_BATCH_ITEMS)
+            .clamp(1, MAX_VIRTUAL_BATCH_ITEMS)
+    }
+
+    /// The number of kept items a collection uses, resolved like
+    /// [`Self::batch_for`].
+    #[must_use]
+    pub fn retain_for(self, own: Option<usize>) -> usize {
+        own.or(self.retain_items)
+            .unwrap_or(DEFAULT_VIRTUAL_RETAIN_ITEMS)
+            .min(MAX_VIRTUAL_RETAIN_ITEMS)
+    }
+
+    /// The overscan a collection uses, in items, or `None` to keep its own
+    /// `overdraw_pixels`.
+    #[must_use]
+    pub fn overscan_for(self, own: Option<usize>) -> Option<usize> {
+        own.or(self.overscan_items)
+            .map(|items| items.min(MAX_VIRTUAL_OVERSCAN_ITEMS))
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct VirtualCollectionId {
     pub component: ComponentInstancePath,
@@ -27,6 +107,9 @@ pub struct VirtualCollectionNodeSpec {
     pub overdraw_pixels: f64,
     pub bottom_align: bool,
     pub follow_tail: bool,
+    /// Low-frequency, scoped notification of the native follow state and new
+    /// keys received while reading away from the tail.
+    pub on_follow_change: Option<Box<crate::ScriptCallback>>,
     /// Stable data key to reveal when this controlled target changes.
     pub reveal_key: Option<String>,
     /// Item indices whose realized nodes act as top-pinned section headers.
@@ -34,15 +117,139 @@ pub struct VirtualCollectionNodeSpec {
     /// Presentation-only motion group inherited from a surrounding
     /// `motion_group`; applied to items realized after the initial render.
     pub inherited_motion_group: Option<String>,
+    /// The component instance that declared the inherited group.
+    pub inherited_motion_scope: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct VirtualRequestRegistry {
+    pub(crate) native_views: crate::virtual_list_element::NativeVirtualListRegistry,
     requests: Rc<RefCell<BTreeMap<VirtualCollectionId, BTreeSet<usize>>>>,
     metrics: Rc<RefCell<BTreeMap<VirtualCollectionId, VirtualCollectionMetrics>>>,
+    item_bounds: Rc<RefCell<BTreeMap<VirtualCollectionId, ItemBoundsReader>>>,
+    scrolls: Rc<RefCell<BTreeMap<VirtualCollectionId, VirtualCollectionScrollHandle>>>,
+    active: Rc<RefCell<BTreeSet<VirtualCollectionId>>>,
+    scroll_commands: Rc<RefCell<BTreeMap<VirtualCollectionId, Vec<CollectionScrollCommand>>>>,
+    wake: crate::async_runtime::AsyncWake,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum CollectionScrollCommand {
+    Start,
+    End,
+    By(f64),
+}
+
+/// The native follow state, not a second SDK follow state machine.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct VirtualCollectionFollowStatus {
+    pub following: bool,
+    pub unseen: usize,
+}
+
+impl VirtualCollectionFollowStatus {
+    #[must_use]
+    pub fn to_ui_value(self) -> crate::UiValue {
+        crate::UiValue::Map(BTreeMap::from([
+            ("following".to_owned(), crate::UiValue::Bool(self.following)),
+            (
+                "unseen".to_owned(),
+                crate::UiValue::Integer(i64::try_from(self.unseen).unwrap_or(i64::MAX)),
+            ),
+        ]))
+    }
+}
+
+/// A mounted collection's native scrolling capability. Commands notify its
+/// owning view; the handle is resolved by scoped ID immediately before use.
+#[derive(Clone)]
+pub struct VirtualCollectionScrollHandle {
+    pub(crate) state: gpui::ListState,
+    pub(crate) unseen: Rc<RefCell<BTreeSet<String>>>,
+    pub(crate) follow_tail: bool,
+    pub(crate) notify: gpui::EntityId,
+}
+
+impl std::fmt::Debug for VirtualCollectionScrollHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VirtualCollectionScrollHandle")
+            .field("status", &self.status())
+            .finish_non_exhaustive()
+    }
+}
+
+impl VirtualCollectionScrollHandle {
+    /// Whether this native source currently owns a thumb-drag height freeze.
+    #[must_use]
+    pub fn is_scrollbar_dragging(&self) -> bool {
+        self.state.is_scrollbar_dragging()
+    }
+    #[must_use]
+    pub fn status(&self) -> VirtualCollectionFollowStatus {
+        let following = self.state.is_following_tail();
+        VirtualCollectionFollowStatus {
+            following,
+            unseen: if following {
+                0
+            } else {
+                self.unseen.borrow().len()
+            },
+        }
+    }
+
+    pub fn scroll_to_end(&self, cx: &mut gpui::App) {
+        if self.follow_tail {
+            self.state.set_follow_mode(gpui::FollowMode::Tail);
+        }
+        self.state.scroll_to_end();
+        self.unseen.borrow_mut().clear();
+        cx.notify(self.notify);
+    }
+
+    pub fn scroll_to_start(&self, cx: &mut gpui::App) {
+        self.state.pause_following_tail();
+        self.state.scroll_to(gpui::ListOffset {
+            item_ix: 0,
+            offset_in_item: gpui::px(0.0),
+        });
+        cx.notify(self.notify);
+    }
+
+    pub fn pause_following(&self, cx: &mut gpui::App) {
+        self.state.pause_following_tail();
+        cx.notify(self.notify);
+    }
+
+    /// Scroll in logical pixels (positive toward the end). Native upward
+    /// scrolling pauses tail following, just like wheel input.
+    pub fn scroll_by(&self, distance: gpui::Pixels, cx: &mut gpui::App) {
+        // A bottom-aligned ListState represents its natural tail as an end
+        // anchor, not the visible viewport top. Its direct scroll_by starts
+        // from that end anchor. Use the native scrollbar-compatible offset so
+        // Page Up moves a full distance from what the reader actually sees.
+        let offset = self.state.scroll_px_offset_for_scrollbar();
+        let max = self.state.max_offset_for_scrollbar();
+        self.state.set_offset_from_scrollbar(gpui::point(
+            offset.x,
+            (offset.y - distance).clamp(-max.y, gpui::px(0.0)),
+        ));
+        cx.notify(self.notify);
+    }
+}
+
+/// Reads a mounted list's item bounds, in window coordinates, at call time.
+#[derive(Clone)]
+pub(crate) struct ItemBoundsReader(Rc<dyn Fn(usize) -> Option<crate::GeometryBounds>>);
+
+impl std::fmt::Debug for ItemBoundsReader {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ItemBoundsReader")
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::struct_excessive_bools)] // Independent inspected policies and native state, not a state machine.
 pub struct VirtualCollectionMetrics {
     pub id: VirtualCollectionId,
     pub item_count: usize,
@@ -58,6 +265,8 @@ pub struct VirtualCollectionMetrics {
     pub sticky_header: Option<usize>,
     pub bottom_align: bool,
     pub follow_tail: bool,
+    pub is_following_tail: bool,
+    pub unseen_count: usize,
 }
 
 impl VirtualCollectionMetrics {
@@ -77,17 +286,33 @@ impl VirtualCollectionMetrics {
             sticky_header: None,
             bottom_align: false,
             follow_tail: false,
+            is_following_tail: false,
+            unseen_count: 0,
         }
     }
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct VirtualRequestSnapshot {
+    native_views: crate::virtual_list_element::NativeVirtualListSnapshot,
     requests: BTreeMap<VirtualCollectionId, BTreeSet<usize>>,
     metrics: BTreeMap<VirtualCollectionId, VirtualCollectionMetrics>,
+    item_bounds: BTreeMap<VirtualCollectionId, ItemBoundsReader>,
+    scrolls: BTreeMap<VirtualCollectionId, VirtualCollectionScrollHandle>,
+    active: BTreeSet<VirtualCollectionId>,
+    scroll_commands: BTreeMap<VirtualCollectionId, Vec<CollectionScrollCommand>>,
 }
 
 impl VirtualRequestRegistry {
+    /// Retained native render runtimes can access the lifecycle's collection
+    /// entities but must not extend their lifetime or own themselves indirectly.
+    pub(crate) fn native_access(&self) -> Self {
+        Self {
+            native_views: self.native_views.downgrade(),
+            ..self.clone()
+        }
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -115,6 +340,7 @@ impl VirtualRequestRegistry {
                     ..metrics.requested_range.end.max(new_range.end)
             };
         }
+        self.wake.notify();
     }
 
     /// Replace one collection's pending request with a complete atomic target.
@@ -138,6 +364,7 @@ impl VirtualRequestRegistry {
             .or_insert_with(|| VirtualCollectionMetrics::new(id));
         metrics.requested_count = requested_count;
         metrics.requested_range = requested_range;
+        self.wake.notify();
     }
 
     pub(crate) fn clear_target(&self, id: &VirtualCollectionId) {
@@ -170,25 +397,176 @@ impl VirtualRequestRegistry {
         requests
     }
 
+    pub(crate) fn wake(&self) -> crate::async_runtime::AsyncWake {
+        self.wake.clone()
+    }
+
     pub(crate) fn snapshot(&self) -> VirtualRequestSnapshot {
         VirtualRequestSnapshot {
+            native_views: self.native_views.snapshot(),
             requests: self.requests.borrow().clone(),
             metrics: self.metrics.borrow().clone(),
+            item_bounds: self.item_bounds.borrow().clone(),
+            scrolls: self.scrolls.borrow().clone(),
+            active: self.active.borrow().clone(),
+            scroll_commands: self.scroll_commands.borrow().clone(),
         }
     }
 
     pub(crate) fn restore(&self, snapshot: VirtualRequestSnapshot) {
+        self.native_views.restore(snapshot.native_views);
         *self.requests.borrow_mut() = snapshot.requests;
         *self.metrics.borrow_mut() = snapshot.metrics;
+        *self.item_bounds.borrow_mut() = snapshot.item_bounds;
+        *self.scrolls.borrow_mut() = snapshot.scrolls;
+        *self.active.borrow_mut() = snapshot.active;
+        *self.scroll_commands.borrow_mut() = snapshot.scroll_commands;
     }
 
-    pub(crate) fn retain(&self, active: &BTreeSet<VirtualCollectionId>) {
+    /// Keeps the collections of `root` that are in `active`, and leaves every
+    /// other scope's collections alone: views and windows sharing this runtime
+    /// commit independently.
+    pub(crate) fn retain_within(
+        &self,
+        root: &ComponentInstancePath,
+        active: &BTreeSet<VirtualCollectionId>,
+    ) {
+        let keep = |id: &VirtualCollectionId| !id.component.is_within(root) || active.contains(id);
+        {
+            let mut current = self.active.borrow_mut();
+            current.retain(|id| !id.component.is_within(root));
+            current.extend(
+                active
+                    .iter()
+                    .filter(|id| id.component.is_within(root))
+                    .cloned(),
+            );
+        }
+        self.scroll_commands.borrow_mut().retain(|id, _| keep(id));
+        self.requests.borrow_mut().retain(|id, _| keep(id));
+        self.metrics.borrow_mut().retain(|id, _| keep(id));
+        self.item_bounds.borrow_mut().retain(|id, _| keep(id));
+        self.scrolls.borrow_mut().retain(|id, _| keep(id));
+    }
+
+    pub(crate) fn release_scope(&self, root: &ComponentInstancePath) {
+        self.native_views.release_scope(root);
+        self.active
+            .borrow_mut()
+            .retain(|id| !id.component.is_within(root));
         self.requests
             .borrow_mut()
-            .retain(|id, _| active.contains(id));
+            .retain(|id, _| !id.component.is_within(root));
         self.metrics
             .borrow_mut()
-            .retain(|id, _| active.contains(id));
+            .retain(|id, _| !id.component.is_within(root));
+        self.item_bounds
+            .borrow_mut()
+            .retain(|id, _| !id.component.is_within(root));
+        self.scrolls
+            .borrow_mut()
+            .retain(|id, _| !id.component.is_within(root));
+        self.scroll_commands
+            .borrow_mut()
+            .retain(|id, _| !id.component.is_within(root));
+    }
+
+    pub(crate) fn queue_scroll(&self, id: VirtualCollectionId, command: CollectionScrollCommand) {
+        if self.active.borrow().contains(&id) {
+            self.scroll_commands
+                .borrow_mut()
+                .entry(id)
+                .or_default()
+                .push(command);
+        }
+    }
+
+    pub(crate) fn take_scroll_commands(
+        &self,
+        id: &VirtualCollectionId,
+    ) -> Vec<CollectionScrollCommand> {
+        self.scroll_commands
+            .borrow_mut()
+            .remove(id)
+            .unwrap_or_default()
+    }
+
+    /// Resolve a currently mounted collection by its full component-local ID.
+    /// A missing or unmounted collection has no scroll capability.
+    #[must_use]
+    pub fn scroll_handle(&self, id: &VirtualCollectionId) -> Option<VirtualCollectionScrollHandle> {
+        self.scrolls.borrow().get(id).cloned()
+    }
+
+    pub(crate) fn set_scroll_handle(
+        &self,
+        id: VirtualCollectionId,
+        handle: VirtualCollectionScrollHandle,
+    ) {
+        self.scrolls.borrow_mut().insert(id, handle);
+    }
+
+    pub(crate) fn remove_scroll_handle(
+        &self,
+        id: &VirtualCollectionId,
+        unseen: &Rc<RefCell<BTreeSet<String>>>,
+    ) {
+        let mut scrolls = self.scrolls.borrow_mut();
+        if scrolls
+            .get(id)
+            .is_some_and(|handle| Rc::ptr_eq(&handle.unseen, unseen))
+        {
+            scrolls.remove(id);
+        }
+    }
+
+    pub(crate) fn report_follow(
+        &self,
+        id: &VirtualCollectionId,
+        status: VirtualCollectionFollowStatus,
+    ) {
+        let mut metrics = self.metrics.borrow_mut();
+        let metrics = metrics
+            .entry(id.clone())
+            .or_insert_with(|| VirtualCollectionMetrics::new(id.clone()));
+        metrics.is_following_tail = status.following;
+        metrics.unseen_count = status.unseen;
+    }
+
+    /// Install the reader of a mounted list; the list removes it when it is
+    /// dropped (the reader holds the list's state).
+    pub(crate) fn set_item_bounds_reader(
+        &self,
+        id: VirtualCollectionId,
+        read: impl Fn(usize) -> Option<crate::GeometryBounds> + 'static,
+    ) -> ItemBoundsReader {
+        let reader = ItemBoundsReader(Rc::new(read));
+        self.item_bounds.borrow_mut().insert(id, reader.clone());
+        reader
+    }
+
+    pub(crate) fn remove_item_bounds_reader(
+        &self,
+        id: &VirtualCollectionId,
+        reader: &ItemBoundsReader,
+    ) {
+        let mut readers = self.item_bounds.borrow_mut();
+        if readers
+            .get(id)
+            .is_some_and(|current| Rc::ptr_eq(&current.0, &reader.0))
+        {
+            readers.remove(id);
+        }
+    }
+
+    /// The window bounds of a laid-out item of a mounted collection.
+    pub(crate) fn item_bounds(
+        &self,
+        id: &VirtualCollectionId,
+        index: usize,
+    ) -> Option<crate::GeometryBounds> {
+        let reader = self.item_bounds.borrow().get(id).cloned()?;
+        (reader.0)(index)
     }
 
     pub(crate) fn report_frame(
@@ -450,7 +828,7 @@ impl FenwickTree {
         let mut cursor = index + 1;
         while cursor < self.tree.len() {
             self.tree[cursor] += delta;
-            cursor += cursor & cursor.wrapping_neg();
+            cursor += cursor.isolate_lowest_one();
         }
     }
 
@@ -539,6 +917,27 @@ mod tests {
     }
 
     #[test]
+    fn a_policy_resolves_a_collection_setting_then_its_own_then_the_built_in() {
+        let host = VirtualCollectionPolicy {
+            overscan_items: Some(5_000),
+            batch_items: Some(0),
+            retain_items: Some(99_999),
+        }
+        .clamped();
+        assert_eq!(host.overscan_items, Some(MAX_VIRTUAL_OVERSCAN_ITEMS));
+        assert_eq!(host.batch_items, Some(1));
+        assert_eq!(host.retain_items, Some(MAX_VIRTUAL_RETAIN_ITEMS));
+        assert_eq!(host.batch_for(Some(4)), 4);
+        assert_eq!(host.batch_for(None), 1);
+        let unset = VirtualCollectionPolicy::default();
+        assert_eq!(unset.batch_for(None), DEFAULT_VIRTUAL_BATCH_ITEMS);
+        assert_eq!(unset.retain_for(None), DEFAULT_VIRTUAL_RETAIN_ITEMS);
+        assert_eq!(unset.retain_for(Some(0)), 0);
+        assert_eq!(unset.overscan_for(None), None);
+        assert_eq!(unset.overscan_for(Some(3)), Some(3));
+    }
+
+    #[test]
     fn virtual_collection_metrics_track_frame_scroll_requests_and_rollback() {
         let id = VirtualCollectionId {
             component: ComponentInstancePath::root("Chat", "main"),
@@ -560,9 +959,11 @@ mod tests {
             overdraw_pixels: 48.0,
             bottom_align: true,
             follow_tail: true,
+            on_follow_change: None,
             reveal_key: None,
             sticky_headers: Arc::new(BTreeSet::new()),
             inherited_motion_group: None,
+            inherited_motion_scope: None,
         };
         let registry = VirtualRequestRegistry::new();
         registry.report_frame(&spec, 120.0, 1, 3.5, Some(1..3));
@@ -580,7 +981,81 @@ mod tests {
         assert_eq!(registry.inspect()[0].requested_count, 0);
         registry.restore(snapshot);
         assert_eq!(registry.inspect()[0].requested_count, 2);
-        registry.retain(&BTreeSet::new());
-        assert!(registry.inspect().is_empty());
+        registry.retain_within(&id.component, &BTreeSet::new());
+        assert_eq!(
+            registry.inspect(),
+            [] as [crate::virtual_list::VirtualCollectionMetrics; 0]
+        );
+    }
+
+    #[test]
+    fn retaining_one_scope_leaves_the_other_scopes_collections() {
+        let ours = VirtualCollectionId {
+            component: ComponentInstancePath::root("View", "main"),
+            key: "rows".to_owned(),
+        };
+        let theirs = VirtualCollectionId {
+            component: ComponentInstancePath::root("View", "window"),
+            key: "rows".to_owned(),
+        };
+        let registry = VirtualRequestRegistry::new();
+        registry.retain_within(&theirs.component, &BTreeSet::from([theirs.clone()]));
+        registry.retain_within(&ours.component, &BTreeSet::from([ours.clone()]));
+        registry.request(ours.clone(), [1]);
+        registry.request(theirs.clone(), [2]);
+        registry.report_scroll(&theirs, 0..3, true);
+        registry.queue_scroll(theirs.clone(), CollectionScrollCommand::End);
+
+        // Our scope commits without its collection: only ours goes.
+        registry.retain_within(&ours.component, &BTreeSet::new());
+        assert_eq!(
+            registry.drain(),
+            BTreeMap::from([(theirs.clone(), BTreeSet::from([2]))])
+        );
+        let metrics = registry.inspect();
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].id, theirs);
+        assert!(metrics[0].is_scrolled);
+        assert!(matches!(
+            registry.take_scroll_commands(&theirs)[..],
+            [CollectionScrollCommand::End]
+        ));
+        // Their collection is still active, ours is not.
+        registry.queue_scroll(ours.clone(), CollectionScrollCommand::End);
+        assert!(registry.take_scroll_commands(&ours).is_empty());
+    }
+
+    #[test]
+    fn rollback_restores_native_capabilities_pruned_by_a_failed_candidate() {
+        let id = VirtualCollectionId {
+            component: ComponentInstancePath::root("Reader", "main"),
+            key: "history".to_owned(),
+        };
+        let registry = VirtualRequestRegistry::new();
+        registry.retain_within(&id.component, &BTreeSet::from([id.clone()]));
+        let unseen = Rc::new(RefCell::new(BTreeSet::from(["appended".to_owned()])));
+        let state = gpui::ListState::new(10, gpui::ListAlignment::Top, gpui::px(1.0));
+        registry.set_scroll_handle(
+            id.clone(),
+            VirtualCollectionScrollHandle {
+                state,
+                unseen: unseen.clone(),
+                follow_tail: true,
+                notify: gpui::EntityId::from(1),
+            },
+        );
+        let bounds = crate::GeometryBounds::new(0.0, 12.0, 100.0, 32.0).unwrap();
+        registry.set_item_bounds_reader(id.clone(), move |_| Some(bounds));
+        let snapshot = registry.snapshot();
+        registry.retain_within(&id.component, &BTreeSet::new());
+        assert!(registry.scroll_handle(&id).is_none());
+        assert!(registry.item_bounds(&id, 0).is_none());
+
+        registry.restore(snapshot);
+        let restored = registry.scroll_handle(&id).unwrap();
+        assert!(Rc::ptr_eq(&restored.unseen, &unseen));
+        assert_eq!(registry.item_bounds(&id, 0), Some(bounds));
+        registry.queue_scroll(id.clone(), CollectionScrollCommand::Start);
+        assert_eq!(registry.take_scroll_commands(&id).len(), 1);
     }
 }

@@ -32,7 +32,8 @@
 use crate::inbox::Inbox;
 use crate::plan::{Plan, PlanState};
 use nanobot_llm::{BlockAssembler, LlmRequest, LlmRuntime, Message, ToolDefinition};
-use nanobot_session::{Session, SessionEvent, TurnEndReason};
+use nanobot_session::{ProjectedMessage, Session, SessionEvent, TurnEndReason, derive_messages};
+use nanobot_telemetry::{NoopTelemetryContext, SpanKind, SpanOptions, TelemetryContext};
 use nanobot_tools::ToolPipeline;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -180,6 +181,22 @@ pub enum AgentState {
     Cancelled,
 }
 
+/// What happened when a crash-interrupted call was replayed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReplayOutcome {
+    /// The call ran again. `success` is what the tool reported.
+    Replayed {
+        /// Whether the tool reported success.
+        success: bool,
+        /// The tool's reply.
+        output: String,
+    },
+    /// The call could not be replayed (no executor, or the pipeline refused
+    /// it). Its outcome is recorded as unknown so the session is still a valid
+    /// turn.
+    Unknown,
+}
+
 /// The agent handle: primary interface for driving the agent loop.
 ///
 /// `Agent` is `Clone` (Arc internals). It is `Send + Sync`.
@@ -187,6 +204,9 @@ pub enum AgentState {
 pub struct Agent {
     inner: Arc<AgentInner>,
 }
+
+/// The `prompt/assemble` bridge: system prompt in, assembled system prompt out.
+type PromptAssembler = Arc<dyn Fn(String) -> String + Send + Sync>;
 
 struct AgentInner {
     session: Session,
@@ -206,16 +226,147 @@ struct AgentInner {
     /// Hook the app layer uses to run the `prompt/assemble` waterfall, so
     /// skills can append their persona sections (design-harness 14.2). The
     /// agent stays free of any plugin type.
-    prompt_assembler: Mutex<Option<Arc<dyn Fn(String) -> String + Send + Sync>>>,
+    prompt_assembler: Mutex<Option<PromptAssembler>>,
+    /// The product's standing instructions (the persona section of the system
+    /// prompt). Absent -> [`PERSONA`], the built-in default. A product sets
+    /// this so the framework carries no domain identity of its own.
+    persona: Mutex<Option<String>>,
+    /// The wire model id sent to the provider and recorded on `RequestHeader`.
+    /// Absent -> `"default"`, which is also the adapter key: a product that
+    /// talks to a real provider sets the real id so the record is truthful and
+    /// the accounting can be attributed.
+    model: Mutex<Option<String>>,
     /// The product's plan grader: grades the declared intent against the
     /// post-execution state (design-harness 14.3). Absent -> a plan with an
     /// intent passes (nothing to check against).
     plan_verifier: Mutex<Option<Arc<dyn PlanVerifier>>>,
-    /// The model identifier sent on every request. The default (`"default"`)
-    /// matches the provider key the runtime is registered under, which is
-    /// what a proxy that ignores the field expects; a real provider needs
-    /// the concrete model name, so [`Agent::set_model`] overrides it.
-    model: Mutex<String>,
+    /// The telemetry context the loop emits its spans through. The default
+    /// records nothing, so instrumentation stays a *choice*: the kernel never
+    /// drags a tracing backend into a consumer that did not ask for one.
+    telemetry: Mutex<Arc<dyn TelemetryContext>>,
+    /// The projected history above which the older turns are compacted.
+    ///
+    /// The projected history is what the model's context window sees, and a
+    /// long negotiation grows it without bound. `0` disables compaction.
+    compaction_threshold: Mutex<usize>,
+}
+
+/// The model id the agent uses when the product sets none: the
+/// [`nanobot_llm::DEFAULT_PROVIDER`] adapter key, so a harness that registers
+/// one adapter under `"default"` keeps working without a catalog.
+const DEFAULT_MODEL: &str = nanobot_llm::DEFAULT_PROVIDER;
+
+/// The log position of the first event of the earliest turn to keep.
+///
+/// Walks the turns newest-first, keeping them while they fit in
+/// `keep_messages`, and returns the start of the oldest kept turn. `None` when
+/// there is only one turn — compaction has nothing to split at.
+///
+/// Turn-aligned on purpose: a split inside a turn could leave a tool call
+/// without its result in the kept half.
+fn compaction_split(entries: &[nanobot_session::LogEntry], keep_messages: usize) -> Option<u32> {
+    let turns = turn_message_counts(entries);
+    if turns.len() < 2 {
+        return None;
+    }
+
+    let mut kept = 0usize;
+    let mut split = None;
+    for (start, count) in turns.iter().rev() {
+        // Always keep at least the newest turn, even if it alone is over budget.
+        if kept > 0 && kept + count > keep_messages {
+            break;
+        }
+        kept += count;
+        split = Some(*start);
+    }
+    split
+}
+
+/// Projected message count per turn, oldest first: `(turn start seq, count)`.
+fn turn_message_counts(entries: &[nanobot_session::LogEntry]) -> Vec<(u32, usize)> {
+    let mut turns: Vec<(u32, usize)> = Vec::new();
+    for entry in entries {
+        if matches!(entry.event, SessionEvent::TurnStart { .. }) {
+            turns.push((entry.seq, 0));
+        }
+        if let Some((_, count)) = turns.last_mut() {
+            if projects_to_message(&entry.event) {
+                *count += 1;
+            }
+        }
+    }
+    turns
+}
+
+/// Whether an event projects to a model-visible message.
+fn projects_to_message(event: &SessionEvent) -> bool {
+    matches!(
+        event,
+        SessionEvent::UserMessage { .. }
+            | SessionEvent::AssistantMessage { .. }
+            | SessionEvent::ToolCall { .. }
+            | SessionEvent::ToolResult { .. }
+            | SessionEvent::PlanRejected { .. }
+    )
+}
+
+/// The first log position no live compaction already covers.
+fn next_uncovered_seq(entries: &[nanobot_session::LogEntry]) -> u32 {
+    entries
+        .iter()
+        .filter_map(|entry| match &entry.event {
+            SessionEvent::CompactionEntry { to_seq, .. } => Some(*to_seq + 1),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Project the messages of a log range.
+fn derive_messages_in(
+    entries: &[nanobot_session::LogEntry],
+    from_seq: u32,
+    to_seq: u32,
+) -> Vec<ProjectedMessage> {
+    derive_messages(
+        &entries
+            .iter()
+            .filter(|entry| entry.seq >= from_seq && entry.seq <= to_seq)
+            .cloned()
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// Render projected messages as text for the summarizer.
+fn render_messages(messages: &[ProjectedMessage]) -> String {
+    messages
+        .iter()
+        .map(|message| match message {
+            ProjectedMessage::System(text) => format!("[system] {text}"),
+            ProjectedMessage::User { content, .. } => format!("[user] {content}"),
+            ProjectedMessage::Assistant(text) => format!("[assistant] {text}"),
+            ProjectedMessage::ToolCall {
+                name, arguments, ..
+            } => format!("[tool call] {name} {arguments}"),
+            ProjectedMessage::ToolResult { output, .. } => format!("[tool result] {output}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Convert the wire accounting type into the session's.
+///
+/// The two types are separate on purpose: `nanobot-llm` owns the provider
+/// vocabulary (and must stay below `nanobot-session` in the dependency order),
+/// while `nanobot-session` owns the neutral, provider-free event vocabulary.
+/// The conversion therefore lives here, in the one crate that depends on both.
+fn to_session_usage(usage: nanobot_llm::Usage) -> nanobot_session::Usage {
+    nanobot_session::Usage {
+        prompt_tokens: usage.prompt_tokens,
+        completion_tokens: usage.completion_tokens,
+        total_tokens: usage.total_tokens,
+    }
 }
 
 /// How many steps one turn may take before it is cut off.
@@ -227,6 +378,23 @@ const MAX_STEPS: u32 = 50;
 /// How many times a failed plan verification is handed back to the model
 /// before the plan is left `Contingent` for a human.
 const MAX_VERIFY_RETRIES: u32 = 2;
+
+/// The projected history above which the older turns are compacted, by default.
+///
+/// Generous on purpose: compaction trades detail for a bounded context, so it
+/// should only engage on a genuinely long session. A product tunes it with
+/// [`Agent::set_compaction_threshold`].
+pub const DEFAULT_COMPACTION_THRESHOLD: usize = 400;
+
+/// The instruction the summarizer gets.
+const COMPACT_PROMPT: &str = "You are compressing an earlier part of a design \
+session. Write a compact but complete summary of the design intent, the \
+decisions made, the assumptions recorded and the verification results so far. \
+Preserve concrete values (frequencies, counts, dimensions) and anything still \
+open. Do not add new decisions.";
+
+/// How many tokens the summary may take.
+const COMPACT_MAX_TOKENS: u32 = 1024;
 
 /// What the plan gate decided at the end of a step.
 #[derive(Debug, Clone)]
@@ -244,7 +412,11 @@ enum PlanVerdict {
     },
 }
 
-/// The agent's standing instructions (design-harness 14.2, persona section).
+/// The built-in persona, used when the product supplies none.
+///
+/// This is a *default*, not the framework's opinion about the domain: a
+/// harness product installs its own standing instructions with
+/// [`Agent::set_persona`], because the domain identity belongs to the product.
 const PERSONA: &str = "\
 You are ocad, a CAD design agent working on one open part document.
 You change the document only by calling the provided tools; you never emit
@@ -285,6 +457,7 @@ fn plan_tool_definition() -> nanobot_tools::ToolDefinition {
         }),
         requires_approval: false,
         contract: nanobot_tools::ToolContract::ReadOnly,
+        validate_args: false,
     }
 }
 
@@ -309,25 +482,13 @@ impl Agent {
                 plan_checkpoint: Mutex::new(None),
                 plan_start_seq: Mutex::new(None),
                 prompt_assembler: Mutex::new(None),
+                persona: Mutex::new(None),
+                model: Mutex::new(None),
                 plan_verifier: Mutex::new(None),
-                model: Mutex::new("default".to_string()),
+                telemetry: Mutex::new(Arc::new(NoopTelemetryContext)),
+                compaction_threshold: Mutex::new(DEFAULT_COMPACTION_THRESHOLD),
             }),
         }
-    }
-
-    /// Set the model identifier sent to the provider on every request.
-    ///
-    /// The runtime routes by provider key, but the request still carries a
-    /// model name; a real provider rejects an unknown one. Defaults to
-    /// `"default"`, which is what a proxy that maps the key to a model
-    /// expects.
-    pub fn set_model(&self, model: impl Into<String>) {
-        *self.inner.model.lock().unwrap() = model.into();
-    }
-
-    /// The model identifier the agent currently sends.
-    pub fn model(&self) -> String {
-        self.inner.model.lock().unwrap().clone()
     }
 
     /// Install the `prompt/assemble` hook.
@@ -343,12 +504,74 @@ impl Agent {
         *self.inner.prompt_assembler.lock().unwrap() = Some(Arc::new(assembler));
     }
 
+    /// Set the product's standing instructions (the persona section).
+    ///
+    /// The persona is the *first* section of the system prompt: the domain
+    /// identity ("you are a chip design agent working on one open design"),
+    /// followed by what the product wants the model to treat as its job.
+    /// Unset, the built-in default ([`PERSONA`]) is used. Skills and the
+    /// prompt assembler still append after it, so this replaces the identity
+    /// only — it does not disable plugin contributions.
+    pub fn set_persona(&self, persona: impl Into<String>) {
+        *self.inner.persona.lock().unwrap() = Some(persona.into());
+    }
+
+    /// Set the model id the agent routes.
+    ///
+    /// The id is resolved through the runtime's [`ModelCatalog`]: a catalog
+    /// entry wins (routing to its provider, asking it for its wire model);
+    /// without one, the id is the wire model and routes to the `default`
+    /// adapter. Unset, the agent asks for [`DEFAULT_MODEL`] — the adapter key
+    /// a harness registers its single adapter under.
+    pub fn set_model(&self, model: impl Into<String>) {
+        *self.inner.model.lock().unwrap() = Some(model.into());
+    }
+
+    /// The model id requests are made with (the configured id, or the default).
+    fn model_id(&self) -> String {
+        self.inner
+            .model
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string())
+    }
+
+    /// The wire model id: what the provider is actually asked for, and what
+    /// `RequestHeader` records.
+    ///
+    /// A catalog route may name a different wire model than the id the agent
+    /// was given (an alias), so the runtime's resolution is the truth.
+    fn wire_model(&self) -> String {
+        let id = self.model_id();
+        self.inner
+            .llm
+            .resolve(&id)
+            .map(|route| route.model)
+            .unwrap_or(id)
+    }
+
     /// Set the plan verifier (the product's intent grader). Without one, a
     /// plan that declares an intent passes — there is nothing to check against.
     pub fn set_plan_verifier(&self, verifier: Arc<dyn PlanVerifier>) {
         *self.inner.plan_verifier.lock().unwrap() = Some(verifier);
     }
 
+    /// Set the telemetry context the loop emits its spans through.
+    ///
+    /// The default is the no-op context: `agent.turn`, `agent.step`,
+    /// `tool.execute` and `provider.request` spans are then dropped on the
+    /// floor. A consumer that wants them implements [`TelemetryContext`]
+    /// (bridging into its own tracing stack) and installs it here.
+    pub fn set_telemetry(&self, telemetry: Arc<dyn TelemetryContext>) {
+        *self.inner.telemetry.lock().unwrap() = telemetry;
+    }
+
+    /// The telemetry context, cloned so the loop can hold it across an `.await`
+    /// without keeping the lock guard alive.
+    fn telemetry(&self) -> Arc<dyn TelemetryContext> {
+        self.inner.telemetry.lock().unwrap().clone()
+    }
 
     /// The system prompt the model receives this turn (design-harness 14.2).
     ///
@@ -365,7 +588,15 @@ impl Agent {
     /// the evaluated result. The check section carries the latest verdicts so
     /// the model can see what already failed.
     fn build_system_prompt(&self) -> String {
-        let mut prompt = String::from(PERSONA);
+        // The persona comes from the product when it set one; the built-in
+        // default is a fallback, not a framework opinion about the domain.
+        let mut prompt = self
+            .inner
+            .persona
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| PERSONA.to_string());
 
         let executor = self.inner.tool_executor.lock().unwrap().clone();
         if let Some(subject) = executor.as_ref().and_then(|e| e.describe_subject()) {
@@ -423,20 +654,90 @@ impl Agent {
         self.inner.state.lock().unwrap().clone()
     }
 
-    /// Get the current plan state, if a plan is active.
-    pub fn current_plan_state(&self) -> Option<PlanState> {
-        self.inner
-            .current_plan
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|p| p.state)
+    /// Send a followup message that will start a new turn.
+    pub fn followup(&self, message: impl Into<String>) {
+        self.inner.inbox.push_turn(message.into());
     }
 
-    /// Accept the current plan: keep the work and close the plan
+    /// Send a followup message carrying an image, which starts a new turn.
+    ///
+    /// The image is a data URL (`data:image/png;base64,...`); the model sees it
+    /// as a multi-part user message, which is how a drawing reaches the agent.
+    pub fn followup_with_image(
+        &self,
+        message: impl Into<String>,
+        image: impl Into<String>,
+    ) {
+        self.inner.inbox.push_turn(crate::inbox::TurnMessage {
+            content: message.into(),
+            image: Some(image.into()),
+        });
+    }
+
+    /// Send a steering message that will inject into the current step.
+    pub fn steer(&self, message: impl Into<String>) {
+        self.inner.inbox.push_step(message.into());
+    }
+
+    /// Cancel the current turn.
+    pub fn cancel(&self) {
+        *self.inner.state.lock().unwrap() = AgentState::Cancelled;
+    }
+
+    /// Propose a plan: create it in `Proposed` state, emit `PlanProposed`,
+    /// and store it as the current plan.
+    ///
+    /// Called when the model emits a `propose_plan` tool call.
+    pub fn propose_plan(
+        &self,
+        plan_id: impl Into<String>,
+        summary: impl Into<String>,
+        steps: serde_json::Value,
+        intent: Option<serde_json::Value>,
+    ) {
+        let mut plan = Plan::new(plan_id, summary, steps);
+        if let Some(intent) = intent {
+            plan = Plan::with_intent(
+                plan.plan_id.clone(),
+                plan.summary.clone(),
+                plan.steps.clone(),
+                intent,
+            );
+        }
+
+        let proposal = nanobot_session::PlanProposal {
+            plan_id: plan.plan_id.clone(),
+            summary: plan.summary.clone(),
+        };
+
+        self.inner
+            .session
+            .append(SessionEvent::PlanProposed { plan: proposal });
+
+        *self.inner.current_plan.lock().unwrap() = Some(plan);
+    }
+
+    /// Request clarification: create a plan in `Clarify` state, emit
+    /// `PlanClarify`, and store it as the current plan (design 14.3).
+    ///
+    /// Called when the model needs more information before proposing.
+    pub fn clarify_plan(&self, plan_id: impl Into<String>, questions: &[String]) {
+        let plan_id = plan_id.into();
+        let mut plan = Plan::new(plan_id.clone(), "", serde_json::Value::Null);
+        plan.request_clarification();
+
+        self.inner.session.append(SessionEvent::PlanClarify {
+            plan_id: plan_id.clone(),
+            questions: questions.to_vec(),
+        });
+
+        *self.inner.current_plan.lock().unwrap() = Some(plan);
+    }
+
+    /// Accept the current plan: close it and record the acceptance
     /// (design-harness 14.3, the decision bar's Accept).
     ///
-    /// Emits `PlanAccepted`. Returns whether a plan was open.
+    /// Returns whether a plan was open.
     pub fn accept_plan(&self) -> bool {
         let plan_id = {
             let mut guard = self.inner.current_plan.lock().unwrap();
@@ -511,92 +812,6 @@ impl Agent {
             }
             None => false,
         }
-    }
-
-    /// Send a followup message that will start a new turn.
-    pub fn followup(&self, message: impl Into<String>) {
-        self.inner.inbox.push_turn(message.into());
-    }
-
-    /// Send a followup message carrying an image, which starts a new turn.
-    ///
-    /// The image is a data URL (`data:image/png;base64,...`); the model sees it
-    /// as a multi-part user message, which is how a drawing reaches the agent.
-    pub fn followup_with_image(
-        &self,
-        message: impl Into<String>,
-        image: impl Into<String>,
-    ) {
-        self.inner.inbox.push_turn(crate::inbox::TurnMessage {
-            content: message.into(),
-            image: Some(image.into()),
-        });
-    }
-
-    /// Send a steering message that will inject into the current step.
-    pub fn steer(&self, message: impl Into<String>) {
-        self.inner.inbox.push_step(message.into());
-    }
-
-    /// Inject a raw session event.
-    pub fn inject(&self, event: SessionEvent) {
-        self.inner.session.append(event);
-    }
-
-    /// Cancel the current turn.
-    pub fn cancel(&self) {
-        *self.inner.state.lock().unwrap() = AgentState::Cancelled;
-    }
-
-    /// Propose a plan: create it in `Proposed` state, emit `PlanProposed`,
-    /// and store it as the current plan.
-    ///
-    /// Called when the model emits a `propose_plan` tool call.
-    pub fn propose_plan(
-        &self,
-        plan_id: impl Into<String>,
-        summary: impl Into<String>,
-        steps: serde_json::Value,
-        intent: Option<serde_json::Value>,
-    ) {
-        let mut plan = Plan::new(plan_id, summary, steps);
-        if let Some(intent) = intent {
-            plan = Plan::with_intent(
-                plan.plan_id.clone(),
-                plan.summary.clone(),
-                plan.steps.clone(),
-                intent,
-            );
-        }
-
-        let proposal = nanobot_session::PlanProposal {
-            plan_id: plan.plan_id.clone(),
-            summary: plan.summary.clone(),
-            steps: plan.steps.clone(),
-        };
-
-        self.inner
-            .session
-            .append(SessionEvent::PlanProposed { plan: proposal });
-
-        *self.inner.current_plan.lock().unwrap() = Some(plan);
-    }
-
-    /// Request clarification: create a plan in `Clarify` state, emit
-    /// `PlanClarify`, and store it as the current plan (design 14.3).
-    ///
-    /// Called when the model needs more information before proposing.
-    pub fn clarify_plan(&self, plan_id: impl Into<String>, questions: &[String]) {
-        let plan_id = plan_id.into();
-        let mut plan = Plan::new(plan_id.clone(), "", serde_json::Value::Null);
-        plan.request_clarification();
-
-        self.inner.session.append(SessionEvent::PlanClarify {
-            plan_id: plan_id.clone(),
-            questions: questions.to_vec(),
-        });
-
-        *self.inner.current_plan.lock().unwrap() = Some(plan);
     }
 
     /// Handle a `propose_plan` tool call: parse arguments and create a plan.
@@ -683,8 +898,233 @@ impl Agent {
                 "error": {"code": code, "detail": detail}
             })
             .to_string(),
-            topology_signature: None,
         });
+    }
+
+    /// Run a tool call that cleared the gate, and log the call and its result.
+    ///
+    /// Shared by the turn loop and by crash-recovery replay, so a replayed call
+    /// is logged exactly like one the model just asked for.
+    fn execute_and_log(
+        &self,
+        executor: &Arc<dyn ToolExecutor>,
+        id: &str,
+        name: &str,
+        args: &serde_json::Value,
+        seq: u32,
+    ) -> (bool, String) {
+        // Announce the check, then execute the tool call under its contract. A
+        // rejected write has already been rolled back, so the document carries
+        // no trace of it.
+        let check_id = format!("write:{name}");
+        self.inner
+            .session
+            .append(SessionEvent::CheckRun { check_id: check_id.clone() });
+
+        let outcome = executor.apply(name, args);
+        self.inner.session.append(SessionEvent::ToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            arguments: args.clone(),
+            seq,
+        });
+
+        let success = outcome.accepted && !outcome.reply.contains("\"ok\":false");
+        // Post-execute waterfall (design 14.1): lightweight verification hook
+        // after the tool has run.
+        let post = self.inner.tools.post_execute(name, &outcome.reply);
+        let (output, check_details) = if outcome.accepted {
+            match post {
+                nanobot_tools::PostExecuteResult::Accept => {
+                    (outcome.reply.clone(), outcome.summary())
+                }
+                nanobot_tools::PostExecuteResult::Block(reason) => (
+                    serde_json::json!({"ok":false,"error":{"code":"post_blocked","detail":reason}})
+                        .to_string(),
+                    outcome.summary(),
+                ),
+            }
+        } else {
+            // The write was rolled back; tell the model why.
+            let failures: Vec<String> = outcome
+                .failures()
+                .map(|f| format!("{}: {}", f.invariant, f.detail))
+                .collect();
+            let detail = failures.join("; ");
+            let output = serde_json::json!({
+                "ok": false,
+                "error": { "code": "write_rejected", "detail": detail }
+            })
+            .to_string();
+            (output, outcome.summary())
+        };
+        self.inner.session.append(SessionEvent::ToolResult {
+            id: id.to_string(),
+            success,
+            output: output.clone(),
+        });
+
+        // The verdict lands in the check panel (the app projects `CheckResult`
+        // into its check items).
+        self.inner.session.append(SessionEvent::CheckResult {
+            check_id,
+            passed: outcome.accepted,
+            // The write gate carries no versioned scoring contract, so the
+            // regrade surface stays empty here.
+            measurements: std::collections::BTreeMap::new(),
+            scorer_version: None,
+            // The invariants the gate recorded, in full: this is what lets a
+            // check panel or an agent filter on the failing invariant instead of
+            // reading the summary.
+            payload: Some(serde_json::json!({
+                "invariants": outcome
+                    .checks
+                    .iter()
+                    .map(|check| serde_json::json!({
+                        "invariant": check.invariant,
+                        "passed": check.passed,
+                        "detail": check.detail,
+                    }))
+                    .collect::<Vec<_>>(),
+            })),
+            details: check_details,
+        });
+
+        (success, output)
+    }
+
+    /// Re-execute a tool call the log recorded but never answered.
+    ///
+    /// Crash recovery: a call whose result was lost to a crash is re-run when
+    /// the harness judged it safe to replay, and its answer is appended so the
+    /// session is a valid turn again. The call goes through the same gate as a
+    /// live one, so a refusal is logged rather than silently skipped.
+    pub fn replay_call(
+        &self,
+        id: &str,
+        name: &str,
+        arguments: &serde_json::Value,
+    ) -> ReplayOutcome {
+        let seq = self.inner.session.next_seq();
+        match self.inner.tools.pre_execute(name, arguments) {
+            nanobot_tools::PreExecuteResult::Allow(args) => {
+                let executor = self.inner.tool_executor.lock().unwrap().clone();
+                let Some(executor) = executor else {
+                    self.log_unexecuted_call(
+                        id,
+                        name,
+                        arguments,
+                        seq,
+                        "no_executor",
+                        "no tool executor is wired",
+                    );
+                    return ReplayOutcome::Unknown;
+                };
+                let (success, output) = self.execute_and_log(&executor, id, name, &args, seq);
+                ReplayOutcome::Replayed { success, output }
+            }
+            nanobot_tools::PreExecuteResult::Deny(reason) => {
+                self.log_unexecuted_call(id, name, arguments, seq, "tool_denied", &reason);
+                ReplayOutcome::Unknown
+            }
+        }
+    }
+
+    /// The projected history above which the older turns are compacted.
+    ///
+    /// `0` disables compaction. See [`Agent::compact_history`].
+    pub fn compaction_threshold(&self) -> usize {
+        *self.inner.compaction_threshold.lock().unwrap()
+    }
+
+    /// Set the projected-history threshold for compaction.
+    ///
+    /// `0` disables it. The default is [`DEFAULT_COMPACTION_THRESHOLD`].
+    pub fn set_compaction_threshold(&self, max_messages: usize) {
+        *self.inner.compaction_threshold.lock().unwrap() = max_messages;
+    }
+
+    /// Compact the older turns of the model history into a `CompactionEntry`.
+    ///
+    /// The projected history is what the model's context window sees, and a
+    /// long negotiation grows it without bound. Compaction asks the model to
+    /// summarize the older turns and records that summary as a
+    /// [`SessionEvent::CompactionEntry`], which [`Session::derive_messages`]
+    /// then emits in place of the covered events. The log keeps every event —
+    /// compaction is a projection record, not a rewrite — so the audit trail
+    /// and the UI replay are unaffected.
+    ///
+    /// Returns whether a compaction was recorded. Nothing happens when the
+    /// history is under the threshold, when there is no turn boundary to split
+    /// at, or when the summarizer returns nothing.
+    pub async fn compact_history(&self) -> bool {
+        let threshold = self.compaction_threshold();
+        if threshold == 0 {
+            return false;
+        }
+
+        let entries = self.inner.session.events();
+        if derive_messages(&entries).len() <= threshold {
+            return false;
+        }
+
+        // Keep the newest turns that fit in half the threshold, so a session
+        // always has room to grow before the next compaction.
+        let Some(split) = compaction_split(&entries, threshold / 2) else {
+            return false;
+        };
+        let from_seq = next_uncovered_seq(&entries);
+        if from_seq >= split {
+            // Everything up to the split is already covered.
+            return false;
+        }
+        let to_seq = split - 1;
+
+        let older = derive_messages_in(&entries, from_seq, to_seq);
+        if older.is_empty() {
+            return false;
+        }
+        let Some(summary) = self.summarize(&older).await else {
+            return false;
+        };
+
+        self.inner.session.append(SessionEvent::CompactionEntry {
+            from_seq,
+            to_seq,
+            summary,
+        });
+        true
+    }
+
+    /// Ask the model to summarize `older` into one message.
+    async fn summarize(&self, older: &[ProjectedMessage]) -> Option<String> {
+        let model_id = self.model_id();
+        let request = LlmRequest {
+            model: self.wire_model(),
+            messages: vec![
+                Message::system(COMPACT_PROMPT),
+                Message::user(render_messages(older)),
+            ],
+            tools: vec![],
+            temperature: None,
+            max_tokens: Some(COMPACT_MAX_TOKENS),
+        };
+
+        let mut stream = self.inner.llm.stream_model(&model_id, request);
+        let mut assembler = BlockAssembler::new();
+        use futures_util::StreamExt;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(chunk) => {
+                    assembler.push(chunk);
+                }
+                Err(_) => return None,
+            }
+        }
+        assembler
+            .finish()
+            .map(|block| block.text)
+            .filter(|text| !text.trim().is_empty())
     }
 
     /// Grade the plan awaiting verification and finalize it.
@@ -746,6 +1186,12 @@ impl Agent {
             details: detail.clone(),
             measurements,
             scorer_version,
+            // The graded measurements, structured: a UI can list what held and
+            // what did not without re-parsing the summary line.
+            payload: Some(serde_json::json!({
+                "verdict": if passed { "passed" } else { "failed" },
+                "detail": detail,
+            })),
         });
 
         if passed {
@@ -833,6 +1279,14 @@ impl Agent {
             // turn/start
             self.inner.session.append(SessionEvent::TurnStart { turn });
 
+            // The turn span stays open until the turn returns (completion,
+            // cancellation, max steps or a provider error), so its duration is
+            // the turn's. Dropped on every exit path, including the early
+            // `return`s below.
+            let _turn_span = self
+                .telemetry()
+                .start_span(SpanOptions::new("agent.turn", SpanKind::AgentTurn));
+
             // The system prompt is assembled once per turn (design 14.2): it is
             // a turn-level view of the document, not a per-step one.
             let system_prompt = self.build_system_prompt();
@@ -862,6 +1316,13 @@ impl Agent {
                     .session
                     .append(SessionEvent::StepStart { turn, step });
 
+                // One span per step: it ends when the step does (the loop body
+                // ends, breaks, or returns), so it measures the model request
+                // plus the tool dispatch it triggered.
+                let _step_span = self
+                    .telemetry()
+                    .start_span(SpanOptions::new("agent.step", SpanKind::AgentStep));
+
                 // Get next step message (steering). For the first step, use the
                 // turn message; for subsequent steps, use steering or empty.
                 // The turn's own message may carry an image; steering messages
@@ -876,10 +1337,13 @@ impl Agent {
                 self.inner.session.append(SessionEvent::UserMessage {
                     content: step_message,
                     image: step_image,
-                    selection_ref: None,
                 });
 
-                // Derive messages from session.
+                // Derive messages from session. Compaction runs first: the
+                // projected history is what the context window sees, and a long
+                // negotiation must not grow it without bound. It is a no-op
+                // under the threshold.
+                self.compact_history().await;
                 let projected = self.inner.session.derive_messages();
                 let mut messages: Vec<Message> = vec![Message::system(system_prompt.clone())];
                 messages.extend(
@@ -925,9 +1389,14 @@ impl Agent {
                     })
                     .collect();
 
-                // Build LLM request.
+                // Build LLM request. The model *id* goes to the runtime, which
+                // resolves it through the catalog (provider + wire model); the
+                // request carries the wire model, which is what the provider is
+                // asked for and what `RequestHeader` records.
+                let model_id = self.model_id();
+                let wire_model = self.wire_model();
                 let request = LlmRequest {
-                    model: self.inner.model.lock().unwrap().clone(),
+                    model: wire_model.clone(),
                     messages,
                     tools: tool_defs,
                     temperature: None,
@@ -935,7 +1404,7 @@ impl Agent {
                 };
 
                 // Stream from LLM.
-                let mut stream = self.inner.llm.stream("default", request);
+                let mut stream = self.inner.llm.stream_model(&model_id, request);
                 let mut assembler = BlockAssembler::new();
                 let mut stream_error: Option<String> = None;
 
@@ -972,6 +1441,10 @@ impl Agent {
                     self.inner.session.append(SessionEvent::CheckResult {
                         check_id: "llm:stream".to_string(),
                         passed: false,
+                        payload: Some(serde_json::json!({
+                            "error": detail,
+                            "kind": "stream",
+                        })),
                         details: detail,
                         measurements: std::collections::BTreeMap::new(),
                         scorer_version: None,
@@ -982,16 +1455,73 @@ impl Agent {
 
                 // Process any remaining text from the assembler.
                 if let Some(block) = assembler.finish() {
+                    // Record the request itself: which model answered and what
+                    // it cost. This is the only event carrying token usage, so
+                    // dropping it would make the session unbillable.
+                    self.inner.session.append(SessionEvent::RequestHeader {
+                        model: wire_model,
+                        usage: block.usage.map(to_session_usage),
+                    });
+
                     if !block.text.is_empty() {
                         self.inner.session.append(SessionEvent::AssistantMessage {
                             content: block.text,
                         });
                     }
 
+                    // A response the provider cut off at the token limit is an
+                    // incomplete message: the text may stop mid-sentence and
+                    // the tool arguments mid-JSON. Recorded so the check panel
+                    // and the trace both show why the calls below were refused.
+                    let truncated = block.stop_reason.map(|reason| reason.is_truncated()).unwrap_or(false);
+                    if truncated {
+                        self.inner.session.append(SessionEvent::CheckResult {
+                            check_id: "llm:truncated".to_string(),
+                            passed: false,
+                            payload: Some(serde_json::json!({
+                                "stop_reason": format!("{:?}", block.stop_reason),
+                                "tool_calls": block.tool_calls.len(),
+                            })),
+                            details: "the provider cut the response off at the token limit; \
+                                      its tool calls were not executed"
+                                .to_string(),
+                            measurements: std::collections::BTreeMap::new(),
+                            scorer_version: None,
+                        });
+                    }
+
                     // Log tool calls and execute them under the write gate.
                     for tc in &block.tool_calls {
                         has_tool_calls = true;
-                        let args: serde_json::Value =
+
+                        // A response the provider cut off at the token limit
+                        // asked for these tools with an incomplete message.
+                        // Acting on them would run a half-formed intent, so
+                        // every call in the block is failed rather than
+                        // executed; the model sees the refusal and can re-ask.
+                        if truncated {
+                            self.log_unexecuted_call(
+                                &tc.id,
+                                &tc.name,
+                                &serde_json::from_str(&tc.arguments)
+                                    .unwrap_or(serde_json::Value::Null),
+                                self.inner.session.next_seq(),
+                                "truncated",
+                                "the response was cut off at the token limit, so this \
+                                 call was not executed; re-issue it in full",
+                            );
+                            continue;
+                        }
+
+                        // Per-call span: it ends when the call is dispatched
+                        // (including the `continue`s for a denied or
+                        // executor-less call), so it measures the whole
+                        // pre-execute -> execute -> post-execute path.
+                        let _tool_span = self
+                            .telemetry()
+                            .start_span(SpanOptions::new("tool.execute", SpanKind::Tool));
+
+                        let mut args: serde_json::Value =
                             serde_json::from_str(&tc.arguments).unwrap_or(serde_json::Value::Null);
 
                         let seq = self.inner.session.next_seq();
@@ -1009,7 +1539,6 @@ impl Agent {
                                 id: tc.id.clone(),
                                 success: true,
                                 output,
-                                topology_signature: None,
                             });
                             continue;
                         }
@@ -1019,12 +1548,15 @@ impl Agent {
                         // decision all happen here, before anything reaches the
                         // engine: an unregistered tool is refused, not run.
                         let denial = match self.inner.tools.pre_execute(&tc.name, &args) {
-                            nanobot_tools::PreExecuteResult::Allow => None,
-                            // The approval policy resolves synchronously today,
-                            // so `Ask` is not produced; refusing it keeps an
-                            // unapproved call from slipping through.
-                            nanobot_tools::PreExecuteResult::Deny(reason)
-                            | nanobot_tools::PreExecuteResult::Ask(reason) => Some(reason),
+                            // The pipeline validated and coerced the arguments;
+                            // the coerced value is what runs, so a numeric string
+                            // the model wrote for a numeric field reaches the
+                            // executor as a number.
+                            nanobot_tools::PreExecuteResult::Allow(coerced) => {
+                                args = coerced;
+                                None
+                            }
+                            nanobot_tools::PreExecuteResult::Deny(reason) => Some(reason),
                         };
 
                         if let Some(reason) = denial {
@@ -1075,71 +1607,7 @@ impl Agent {
                             }
                         }
 
-                        // Announce the check, then execute the tool call under
-                        // its contract. A rejected write has already been
-                        // rolled back, so the document carries no trace of it.
-                        let check_id = format!("write:{}", tc.name);
-                        self.inner.session.append(SessionEvent::CheckRun {
-                            check_id: check_id.clone(),
-                        });
-
-                        let outcome = executor.apply(&tc.name, &args);
-                        self.inner.session.append(SessionEvent::ToolCall {
-                            id: tc.id.clone(),
-                            name: tc.name.clone(),
-                            arguments: args.clone(),
-                            seq,
-                        });
-
-                        let success = outcome.accepted && !outcome.reply.contains("\"ok\":false");
-                        // Post-execute waterfall (design 14.1): lightweight
-                        // verification hook after the tool has run.
-                        let post = self.inner.tools.post_execute(&tc.name, &outcome.reply);
-                        let (output, check_details) = if outcome.accepted {
-                            match post {
-                                nanobot_tools::PostExecuteResult::Accept => {
-                                    (outcome.reply.clone(), outcome.summary())
-                                }
-                                nanobot_tools::PostExecuteResult::Replace(v) => {
-                                    (v, outcome.summary())
-                                }
-                                nanobot_tools::PostExecuteResult::Block(reason) => {
-                                    (serde_json::json!({"ok":false,"error":{"code":"post_blocked","detail":reason}}).to_string(), outcome.summary())
-                                }
-                            }
-                        } else {
-                            // The write was rolled back; tell the model why.
-                            let failures: Vec<String> = outcome
-                                .failures()
-                                .map(|f| format!("{}: {}", f.invariant, f.detail))
-                                .collect();
-                            let detail = failures.join("; ");
-                            let output = serde_json::json!({
-                                "ok": false,
-                                "error": {
-                                    "code": "write_rejected",
-                                    "detail": detail
-                                }
-                            })
-                            .to_string();
-                            (output, outcome.summary())
-                        };
-                        self.inner.session.append(SessionEvent::ToolResult {
-                            id: tc.id.clone(),
-                            success,
-                            output,
-                            topology_signature: None,
-                        });
-
-                        // The verdict lands in the check panel (the app
-                        // projects `CheckResult` into its check items).
-                        self.inner.session.append(SessionEvent::CheckResult {
-                            check_id,
-                            passed: outcome.accepted,
-                            details: check_details,
-                            measurements: std::collections::BTreeMap::new(),
-                            scorer_version: None,
-                        });
+                        let _ = self.execute_and_log(&executor, &tc.id, &tc.name, &args, seq);
                     }
                 }
 
@@ -1214,33 +1682,4 @@ fn verification_feedback(diagnostics: &[String]) -> String {
         }
     }
     message
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use nanobot_llm::LlmRuntime;
-    use nanobot_session::Session;
-    use nanobot_tools::{AutoApprovalPolicy, ToolPipeline, ToolRegistry};
-    use std::sync::Arc;
-
-    fn agent() -> Agent {
-        let session = Session::new("test");
-        let llm = LlmRuntime::new();
-        let registry = Arc::new(ToolRegistry::new());
-        let pipeline = ToolPipeline::new(registry, Arc::new(AutoApprovalPolicy));
-        Agent::new(session, llm, pipeline)
-    }
-
-    #[test]
-    fn the_model_name_defaults_to_the_provider_key() {
-        assert_eq!(agent().model(), "default");
-    }
-
-    #[test]
-    fn the_model_name_can_be_overridden() {
-        let agent = agent();
-        agent.set_model("a-real-model");
-        assert_eq!(agent.model(), "a-real-model");
-    }
 }

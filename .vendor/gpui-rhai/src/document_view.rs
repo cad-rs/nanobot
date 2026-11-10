@@ -1,6 +1,6 @@
 //! Retained native `CodeViewer` and `DiffViewer` surfaces.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::rc::Rc;
@@ -8,12 +8,12 @@ use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AnyElement, App, AppContext as _, Bounds, Context, CursorStyle, Element, ElementId, Entity,
-    FocusHandle, Focusable, FontWeight, GlobalElementId, HighlightStyle, InspectorElementId,
-    InteractiveElement, IntoElement, KeyBinding, ListHorizontalSizingBehavior, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, ScrollHandle,
-    ScrollStrategy, SharedString, StatefulInteractiveElement, Styled, StyledText, Task, Window,
-    actions, div, px, relative, rgba, uniform_list,
+    AnyElement, App, AppContext as _, AvailableSpace, Bounds, Context, CursorStyle, Element,
+    ElementId, Entity, FocusHandle, Focusable, FontWeight, GlobalElementId, HighlightStyle,
+    InspectorElementId, InteractiveElement, IntoElement, KeyBinding, ListHorizontalSizingBehavior,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render,
+    ScrollHandle, ScrollStrategy, SharedString, StatefulInteractiveElement, Styled, StyledText,
+    Task, Window, actions, div, px, relative, rgba, size, uniform_list,
 };
 use regex::RegexBuilder;
 use similar::TextDiff;
@@ -25,13 +25,94 @@ use crate::text_input::{
 use crate::{
     DiffDisplayRow, DiffRowKind, DiffViewMode, DiffWhitespace, DocumentDescriptor,
     DocumentRuntimeConfig, DocumentSource, DocumentWrap, EventSchema, ObjectField, PreparedDiff,
-    PreparedDocument, PrimitiveDescriptor, PrimitiveEventEmitter, PrimitiveHandler, PrimitiveId,
+    PreparedDocument, PrimitiveContext, PrimitiveDescriptor, PrimitiveHandler, PrimitiveId,
     PrimitiveInstance, PrimitiveInstanceId, PrimitiveProps, PrimitiveTheme, PrimitiveValue, Style,
     SyntaxRegistry, UiValue, ValueSchema, prepare_diff_with_limits, prepare_document_with_limits,
 };
 
 const CODE_CONTEXT: &str = "GPUIRhaiCodeViewer";
 const DIFF_CONTEXT: &str = "GPUIRhaiDiffViewer";
+
+#[derive(Clone, Debug, PartialEq)]
+struct DocumentScrollbarConfig {
+    spec: crate::ScrollbarSpec,
+    parts: [Style; 3],
+}
+
+impl DocumentScrollbarConfig {
+    fn parse(props: &PrimitiveProps) -> Result<Self, String> {
+        let visibility = props.string("scrollbar").unwrap_or("auto");
+        Ok(Self {
+            spec: crate::ScrollbarSpec::new(visibility, visibility)?,
+            parts: [
+                "scrollbar_track_style",
+                "scrollbar_thumb_style",
+                "scrollbar_thumb_hover_style",
+            ]
+            .map(|part| props.style(part).cloned().unwrap_or_default()),
+        })
+    }
+
+    fn context(
+        &self,
+        events: &PrimitiveContext,
+        theme: &PrimitiveTheme,
+    ) -> crate::ScrollbarContext {
+        events
+            .scrollbars(theme)
+            .with_part_styles(&self.parts[0], &self.parts[1], &self.parts[2])
+    }
+}
+
+fn document_scrollbar_props() -> Vec<(String, ObjectField)> {
+    let mut props = vec![("scrollbar".to_owned(),
+        ObjectField::optional(ValueSchema::enumeration(["auto", "always", "hidden"]))
+            .with_default(UiValue::String("auto".to_owned()))
+            .with_doc("Shared overlay scrollbar visibility; keyboard scrolling remains owned by the document."))];
+    props.extend(
+        [
+            "scrollbar_track_style",
+            "scrollbar_thumb_style",
+            "scrollbar_thumb_hover_style",
+        ]
+        .map(|name| {
+            (
+                name.to_owned(),
+                ObjectField::optional(ValueSchema::Style)
+                    .with_doc("Background override for the corresponding shared scrollbar part."),
+            )
+        }),
+    );
+    props
+}
+
+/// Split panes share the list's vertical viewport and retain only their own
+/// native horizontal `ScrollHandle`. This adapts geometry, never position.
+struct DocumentPaneScrollSource {
+    viewport: gpui::UniformListScrollHandle,
+    horizontal: ScrollHandle,
+    right: bool,
+}
+
+impl crate::ScrollbarSource for DocumentPaneScrollSource {
+    fn viewport(&self) -> Bounds<Pixels> {
+        let mut bounds = self.viewport.0.borrow().base_handle.bounds();
+        bounds.size.width /= 2.0;
+        if self.right {
+            bounds.origin.x += bounds.size.width;
+        }
+        bounds
+    }
+    fn offset(&self) -> gpui::Point<Pixels> {
+        gpui::point(self.horizontal.offset().x, px(0.0))
+    }
+    fn max_offset(&self) -> gpui::Point<Pixels> {
+        gpui::point(self.horizontal.max_offset().x, px(0.0))
+    }
+    fn set_offset(&self, offset: gpui::Point<Pixels>) {
+        self.horizontal.set_offset(gpui::point(offset.x, px(0.0)));
+    }
+}
 
 actions!(
     gpui_rhai_document,
@@ -90,7 +171,7 @@ pub fn init_document_view(cx: &mut App) {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DocumentSide {
+pub(crate) enum DocumentSide {
     Single,
     Left,
     Right,
@@ -115,12 +196,12 @@ struct ActiveDocumentSelection {
 }
 
 #[derive(Clone, Default)]
-struct DocumentSelection {
+pub(crate) struct DocumentSelection {
     active: Rc<RefCell<Option<ActiveDocumentSelection>>>,
 }
 
 impl DocumentSelection {
-    fn begin(&self, side: DocumentSide, source: Arc<str>, offset: usize) {
+    pub(crate) fn begin(&self, side: DocumentSide, source: Arc<str>, offset: usize) {
         self.active.borrow_mut().replace(ActiveDocumentSelection {
             side,
             source,
@@ -129,7 +210,7 @@ impl DocumentSelection {
         });
     }
 
-    fn update(&self, side: DocumentSide, offset: usize) {
+    pub(crate) fn update(&self, side: DocumentSide, offset: usize) {
         if let Some(selection) = self
             .active
             .borrow_mut()
@@ -140,7 +221,7 @@ impl DocumentSelection {
         }
     }
 
-    fn range_for(
+    pub(crate) fn range_for(
         &self,
         side: DocumentSide,
         source: &Arc<str>,
@@ -159,7 +240,7 @@ impl DocumentSelection {
         )
     }
 
-    fn selected_text(&self) -> Option<String> {
+    pub(crate) fn selected_text(&self) -> Option<String> {
         let selection = self.active.borrow();
         let selection = selection.as_ref()?;
         let start = selection.anchor.min(selection.head);
@@ -179,11 +260,11 @@ impl DocumentSelection {
         ))
     }
 
-    fn clear(&self) {
+    pub(crate) fn clear(&self) {
         self.active.borrow_mut().take();
     }
 
-    fn rebase(&self, side: DocumentSide, previous: &Arc<str>, next: Arc<str>) {
+    pub(crate) fn rebase(&self, side: DocumentSide, previous: &Arc<str>, next: Arc<str>) {
         let mut active = self.active.borrow_mut();
         let Some(selection) = active
             .as_mut()
@@ -195,14 +276,51 @@ impl DocumentSelection {
         selection.head = clamp_char_boundary(&next, selection.head);
         selection.source = next;
     }
+
+    /// Streaming presentation may change earlier visible text (for example a
+    /// Markdown reference becomes a link). Preserve only selections whose full
+    /// prefix still maps identically, rather than copying different text at old
+    /// byte offsets.
+    pub(crate) fn rebase_unchanged_prefix(
+        &self,
+        side: DocumentSide,
+        previous: &Arc<str>,
+        next: Arc<str>,
+    ) {
+        let end = self
+            .active
+            .borrow()
+            .as_ref()
+            .filter(|selection| selection.side == side && Arc::ptr_eq(&selection.source, previous))
+            .map(|selection| selection.anchor.max(selection.head));
+        if let Some(end) = end
+            && previous.get(..end) != next.get(..end)
+        {
+            self.clear();
+            return;
+        }
+        self.rebase(side, previous, next);
+    }
+}
+
+/// How tall a `CodeViewer` is.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CodeViewerHeight {
+    /// The box its node's style gives it.
+    Fill,
+    /// Its display rows at the current width times the row height, measured at layout
+    /// time, up to `max` logical pixels.
+    Content { max: Option<f32> },
 }
 
 #[derive(Clone, Debug, PartialEq)]
 struct CodeViewerConfig {
+    scrollbar: DocumentScrollbarConfig,
     descriptor: DocumentDescriptor,
     show_line_numbers: bool,
     wrap: DocumentWrap,
     tab_size: usize,
+    height: CodeViewerHeight,
     monospace_family: SharedString,
     gutter_style: Style,
     line_style: Style,
@@ -279,7 +397,7 @@ fn select_document_monospace_family(
         .into()
 }
 
-fn resolve_document_monospace_family(cx: &App) -> SharedString {
+pub(crate) fn resolve_document_monospace_family(cx: &App) -> SharedString {
     select_document_monospace_family(
         &cx.text_system().all_font_names(),
         DOCUMENT_MONOSPACE_CANDIDATES,
@@ -376,12 +494,13 @@ struct SearchState {
 
 struct CodeViewerEntity {
     config: CodeViewerConfig,
-    events: PrimitiveEventEmitter,
+    events: PrimitiveContext,
     theme: PrimitiveTheme,
     syntaxes: SyntaxRegistry,
     document_runtime: DocumentRuntimeConfig,
     focus: FocusHandle,
     scroll: gpui::UniformListScrollHandle,
+    scroll_source: crate::ScrollbarSourceHandle,
     prepared: Option<Arc<PreparedDocument>>,
     display: Arc<[DisplaySegment]>,
     display_columns: Option<usize>,
@@ -389,6 +508,9 @@ struct CodeViewerEntity {
     display_task: Option<Task<()>>,
     pending_display_columns: Option<PendingDisplayColumns>,
     viewport: Option<Bounds<Pixels>>,
+    /// Viewport wrap columns from the width a content-height viewer was last measured
+    /// at, so its display rows are the ones its height counted.
+    measured_columns: Rc<Cell<Option<usize>>>,
     selection: DocumentSelection,
     search: SearchState,
     search_input: Entity<TextInputEntity>,
@@ -403,7 +525,7 @@ struct CodeViewerEntity {
 impl CodeViewerEntity {
     fn new(
         config: CodeViewerConfig,
-        events: PrimitiveEventEmitter,
+        events: PrimitiveContext,
         theme: PrimitiveTheme,
         syntaxes: SyntaxRegistry,
         document_runtime: DocumentRuntimeConfig,
@@ -434,6 +556,7 @@ impl CodeViewerEntity {
                 TextInputConfig {
                     value: String::new(),
                     placeholder: "Find in document".to_owned(),
+                    placeholder_color: theme.color("text_muted"),
                     disabled: false,
                     read_only: false,
                     autofocus: false,
@@ -445,6 +568,8 @@ impl CodeViewerEntity {
                 cx,
             )
         });
+        let scroll = gpui::UniformListScrollHandle::new();
+        let scroll_source = crate::ScrollbarSourceHandle::new(scroll.clone());
         Self {
             config,
             events,
@@ -452,7 +577,8 @@ impl CodeViewerEntity {
             syntaxes,
             document_runtime,
             focus: cx.focus_handle(),
-            scroll: gpui::UniformListScrollHandle::new(),
+            scroll,
+            scroll_source,
             prepared: None,
             display: Arc::from([]),
             display_columns: None,
@@ -460,6 +586,7 @@ impl CodeViewerEntity {
             display_task: None,
             pending_display_columns: None,
             viewport: None,
+            measured_columns: Rc::new(Cell::new(None)),
             selection: DocumentSelection::default(),
             search: SearchState::default(),
             search_input,
@@ -475,7 +602,7 @@ impl CodeViewerEntity {
     fn update(
         &mut self,
         config: CodeViewerConfig,
-        events: PrimitiveEventEmitter,
+        events: PrimitiveContext,
         theme: &PrimitiveTheme,
         search_typography: NativeTypography,
         cx: &mut Context<Self>,
@@ -483,6 +610,9 @@ impl CodeViewerEntity {
         let needs_prepare = self.config.preparation_changed(&config);
         let presentation_changed =
             self.config.wrap != config.wrap || self.config.tab_size != config.tab_size;
+        if self.config.height != config.height {
+            self.measured_columns.set(None);
+        }
         self.config = config;
         self.events = events;
         self.theme = theme.clone();
@@ -492,6 +622,7 @@ impl CodeViewerEntity {
                 &TextInputConfig {
                     value: self.search.query.clone(),
                     placeholder: "Find in document".to_owned(),
+                    placeholder_color: theme.color("text_muted"),
                     disabled: false,
                     read_only: false,
                     autofocus: false,
@@ -574,21 +705,22 @@ impl CodeViewerEntity {
         match self.config.wrap {
             DocumentWrap::None => None,
             DocumentWrap::Column(columns) => Some(columns.max(1)),
+            DocumentWrap::Viewport
+                if matches!(self.config.height, CodeViewerHeight::Content { .. })
+                    && self.measured_columns.get().is_some() =>
+            {
+                self.measured_columns.get()
+            }
             DocumentWrap::Viewport => self.viewport.map(|bounds| {
-                let gutter = if self.config.show_line_numbers {
-                    72.0
-                } else {
-                    16.0
-                };
-                let available = (f64::from(bounds.size.width) - gutter).max(20.0);
+                let line_digits = self.prepared.as_ref().map_or(1, |document| {
+                    document.lines().len().max(1).to_string().len()
+                });
                 let (text_size, _) = document_text_metrics(&self.config.text_style, &self.theme);
-                let character_width = (f64::from(text_size) * 0.604).max(1.0);
-                (available / character_width)
-                    .floor()
-                    .to_string()
-                    .parse()
-                    .unwrap_or(80)
-                    .max(1)
+                viewport_wrap_columns(
+                    f64::from(bounds.size.width),
+                    line_digits,
+                    f64::from(text_size),
+                )
             }),
         }
     }
@@ -947,17 +1079,79 @@ impl CodeViewerEntity {
         .size_full()
         .opacity(if self.loading { 0.62 } else { 1.0 });
         let _ = cx;
-        list.into_any_element()
+        div()
+            .relative()
+            .size_full()
+            .overflow_hidden()
+            .child(list)
+            .child(
+                self.config
+                    .scrollbar
+                    .context(&self.events, &self.theme)
+                    .element_with_wheel_routing(
+                        "code-scrollbar",
+                        self.scroll_source.clone(),
+                        self.config.scrollbar.spec,
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn content_measure(&self, max_height: Option<f32>) -> CodeContentMeasure {
+        let (text_size, line_height) = document_text_metrics(&self.config.text_style, &self.theme);
+        let line_digits = self.prepared.as_ref().map_or(1, |document| {
+            document.lines().len().max(1).to_string().len()
+        });
+        // The widest row, the one the row list measures.
+        let widest = self
+            .display
+            .iter()
+            .max_by_key(|segment| segment.range.end.saturating_sub(segment.range.start));
+        let row = self
+            .prepared
+            .as_ref()
+            .zip(widest)
+            .map(|(document, segment)| {
+                code_line_element(
+                    document,
+                    segment,
+                    line_digits,
+                    &self.config,
+                    &self.theme,
+                    &self.selection,
+                    &[],
+                    None,
+                    &self.events,
+                    &self.focus,
+                    self.loading,
+                )
+            });
+        CodeContentMeasure {
+            rows: Rc::new(ContentRows {
+                document: self.prepared.clone(),
+                display: Arc::clone(&self.display),
+                display_columns: self.display_columns,
+                wrap: self.config.wrap,
+                tab_size: self.config.tab_size,
+                line_digits,
+                text_size,
+                measured_columns: Rc::clone(&self.measured_columns),
+                last: Cell::new(None),
+            }),
+            row,
+            row_height: line_height.max(16.0),
+            max_height,
+        }
     }
 }
 
 impl Render for CodeViewerEntity {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut root = div()
+        crate::app::read_host_frame_epoch(cx);
+        let root = div()
             .relative()
             .flex()
             .flex_col()
-            .size_full()
             .min_w(px(0.0))
             .min_h(px(0.0))
             .key_context(CODE_CONTEXT)
@@ -969,11 +1163,25 @@ impl Render for CodeViewerEntity {
             .on_action(cx.listener(Self::close_find))
             .on_action(cx.listener(Self::copy_selection))
             .on_action(cx.listener(Self::reveal_line))
-            .on_action(cx.listener(Self::activate_location))
-            .child(self.content(cx))
-            .child(DocumentBoundsRecorder {
-                viewer: cx.entity(),
-            });
+            .on_action(cx.listener(Self::activate_location));
+        // A content-height viewer takes its height from the measured leaf; the rows
+        // fill that height out of flow and scroll only past `max`.
+        let mut root = match self.config.height {
+            CodeViewerHeight::Fill => root.size_full().child(self.content(cx)),
+            CodeViewerHeight::Content { max } => {
+                root.w_full().child(self.content_measure(max)).child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .flex_col()
+                        .child(self.content(cx)),
+                )
+            }
+        }
+        .child(DocumentBoundsRecorder {
+            viewer: cx.entity(),
+        });
         if self.search.open {
             root = root.child(self.search_bar(cx));
         }
@@ -1095,6 +1303,165 @@ impl IntoElement for DocumentBoundsRecorder {
     }
 }
 
+/// Counts a content-height `CodeViewer`'s display rows at the width layout offers.
+struct ContentRows {
+    document: Option<Arc<PreparedDocument>>,
+    display: Arc<[DisplaySegment]>,
+    display_columns: Option<usize>,
+    wrap: DocumentWrap,
+    tab_size: usize,
+    line_digits: usize,
+    text_size: f32,
+    measured_columns: Rc<Cell<Option<usize>>>,
+    /// The last count, so the layout passes of one frame wrap the document once.
+    last: Cell<Option<(Option<usize>, usize)>>,
+}
+
+impl ContentRows {
+    fn rows(&self, width: Option<Pixels>) -> usize {
+        let Some(document) = self.document.as_ref() else {
+            return 1;
+        };
+        let columns = match (self.wrap, width) {
+            (DocumentWrap::None, _) | (DocumentWrap::Viewport, None) => None,
+            (DocumentWrap::Column(columns), _) => Some(columns.max(1)),
+            (DocumentWrap::Viewport, Some(width)) => {
+                let columns = viewport_wrap_columns(
+                    f64::from(width),
+                    self.line_digits,
+                    f64::from(self.text_size),
+                );
+                self.measured_columns.set(Some(columns));
+                Some(columns)
+            }
+        };
+        let rows = if columns == self.display_columns && !self.display.is_empty() {
+            self.display.len()
+        } else if let Some((counted, rows)) = self.last.get()
+            && counted == columns
+        {
+            rows
+        } else {
+            let rows = code_display_rows(document, columns, self.tab_size);
+            self.last.set(Some((columns, rows)));
+            rows
+        };
+        rows.max(1)
+    }
+}
+
+/// The in-flow leaf that sizes a content-height `CodeViewer`. It lays out the widest
+/// row, as the row list does, for the row height and the intrinsic width, then
+/// measures the display rows at the width layout offers, so wrapped rows count at the
+/// current width.
+struct CodeContentMeasure {
+    rows: Rc<ContentRows>,
+    row: Option<AnyElement>,
+    /// Row height while no row is prepared.
+    row_height: f32,
+    max_height: Option<f32>,
+}
+
+impl Element for CodeContentMeasure {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (gpui::LayoutId, Self::RequestLayoutState) {
+        let row = self.row.take().map(|mut row| {
+            let available = size(AvailableSpace::MaxContent, AvailableSpace::MinContent);
+            row.layout_as_root(available, window, cx)
+        });
+        let row_width = row.map_or(px(0.0), |row| row.width);
+        let row_height = row.map_or(self.row_height, |row| f32::from(row.height));
+        let rows = Rc::clone(&self.rows);
+        let max_height = self.max_height;
+        let style = gpui::Style {
+            size: size(relative(1.0).into(), gpui::Length::Auto),
+            ..gpui::Style::default()
+        };
+        let layout = window.request_measured_layout(style, move |known, available, _, _| {
+            let width = known.width.or(match available.width {
+                AvailableSpace::Definite(width) => Some(width),
+                AvailableSpace::MinContent | AvailableSpace::MaxContent => None,
+            });
+            let height = content_height(rows.rows(width), row_height, max_height);
+            size(width.unwrap_or(row_width), px(height))
+        });
+        (layout, ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        (): &mut Self::RequestLayoutState,
+        _: &mut Window,
+        _: &mut App,
+    ) {
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        (): &mut Self::RequestLayoutState,
+        (): &mut Self::PrepaintState,
+        _: &mut Window,
+        _: &mut App,
+    ) {
+    }
+}
+
+impl IntoElement for CodeContentMeasure {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+/// Display rows of `document` wrapped at `columns`, as `build_code_display` lays them out.
+fn code_display_rows(
+    document: &PreparedDocument,
+    columns: Option<usize>,
+    tab_size: usize,
+) -> usize {
+    if columns.is_none() {
+        return document.lines().len();
+    }
+    document
+        .lines()
+        .iter()
+        .enumerate()
+        .map(|(index, line)| {
+            let text = document.line_text(index).unwrap_or_default();
+            wrap_source_line(&line.range, text, columns, tab_size).len()
+        })
+        .sum()
+}
+
+/// A content-height viewer's height: its rows, up to `max_height`.
+fn content_height(rows: usize, row_height: f32, max_height: Option<f32>) -> f32 {
+    let height = usize_f32(rows) * row_height;
+    max_height.map_or(height, |max| height.min(max))
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn code_line_element(
     document: &Arc<PreparedDocument>,
@@ -1105,7 +1472,7 @@ fn code_line_element(
     selection: &DocumentSelection,
     matches: &[Range<usize>],
     current_match: Option<usize>,
-    events: &PrimitiveEventEmitter,
+    events: &PrimitiveContext,
     focus: &FocusHandle,
     disabled: bool,
 ) -> AnyElement {
@@ -1122,10 +1489,12 @@ fn code_line_element(
                 local,
                 HighlightStyle {
                     color: Some(
-                        gpui::rgb_to_hsla(rgba(
+                        rgba(
                             theme_color(theme, syntax.kind.theme_token(), 0xd9de_e8ff)
                                 .as_rgba_hex(),
-                        ))),
+                        )
+                        .into(),
+                    ),
                     ..HighlightStyle::default()
                 },
             ));
@@ -1136,22 +1505,25 @@ fn code_line_element(
             highlights.push((
                 local,
                 HighlightStyle {
-                    background_color: Some(gpui::rgb_to_hsla(rgba(
-                        theme_color(
-                            theme,
-                            if current_match == Some(index) {
-                                "document.search_current"
-                            } else {
-                                "document.search_match"
-                            },
-                            if current_match == Some(index) {
-                                0xe0af_68aa
-                            } else {
-                                0x7aa2_f766
-                            },
+                    background_color: Some(
+                        rgba(
+                            theme_color(
+                                theme,
+                                if current_match == Some(index) {
+                                    "document.search_current"
+                                } else {
+                                    "document.search_match"
+                                },
+                                if current_match == Some(index) {
+                                    0xe0af_68aa
+                                } else {
+                                    0x7aa2_f766
+                                },
+                            )
+                            .as_rgba_hex(),
                         )
-                        .as_rgba_hex(),
-                    ))),
+                        .into(),
+                    ),
                     ..HighlightStyle::default()
                 },
             ));
@@ -1163,7 +1535,8 @@ fn code_line_element(
             range,
             HighlightStyle {
                 background_color: Some(
-                    gpui::rgb_to_hsla(rgba(theme_color(theme, "selection", 0x3347_6fff).as_rgba_hex()))),
+                    rgba(theme_color(theme, "selection", 0x3347_6fff).as_rgba_hex()).into(),
+                ),
                 ..HighlightStyle::default()
             },
         ));
@@ -1190,10 +1563,11 @@ fn code_line_element(
         selection: selection.clone(),
         focus: focus.clone(),
         events: events.clone(),
+        links: Arc::from([]),
         disabled,
     };
     let (text_size, line_height) = document_text_metrics(&config.text_style, theme);
-    let gutter_width = (usize_f32(line_digits) * 8.0 + 20.0).max(42.0);
+    let gutter_width = code_gutter_width(line_digits);
     let gutter = crate::renderer::apply_style_override(
         div()
             .w(px(gutter_width))
@@ -1223,6 +1597,12 @@ fn code_line_element(
             .h_full()
             .flex_1()
             .min_w(px(0.0))
+            .when(matches!(config.wrap, DocumentWrap::None), |content| {
+                // Preserve intrinsic text width in the uniform list's
+                // MaxContent measurement; a zero flex basis reports only the
+                // gutter and makes the native horizontal extent disappear.
+                content.flex_none().whitespace_nowrap()
+            })
             .flex()
             .items_center()
             .font_family(config.monospace_family.clone())
@@ -1240,6 +1620,9 @@ fn code_line_element(
         div()
             .w_full()
             .h(px(line_height.max(16.0)))
+            .when(matches!(config.wrap, DocumentWrap::None), |row| {
+                row.w_auto().min_w_full()
+            })
             .flex()
             .flex_row()
             .items_center()
@@ -1252,19 +1635,39 @@ fn code_line_element(
     .into_any_element()
 }
 
-struct InteractiveDocumentText {
-    id: ElementId,
-    text: StyledText,
-    source: Arc<str>,
-    global_range: Range<usize>,
-    offset_map: Arc<[(usize, usize)]>,
-    line: usize,
-    line_start: usize,
-    side: DocumentSide,
-    selection: DocumentSelection,
-    focus: FocusHandle,
-    events: PrimitiveEventEmitter,
-    disabled: bool,
+/// Width of a `CodeViewer` row's gutter; it is drawn, empty, when line numbers are off.
+fn code_gutter_width(line_digits: usize) -> f32 {
+    (usize_f32(line_digits) * 8.0 + 20.0).max(42.0)
+}
+
+/// Columns that fit beside the gutter when lines wrap at the viewport width.
+fn viewport_wrap_columns(viewport_width: f64, line_digits: usize, text_size: f64) -> usize {
+    let reserved = (f64::from(code_gutter_width(line_digits)) + 16.0).max(72.0);
+    let available = (viewport_width - reserved).max(20.0);
+    let character_width = (text_size * 0.604).max(1.0);
+    (available / character_width)
+        .floor()
+        .to_string()
+        .parse()
+        .unwrap_or(80)
+        .max(1)
+}
+
+pub(crate) struct InteractiveDocumentText {
+    pub(crate) id: ElementId,
+    pub(crate) text: StyledText,
+    pub(crate) source: Arc<str>,
+    pub(crate) global_range: Range<usize>,
+    pub(crate) offset_map: Arc<[(usize, usize)]>,
+    pub(crate) line: usize,
+    pub(crate) line_start: usize,
+    pub(crate) side: DocumentSide,
+    pub(crate) selection: DocumentSelection,
+    pub(crate) focus: FocusHandle,
+    pub(crate) events: PrimitiveContext,
+    /// Display-local link ranges. Links only emit; they never open a URL.
+    pub(crate) links: Arc<[(Range<usize>, String, String)]>,
+    pub(crate) disabled: bool,
 }
 
 impl Element for InteractiveDocumentText {
@@ -1273,6 +1676,19 @@ impl Element for InteractiveDocumentText {
 
     fn id(&self) -> Option<ElementId> {
         Some(self.id.clone())
+    }
+
+    fn a11y_role(&self) -> Option<gpui::Role> {
+        Some(gpui::Role::Label)
+    }
+
+    fn write_a11y_info(&self, node: &mut gpui::accesskit::Node) {
+        node.set_value(
+            self.source
+                .get(self.global_range.clone())
+                .unwrap_or_default()
+                .to_owned(),
+        );
     }
 
     fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
@@ -1303,6 +1719,7 @@ impl Element for InteractiveDocumentText {
         window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal)
     }
 
+    #[allow(clippy::too_many_lines)] // One shared native selection/link event registration pass.
     fn paint(
         &mut self,
         _: Option<&GlobalElementId>,
@@ -1320,6 +1737,14 @@ impl Element for InteractiveDocumentText {
         }
         window.set_cursor_style(CursorStyle::IBeam, hitbox);
         let layout = self.text.layout().clone();
+        if let Ok(index) = layout.index_for_position(window.mouse_position())
+            && self
+                .links
+                .iter()
+                .any(|(range, _, _)| range.contains(&index))
+        {
+            window.set_cursor_style(CursorStyle::PointingHand, hitbox);
+        }
         let clamp = |index: Result<usize, usize>| match index {
             Ok(index) | Err(index) => index,
         };
@@ -1347,7 +1772,7 @@ impl Element for InteractiveDocumentText {
                 let local = display_source_offset(&offset_map, display).min(range.len());
                 let global = range.start + local;
                 selection.begin(side, Arc::clone(&source), global);
-                if event.click_count >= 2 {
+                if event.click_count >= 2 && events.observes("location_activate") {
                     let mut payload = BTreeMap::from([
                         (
                             "line".to_owned(),
@@ -1396,9 +1821,27 @@ impl Element for InteractiveDocumentText {
         }
         {
             let hitbox = hitbox.clone();
+            let links = Arc::clone(&self.links);
+            let selection = self.selection.clone();
+            let events = self.events.clone();
             window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
                 if phase.bubble() && event.button == MouseButton::Left && hitbox.is_hovered(window)
                 {
+                    // A selection drag over a link must not activate it.
+                    let display = clamp(layout.index_for_position(event.position));
+                    if selection.selected_text().is_none()
+                        && let Some((_, href, text)) =
+                            links.iter().find(|(range, _, _)| range.contains(&display))
+                    {
+                        let payload = UiValue::Map(BTreeMap::from([
+                            ("href".to_owned(), UiValue::String(href.clone())),
+                            ("text".to_owned(), UiValue::String(text.clone())),
+                        ]));
+                        let events = events.clone();
+                        window.defer(cx, move |window, cx| {
+                            let _ = events.emit("link", payload, window, cx);
+                        });
+                    }
                     cx.stop_propagation();
                 }
             });
@@ -1438,7 +1881,7 @@ impl PrimitiveHandler for CodeViewerPrimitiveHandler {
     fn render(
         &mut self,
         instance: &PrimitiveInstance,
-        events: &PrimitiveEventEmitter,
+        events: &PrimitiveContext,
         theme: &PrimitiveTheme,
         window: &mut Window,
         cx: &mut App,
@@ -1451,7 +1894,7 @@ impl PrimitiveHandler for CodeViewerPrimitiveHandler {
             .monospace_family
             .get_or_insert_with(|| resolve_document_monospace_family(cx))
             .clone();
-        let config = parse_code_config(&instance.node.props, monospace_family)?;
+        let config = parse_code_config(&instance.node.props, monospace_family, theme)?;
         let search_typography = native_typography(theme, "body_small", window)?;
         let entity = if let Some(entity) = self.instances.get(&id) {
             entity.clone()
@@ -1496,35 +1939,60 @@ impl PrimitiveHandler for CodeViewerPrimitiveHandler {
 fn parse_code_config(
     props: &PrimitiveProps,
     monospace_family: SharedString,
+    theme: &PrimitiveTheme,
 ) -> Result<CodeViewerConfig, String> {
     let descriptor = DocumentDescriptor {
         source: document_source_prop(props, "source")?,
-        label: string_prop(props, "label").unwrap_or_else(|| "Code".to_owned()),
+        label: props.string("label").unwrap_or("Code").to_owned(),
         file_name: optional_string_prop(props, "file_name"),
         language: optional_string_prop(props, "language"),
     };
-    let wrap = match string_prop(props, "wrap").as_deref() {
+    let wrap = match props.string("wrap") {
         None | Some("none") => DocumentWrap::None,
         Some("viewport") => DocumentWrap::Viewport,
-        Some("column") => DocumentWrap::Column(integer_prop(props, "wrap_column").unwrap_or(100)),
+        Some("column") => DocumentWrap::Column(props.usize("wrap_column").unwrap_or(100)),
         Some(other) => return Err(format!("unknown CodeViewer wrap mode `{other}`")),
     };
+    let height = match props.string("height") {
+        None | Some("fill") => CodeViewerHeight::Fill,
+        Some("content") => CodeViewerHeight::Content {
+            max: code_max_height(props, theme)?,
+        },
+        Some(other) => return Err(format!("unknown CodeViewer height `{other}`")),
+    };
     Ok(CodeViewerConfig {
+        scrollbar: DocumentScrollbarConfig::parse(props)?,
         descriptor,
-        show_line_numbers: bool_prop(props, "show_line_numbers").unwrap_or(true),
+        show_line_numbers: props.boolean("show_line_numbers").unwrap_or(true),
         wrap,
-        tab_size: integer_prop(props, "tab_size").unwrap_or(4),
+        tab_size: props.usize("tab_size").unwrap_or(4),
+        height,
         monospace_family,
-        gutter_style: style_prop(props, "gutter_style"),
-        line_style: style_prop(props, "line_style"),
-        text_style: style_prop(props, "text_style"),
-        loading_style: style_prop(props, "loading_style"),
-        error_style: style_prop(props, "error_style"),
-        search_style: style_prop(props, "search_style"),
+        gutter_style: props.style("gutter_style").cloned().unwrap_or_default(),
+        line_style: props.style("line_style").cloned().unwrap_or_default(),
+        text_style: props.style("text_style").cloned().unwrap_or_default(),
+        loading_style: props.style("loading_style").cloned().unwrap_or_default(),
+        error_style: props.style("error_style").cloned().unwrap_or_default(),
+        search_style: props.style("search_style").cloned().unwrap_or_default(),
     })
 }
 
-fn document_source_prop(props: &PrimitiveProps, name: &str) -> Result<DocumentSource, String> {
+fn code_max_height(props: &PrimitiveProps, theme: &PrimitiveTheme) -> Result<Option<f32>, String> {
+    match props.get("max_height") {
+        None | Some(PrimitiveValue::Data(UiValue::Null)) => Ok(None),
+        Some(PrimitiveValue::Length(value)) => theme
+            .resolve_length(*value)
+            .and_then(resolved_pixels)
+            .map(Some)
+            .ok_or_else(|| "CodeViewer max_height must resolve to pixels or rems".to_owned()),
+        Some(_) => Err("CodeViewer max_height must be a Length".to_owned()),
+    }
+}
+
+pub(crate) fn document_source_prop(
+    props: &PrimitiveProps,
+    name: &str,
+) -> Result<DocumentSource, String> {
     match props.get(name) {
         Some(PrimitiveValue::Data(UiValue::String(value))) => Ok(value.clone().into()),
         Some(PrimitiveValue::Document(document)) => Ok(document.clone().into()),
@@ -1534,45 +2002,20 @@ fn document_source_prop(props: &PrimitiveProps, name: &str) -> Result<DocumentSo
     }
 }
 
-fn string_prop(props: &PrimitiveProps, name: &str) -> Option<String> {
-    match props.get(name) {
-        Some(PrimitiveValue::Data(UiValue::String(value))) => Some(value.clone()),
-        _ => None,
-    }
-}
-
 fn optional_string_prop(props: &PrimitiveProps, name: &str) -> Option<String> {
-    string_prop(props, name).filter(|value| !value.is_empty())
+    props
+        .string(name)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
-fn bool_prop(props: &PrimitiveProps, name: &str) -> Option<bool> {
-    match props.get(name) {
-        Some(PrimitiveValue::Data(UiValue::Bool(value))) => Some(*value),
-        _ => None,
-    }
-}
-
-fn integer_prop(props: &PrimitiveProps, name: &str) -> Option<usize> {
-    match props.get(name) {
-        Some(PrimitiveValue::Data(UiValue::Integer(value))) => usize::try_from(*value).ok(),
-        _ => None,
-    }
-}
-
-fn style_prop(props: &PrimitiveProps, name: &str) -> Style {
-    match props.get(name) {
-        Some(PrimitiveValue::Style(style)) => (**style).clone(),
-        _ => Style::new(),
-    }
-}
-
-fn theme_color(theme: &PrimitiveTheme, token: &str, fallback: u32) -> crate::Rgba8 {
+pub(crate) fn theme_color(theme: &PrimitiveTheme, token: &str, fallback: u32) -> crate::Rgba8 {
     theme
         .color(token)
         .unwrap_or_else(|| crate::Rgba8::from_rgba_hex(fallback))
 }
 
-fn resolved_pixels(length: crate::Length) -> Option<f32> {
+pub(crate) fn resolved_pixels(length: crate::Length) -> Option<f32> {
     match length {
         crate::Length::Pixels(value) => value.to_string().parse().ok(),
         crate::Length::Rems(value) => (value * 16.0).to_string().parse().ok(),
@@ -1580,7 +2023,7 @@ fn resolved_pixels(length: crate::Length) -> Option<f32> {
     }
 }
 
-fn document_text_metrics(style: &Style, theme: &PrimitiveTheme) -> (f32, f32) {
+pub(crate) fn document_text_metrics(style: &Style, theme: &PrimitiveTheme) -> (f32, f32) {
     let role = style.base.typography.as_deref().unwrap_or("body");
     let typography = theme.typography(role).or_else(|| theme.typography("body"));
     let default_size = typography
@@ -1695,7 +2138,7 @@ fn remap_highlights(
         .collect()
 }
 
-fn compose_highlights(
+pub(crate) fn compose_highlights(
     text_len: usize,
     layers: &[(Range<usize>, HighlightStyle)],
 ) -> Vec<(Range<usize>, HighlightStyle)> {
@@ -1846,6 +2289,7 @@ fn location_schema(include_side: bool) -> ValueSchema {
 /// # Panics
 ///
 /// Panics only if its compile-time primitive ID becomes invalid.
+#[allow(clippy::too_many_lines)] // One declarative list of documented props and events.
 pub fn code_viewer_primitive_descriptor() -> PrimitiveDescriptor {
     PrimitiveDescriptor {
         id: PrimitiveId::parse("gpui_rhai.code_viewer").expect("static primitive ID"),
@@ -1856,71 +2300,119 @@ pub fn code_viewer_primitive_descriptor() -> PrimitiveDescriptor {
                 ObjectField::required(ValueSchema::one_of([
                     ValueSchema::string(),
                     ValueSchema::Document,
-                ])),
+                ]))
+                .with_doc(
+                    "The document: an inline string or a `NativeTextDocument` from `ctx.get_native_text_document`.",
+                ),
             ),
             (
                 "label".to_owned(),
-                ObjectField::required(ValueSchema::string()),
+                ObjectField::required(ValueSchema::string()).with_doc(
+                    "Human-readable document name; the native view does not show it, so also pass it to `accessibility_label`.",
+                ),
             ),
             (
                 "file_name".to_owned(),
-                ObjectField::optional(ValueSchema::optional(ValueSchema::string())),
+                ObjectField::optional(ValueSchema::optional(ValueSchema::string())).with_doc(
+                    "File name, such as `service.toml`, whose extension picks the syntax when `language` does not.",
+                ),
             ),
             (
                 "language".to_owned(),
-                ObjectField::optional(ValueSchema::optional(ValueSchema::string())),
+                ObjectField::optional(ValueSchema::optional(ValueSchema::string())).with_doc(
+                    "Syntax name or extension, such as `rust`, ahead of `file_name`; unknown ones fall back to it, then plain text.",
+                ),
             ),
             (
                 "show_line_numbers".to_owned(),
-                ObjectField::optional(ValueSchema::Bool).with_default(UiValue::Bool(true)),
+                ObjectField::optional(ValueSchema::Bool)
+                    .with_default(UiValue::Bool(true))
+                    .with_doc(
+                        "Shows 1-based line numbers in the gutter on the first row of each line; with `false` the gutter stays, empty.",
+                    ),
             ),
             (
                 "wrap".to_owned(),
                 ObjectField::optional(ValueSchema::enumeration(["none", "viewport", "column"]))
-                    .with_default(UiValue::String("none".to_owned())),
+                    .with_default(UiValue::String("none".to_owned()))
+                    .with_doc(
+                        "`none` keeps each line on one row, `viewport` wraps at the visible width, `column` at `wrap_column` characters.",
+                    ),
             ),
             (
                 "wrap_column".to_owned(),
                 ObjectField::optional(ValueSchema::bounded_integer(Some(20), Some(500)))
-                    .with_default(UiValue::Integer(100)),
+                    .with_default(UiValue::Integer(100))
+                    .with_doc("Character column where lines wrap when `wrap` is `column`; ignored otherwise."),
             ),
             (
                 "tab_size".to_owned(),
                 ObjectField::optional(ValueSchema::bounded_integer(Some(1), Some(16)))
-                    .with_default(UiValue::Integer(4)),
+                    .with_default(UiValue::Integer(4))
+                    .with_doc("Columns between tab stops; a tab expands to the next stop for display and wrapping."),
+            ),
+            (
+                "height".to_owned(),
+                ObjectField::optional(ValueSchema::enumeration(["fill", "content"]))
+                    .with_default(UiValue::String("fill".to_owned()))
+                    .with_doc(
+                        "`fill` takes the box the node's style gives; `content` is as tall as the display rows at the current width, measured at layout time.",
+                    ),
+            ),
+            (
+                "max_height".to_owned(),
+                ObjectField::optional(ValueSchema::optional(ValueSchema::Length)).with_doc(
+                    "Most a `content` viewer grows, in pixels, rems or a length token; taller documents scroll inside. Ignored with `fill`.",
+                ),
             ),
             (
                 "gutter_style".to_owned(),
-                ObjectField::required(ValueSchema::Style),
+                ObjectField::required(ValueSchema::Style).with_doc(
+                    "Style of each row's line-number gutter; its font defaults to the platform monospace family.",
+                ),
             ),
             (
                 "line_style".to_owned(),
-                ObjectField::required(ValueSchema::Style),
+                ObjectField::required(ValueSchema::Style)
+                    .with_doc("Style of each whole row, gutter and text together."),
             ),
             (
                 "text_style".to_owned(),
-                ObjectField::required(ValueSchema::Style),
+                ObjectField::required(ValueSchema::Style).with_doc(
+                    "Style of each row's text; its `typography`, font size and line height set the row height.",
+                ),
             ),
             (
                 "loading_style".to_owned(),
-                ObjectField::required(ValueSchema::Style),
+                ObjectField::required(ValueSchema::Style).with_doc(
+                    "Style of the placeholder shown while the document is first prepared in the background.",
+                ),
             ),
             (
                 "error_style".to_owned(),
-                ObjectField::required(ValueSchema::Style),
+                ObjectField::required(ValueSchema::Style).with_doc(
+                    "Style of the message that replaces the view when preparing fails, for example past a size limit.",
+                ),
             ),
             (
                 "search_style".to_owned(),
-                ObjectField::required(ValueSchema::Style),
+                ObjectField::required(ValueSchema::Style)
+                    .with_doc("Style of the find bar that Cmd-F opens."),
             ),
             (
                 "on_location_activate".to_owned(),
-                ObjectField::optional(ValueSchema::optional(ValueSchema::Callback)),
+                ObjectField::optional(ValueSchema::optional(ValueSchema::Callback)).with_doc(
+                    "Called with the 1-based `#{ line, column }` when the text is double-clicked or Enter is pressed.",
+                ),
             ),
-        ]),
+        ]).into_iter().chain(document_scrollbar_props()).collect(),
         events: BTreeMap::from([(
             "location_activate".to_owned(),
             EventSchema {
+                doc: Some(
+                    "Emitted on a double-click in the text or Enter at the selection; the payload is the 1-based `line` and `column`."
+                        .to_owned(),
+                ),
                 payload: location_schema(false),
             },
         )]),
@@ -1932,6 +2424,7 @@ pub fn code_viewer_primitive_descriptor() -> PrimitiveDescriptor {
 
 #[derive(Clone, Debug, PartialEq)]
 struct DiffViewerConfig {
+    scrollbar: DocumentScrollbarConfig,
     left: DocumentDescriptor,
     right: DocumentDescriptor,
     mode: DiffViewMode,
@@ -2029,7 +2522,7 @@ struct DiffSearchState {
 
 struct DiffViewerEntity {
     config: DiffViewerConfig,
-    events: PrimitiveEventEmitter,
+    events: PrimitiveContext,
     theme: PrimitiveTheme,
     syntaxes: SyntaxRegistry,
     document_runtime: DocumentRuntimeConfig,
@@ -2037,6 +2530,8 @@ struct DiffViewerEntity {
     scroll: gpui::UniformListScrollHandle,
     left_horizontal: ScrollHandle,
     right_horizontal: ScrollHandle,
+    scroll_source: crate::ScrollbarSourceHandle,
+    pane_sources: [crate::ScrollbarSourceHandle; 2],
     prepared: Option<Arc<PreparedDiff>>,
     display: Arc<[DiffRenderRow]>,
     display_columns: Option<usize>,
@@ -2061,7 +2556,7 @@ struct DiffViewerEntity {
 impl DiffViewerEntity {
     fn new(
         config: DiffViewerConfig,
-        events: PrimitiveEventEmitter,
+        events: PrimitiveContext,
         theme: PrimitiveTheme,
         syntaxes: SyntaxRegistry,
         document_runtime: DocumentRuntimeConfig,
@@ -2090,6 +2585,7 @@ impl DiffViewerEntity {
                 TextInputConfig {
                     value: String::new(),
                     placeholder: "Find on both sides".to_owned(),
+                    placeholder_color: theme.color("text_muted"),
                     disabled: false,
                     read_only: false,
                     autofocus: false,
@@ -2101,6 +2597,18 @@ impl DiffViewerEntity {
                 cx,
             )
         });
+        let scroll = gpui::UniformListScrollHandle::new();
+        let left_horizontal = ScrollHandle::new();
+        let right_horizontal = ScrollHandle::new();
+        let scroll_source = crate::ScrollbarSourceHandle::new(scroll.clone());
+        let pane_sources =
+            [(&left_horizontal, false), (&right_horizontal, true)].map(|(horizontal, right)| {
+                crate::ScrollbarSourceHandle::new(DocumentPaneScrollSource {
+                    viewport: scroll.clone(),
+                    horizontal: horizontal.clone(),
+                    right,
+                })
+            });
         Self {
             config,
             events,
@@ -2108,9 +2616,11 @@ impl DiffViewerEntity {
             syntaxes,
             document_runtime,
             focus: cx.focus_handle(),
-            scroll: gpui::UniformListScrollHandle::new(),
-            left_horizontal: ScrollHandle::new(),
-            right_horizontal: ScrollHandle::new(),
+            scroll,
+            left_horizontal,
+            right_horizontal,
+            scroll_source,
+            pane_sources,
             prepared: None,
             display: Arc::from([]),
             display_columns: None,
@@ -2136,7 +2646,7 @@ impl DiffViewerEntity {
     fn update(
         &mut self,
         config: DiffViewerConfig,
-        events: PrimitiveEventEmitter,
+        events: PrimitiveContext,
         theme: &PrimitiveTheme,
         search_typography: NativeTypography,
         cx: &mut Context<Self>,
@@ -2159,6 +2669,7 @@ impl DiffViewerEntity {
                 &TextInputConfig {
                     value: self.search.query.clone(),
                     placeholder: "Find on both sides".to_owned(),
+                    placeholder_color: theme.color("text_muted"),
                     disabled: false,
                     read_only: false,
                     autofocus: false,
@@ -2923,12 +3434,62 @@ impl DiffViewerEntity {
         .flex_1()
         .min_h(px(0.0))
         .opacity(if self.loading { 0.62 } else { 1.0 });
-        list.into_any_element()
+        self.scrolled_content(list)
+    }
+
+    fn scrolled_content(&self, list: impl IntoElement) -> AnyElement {
+        let scrollbars = self.config.scrollbar.context(&self.events, &self.theme);
+        let split = self.config.mode == DiffViewMode::Split;
+        let spec = if split {
+            crate::ScrollbarSpec::new("hidden", self.config.scrollbar.spec.vertical().as_str())
+                .expect("validated visibility")
+        } else {
+            self.config.scrollbar.spec
+        };
+        div()
+            .relative()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
+            .overflow_hidden()
+            .child(list)
+            .child(
+                scrollbars
+                    .clone()
+                    .with_scroll_axis(split.then_some(gpui::Axis::Vertical))
+                    .element_with_wheel_routing("diff-scrollbar", self.scroll_source.clone(), spec),
+            )
+            .when(
+                split && matches!(self.config.wrap, DocumentWrap::None),
+                |root| {
+                    let spec = crate::ScrollbarSpec::new(
+                        self.config.scrollbar.spec.horizontal().as_str(),
+                        "hidden",
+                    )
+                    .expect("validated visibility");
+                    let panes = scrollbars
+                        .with_scroll_axis(Some(gpui::Axis::Horizontal))
+                        .with_scroll_parent(self.scroll_source.clone(), Some(gpui::Axis::Vertical));
+                    root.child(panes.element_with_wheel_routing(
+                        "left-scrollbar",
+                        self.pane_sources[0].clone(),
+                        spec,
+                    ))
+                    .child(panes.element_with_wheel_routing(
+                        "right-scrollbar",
+                        self.pane_sources[1].clone(),
+                        spec,
+                    ))
+                },
+            )
+            .into_any_element()
     }
 }
 
 impl Render for DiffViewerEntity {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::app::read_host_frame_epoch(cx);
         let status = self.prepared.as_ref().map_or_else(
             || "Preparing".to_owned(),
             |diff| {
@@ -3284,7 +3845,7 @@ fn diff_line_element(
     selection: &DocumentSelection,
     matches: &[DiffSearchMatch],
     current_match: Option<usize>,
-    events: &PrimitiveEventEmitter,
+    events: &PrimitiveContext,
     focus: &FocusHandle,
     weak: &gpui::WeakEntity<DiffViewerEntity>,
     left_horizontal: &ScrollHandle,
@@ -3445,7 +4006,7 @@ fn diff_cell(
     selection: &DocumentSelection,
     matches: &[DiffSearchMatch],
     current_match: Option<usize>,
-    events: &PrimitiveEventEmitter,
+    events: &PrimitiveContext,
     focus: &FocusHandle,
     horizontal: Option<&ScrollHandle>,
     disabled: bool,
@@ -3477,10 +4038,13 @@ fn diff_cell(
             highlights.push((
                 local,
                 HighlightStyle {
-                    color: Some(gpui::rgb_to_hsla(rgba(
-                        theme_color(theme, syntax.kind.theme_token(), 0xd9de_e8ff)
-                            .as_rgba_hex(),
-                    ))),
+                    color: Some(
+                        rgba(
+                            theme_color(theme, syntax.kind.theme_token(), 0xd9de_e8ff)
+                                .as_rgba_hex(),
+                        )
+                        .into(),
+                    ),
                     ..HighlightStyle::default()
                 },
             ));
@@ -3492,22 +4056,25 @@ fn diff_cell(
             highlights.push((
                 local,
                 HighlightStyle {
-                    background_color: Some(gpui::rgb_to_hsla(rgba(
-                        theme_color(
-                            theme,
-                            if side == DocumentSide::Left {
-                                "diff.inline_left"
-                            } else {
-                                "diff.inline_right"
-                            },
-                            if side == DocumentSide::Left {
-                                0x8b3f_4faa
-                            } else {
-                                0x3570_50aa
-                            },
+                    background_color: Some(
+                        rgba(
+                            theme_color(
+                                theme,
+                                if side == DocumentSide::Left {
+                                    "diff.inline_left"
+                                } else {
+                                    "diff.inline_right"
+                                },
+                                if side == DocumentSide::Left {
+                                    0x8b3f_4faa
+                                } else {
+                                    0x3570_50aa
+                                },
+                            )
+                            .as_rgba_hex(),
                         )
-                        .as_rgba_hex(),
-                    ))),
+                        .into(),
+                    ),
                     ..HighlightStyle::default()
                 },
             ));
@@ -3520,8 +4087,9 @@ fn diff_cell(
             highlights.push((
                 local,
                 HighlightStyle {
-                    background_color: Some(gpui::rgb_to_hsla(rgba(
-                                                    theme_color(
+                    background_color: Some(
+                        rgba(
+                            theme_color(
                                 theme,
                                 if current_match == Some(index) {
                                     "document.search_current"
@@ -3535,8 +4103,9 @@ fn diff_cell(
                                 },
                             )
                             .as_rgba_hex(),
-))),
-
+                        )
+                        .into(),
+                    ),
                     ..HighlightStyle::default()
                 },
             ));
@@ -3548,7 +4117,8 @@ fn diff_cell(
             range,
             HighlightStyle {
                 background_color: Some(
-                    gpui::rgb_to_hsla(rgba(theme_color(theme, "selection", 0x3347_6fff).as_rgba_hex()))),
+                    rgba(theme_color(theme, "selection", 0x3347_6fff).as_rgba_hex()).into(),
+                ),
                 ..HighlightStyle::default()
             },
         ));
@@ -3577,6 +4147,7 @@ fn diff_cell(
         selection: selection.clone(),
         focus: focus.clone(),
         events: events.clone(),
+        links: Arc::from([]),
         disabled,
     };
     let (text_size, line_height) = document_text_metrics(&config.text_style, theme);
@@ -3621,6 +4192,10 @@ fn diff_cell(
             .flex_1()
             .min_w(px(0.0))
             .px(px(8.0))
+            .when(
+                matches!(config.wrap, DocumentWrap::None) && horizontal.is_none(),
+                |content| content.flex_none().whitespace_nowrap(),
+            )
             .flex()
             .items_center()
             .font_family(config.monospace_family.clone())
@@ -3636,6 +4211,10 @@ fn diff_cell(
     );
     let row = div()
         .size_full()
+        .when(
+            matches!(config.wrap, DocumentWrap::None) && horizontal.is_none(),
+            |row| row.w_auto().min_w_full(),
+        )
         .flex()
         .bg(rgba(background.as_rgba_hex()))
         .child(gutter)
@@ -3656,6 +4235,7 @@ fn diff_cell(
                 segment.range.start
             )))
             .overflow_x_scroll()
+            .restrict_scroll_to_axis()
             .track_scroll(horizontal)
             .bg(rgba(background.as_rgba_hex()))
             .child(row.w(px(width)))
@@ -3689,7 +4269,7 @@ impl PrimitiveHandler for DiffViewerPrimitiveHandler {
     fn render(
         &mut self,
         instance: &PrimitiveInstance,
-        events: &PrimitiveEventEmitter,
+        events: &PrimitiveContext,
         theme: &PrimitiveTheme,
         window: &mut Window,
         cx: &mut App,
@@ -3748,18 +4328,20 @@ fn parse_diff_config(
     let descriptor = |prefix: &str| -> Result<DocumentDescriptor, String> {
         Ok(DocumentDescriptor {
             source: document_source_prop(props, &format!("{prefix}_source"))?,
-            label: string_prop(props, &format!("{prefix}_label"))
-                .unwrap_or_else(|| prefix.to_owned()),
+            label: props
+                .string(&format!("{prefix}_label"))
+                .unwrap_or(prefix)
+                .to_owned(),
             file_name: optional_string_prop(props, &format!("{prefix}_file_name")),
             language: optional_string_prop(props, &format!("{prefix}_language")),
         })
     };
-    let mode = match string_prop(props, "mode").as_deref() {
+    let mode = match props.string("mode") {
         None | Some("unified") => DiffViewMode::Unified,
         Some("split") => DiffViewMode::Split,
         Some(other) => return Err(format!("unknown DiffViewer mode `{other}`")),
     };
-    let whitespace = match string_prop(props, "whitespace").as_deref() {
+    let whitespace = match props.string("whitespace") {
         None | Some("exact") => DiffWhitespace::Exact,
         Some("ignore_changes") => DiffWhitespace::IgnoreChanges,
         Some("ignore_all") => DiffWhitespace::IgnoreAll,
@@ -3772,31 +4354,32 @@ fn parse_diff_config(
         ),
         _ => Some(3),
     };
-    let wrap = match string_prop(props, "wrap").as_deref() {
+    let wrap = match props.string("wrap") {
         None | Some("none") => DocumentWrap::None,
         Some("viewport") => DocumentWrap::Viewport,
-        Some("column") => DocumentWrap::Column(integer_prop(props, "wrap_column").unwrap_or(100)),
+        Some("column") => DocumentWrap::Column(props.usize("wrap_column").unwrap_or(100)),
         Some(other) => return Err(format!("unknown DiffViewer wrap mode `{other}`")),
     };
     Ok(DiffViewerConfig {
+        scrollbar: DocumentScrollbarConfig::parse(props)?,
         left: descriptor("left")?,
         right: descriptor("right")?,
         mode,
         whitespace,
         context_lines,
-        show_line_numbers: bool_prop(props, "show_line_numbers").unwrap_or(true),
+        show_line_numbers: props.boolean("show_line_numbers").unwrap_or(true),
         wrap,
-        tab_size: integer_prop(props, "tab_size").unwrap_or(4),
+        tab_size: props.usize("tab_size").unwrap_or(4),
         monospace_family,
-        header_style: style_prop(props, "header_style"),
-        gutter_style: style_prop(props, "gutter_style"),
-        line_style: style_prop(props, "line_style"),
-        text_style: style_prop(props, "text_style"),
-        fold_style: style_prop(props, "fold_style"),
-        loading_style: style_prop(props, "loading_style"),
-        error_style: style_prop(props, "error_style"),
-        search_style: style_prop(props, "search_style"),
-        status_style: style_prop(props, "status_style"),
+        header_style: props.style("header_style").cloned().unwrap_or_default(),
+        gutter_style: props.style("gutter_style").cloned().unwrap_or_default(),
+        line_style: props.style("line_style").cloned().unwrap_or_default(),
+        text_style: props.style("text_style").cloned().unwrap_or_default(),
+        fold_style: props.style("fold_style").cloned().unwrap_or_default(),
+        loading_style: props.style("loading_style").cloned().unwrap_or_default(),
+        error_style: props.style("error_style").cloned().unwrap_or_default(),
+        search_style: props.style("search_style").cloned().unwrap_or_default(),
+        status_style: props.style("status_style").cloned().unwrap_or_default(),
     })
 }
 
@@ -3807,19 +4390,28 @@ fn optional_document_fields(prefix: &str) -> Vec<(String, ObjectField)> {
             ObjectField::required(ValueSchema::one_of([
                 ValueSchema::string(),
                 ValueSchema::Document,
-            ])),
+            ]))
+            .with_doc(format!(
+                "The {prefix} document: an inline string or a `NativeTextDocument`; left and right are neutral, not old and new."
+            )),
         ),
         (
             format!("{prefix}_label"),
-            ObjectField::required(ValueSchema::string()),
+            ObjectField::required(ValueSchema::string()).with_doc(format!(
+                "Name of the {prefix} side in the header, and its file name in a unified patch copied with Option-Cmd-C."
+            )),
         ),
         (
             format!("{prefix}_file_name"),
-            ObjectField::optional(ValueSchema::optional(ValueSchema::string())),
+            ObjectField::optional(ValueSchema::optional(ValueSchema::string())).with_doc(format!(
+                "File name whose extension picks the {prefix} side's syntax when `{prefix}_language` does not."
+            )),
         ),
         (
             format!("{prefix}_language"),
-            ObjectField::optional(ValueSchema::optional(ValueSchema::string())),
+            ObjectField::optional(ValueSchema::optional(ValueSchema::string())).with_doc(format!(
+                "Syntax name or extension for the {prefix} side, ahead of `{prefix}_file_name`; unknown ones fall back to it."
+            )),
         ),
     ]
 }
@@ -3835,11 +4427,15 @@ pub fn diff_viewer_primitive_descriptor() -> PrimitiveDescriptor {
     let mut props = BTreeMap::new();
     props.extend(optional_document_fields("left"));
     props.extend(optional_document_fields("right"));
+    props.extend(document_scrollbar_props());
     props.extend([
         (
             "mode".to_owned(),
             ObjectField::optional(ValueSchema::enumeration(["unified", "split"]))
-                .with_default(UiValue::String("unified".to_owned())),
+                .with_default(UiValue::String("unified".to_owned()))
+                .with_doc(
+                    "`unified` interleaves both sides in one column; `split` shows left and right side by side on aligned rows.",
+                ),
         ),
         (
             "whitespace".to_owned(),
@@ -3848,7 +4444,10 @@ pub fn diff_viewer_primitive_descriptor() -> PrimitiveDescriptor {
                 "ignore_changes",
                 "ignore_all",
             ]))
-            .with_default(UiValue::String("exact".to_owned())),
+            .with_default(UiValue::String("exact".to_owned()))
+            .with_doc(
+                "`exact` compares lines as they are, `ignore_changes` collapses and trims whitespace, `ignore_all` drops it all; a unified patch copied with Option-Cmd-C always compares exactly.",
+            ),
         ),
         (
             "context_lines".to_owned(),
@@ -3856,66 +4455,93 @@ pub fn diff_viewer_primitive_descriptor() -> PrimitiveDescriptor {
                 ValueSchema::bounded_integer(Some(0), Some(100)),
                 ValueSchema::enumeration(["all"]),
             ]))
-            .with_default(UiValue::Integer(3)),
+            .with_default(UiValue::Integer(3))
+            .with_doc(
+                "Unchanged lines kept around each change; longer equal runs fold into an expandable row, and `all` never folds.",
+            ),
         ),
         (
             "show_line_numbers".to_owned(),
-            ObjectField::optional(ValueSchema::Bool).with_default(UiValue::Bool(true)),
+            ObjectField::optional(ValueSchema::Bool)
+                .with_default(UiValue::Bool(true))
+                .with_doc("Shows each side's 1-based line numbers in the gutter."),
         ),
         (
             "wrap".to_owned(),
             ObjectField::optional(ValueSchema::enumeration(["none", "viewport", "column"]))
-                .with_default(UiValue::String("none".to_owned())),
+                .with_default(UiValue::String("none".to_owned()))
+                .with_doc(
+                    "`none` keeps each line on one row, `viewport` wraps at the pane width, `column` at `wrap_column` characters.",
+                ),
         ),
         (
             "wrap_column".to_owned(),
             ObjectField::optional(ValueSchema::bounded_integer(Some(20), Some(500)))
-                .with_default(UiValue::Integer(100)),
+                .with_default(UiValue::Integer(100))
+                .with_doc("Character column where lines wrap when `wrap` is `column`; ignored otherwise."),
         ),
         (
             "tab_size".to_owned(),
             ObjectField::optional(ValueSchema::bounded_integer(Some(1), Some(16)))
-                .with_default(UiValue::Integer(4)),
+                .with_default(UiValue::Integer(4))
+                .with_doc("Columns between tab stops; a tab expands to the next stop for display and wrapping."),
         ),
         (
             "header_style".to_owned(),
-            ObjectField::required(ValueSchema::Style),
+            ObjectField::required(ValueSchema::Style)
+                .with_doc("Style of the header bar that shows `left_label` and `right_label`."),
         ),
         (
             "gutter_style".to_owned(),
-            ObjectField::required(ValueSchema::Style),
+            ObjectField::required(ValueSchema::Style).with_doc(
+                "Style of each row's line-number gutter; its font defaults to the platform monospace family.",
+            ),
         ),
         (
             "line_style".to_owned(),
-            ObjectField::required(ValueSchema::Style),
+            ObjectField::required(ValueSchema::Style)
+                .with_doc("Style of each whole diff row, gutters and text together."),
         ),
         (
             "text_style".to_owned(),
-            ObjectField::required(ValueSchema::Style),
+            ObjectField::required(ValueSchema::Style).with_doc(
+                "Style of each row's text; its `typography`, font size and line height set the row height.",
+            ),
         ),
         (
             "fold_style".to_owned(),
-            ObjectField::required(ValueSchema::Style),
+            ObjectField::required(ValueSchema::Style).with_doc(
+                "Style of the row that stands for folded unchanged lines; clicking it expands them.",
+            ),
         ),
         (
             "loading_style".to_owned(),
-            ObjectField::required(ValueSchema::Style),
+            ObjectField::required(ValueSchema::Style).with_doc(
+                "Style of the placeholder shown while the comparison is first calculated in the background.",
+            ),
         ),
         (
             "error_style".to_owned(),
-            ObjectField::required(ValueSchema::Style),
+            ObjectField::required(ValueSchema::Style).with_doc(
+                "Style of the message that replaces the view when preparing fails, for example past a size limit.",
+            ),
         ),
         (
             "search_style".to_owned(),
-            ObjectField::required(ValueSchema::Style),
+            ObjectField::required(ValueSchema::Style)
+                .with_doc("Style of the find bar that Cmd-F opens; it searches both documents."),
         ),
         (
             "status_style".to_owned(),
-            ObjectField::required(ValueSchema::Style),
+            ObjectField::required(ValueSchema::Style).with_doc(
+                "Style of the bottom status bar that shows the current change and the change-navigation keys.",
+            ),
         ),
         (
             "on_location_activate".to_owned(),
-            ObjectField::optional(ValueSchema::optional(ValueSchema::Callback)),
+            ObjectField::optional(ValueSchema::optional(ValueSchema::Callback)).with_doc(
+                "Called with the 1-based `#{ side, line, column }` when the text is double-clicked or Enter is pressed.",
+            ),
         ),
     ]);
     PrimitiveDescriptor {
@@ -3925,6 +4551,10 @@ pub fn diff_viewer_primitive_descriptor() -> PrimitiveDescriptor {
         events: BTreeMap::from([(
             "location_activate".to_owned(),
             EventSchema {
+                doc: Some(
+                    "Emitted on a double-click in either pane or Enter at the selection; the payload is the `side` and 1-based position."
+                        .to_owned(),
+                ),
                 payload: location_schema(true),
             },
         )]),
@@ -3959,6 +4589,77 @@ mod tests {
             matches!(source, ValueSchema::OneOf { variants } if variants.contains(&ValueSchema::Document))
         );
         assert!(descriptor.lifecycle);
+    }
+
+    #[test]
+    fn viewport_wrapping_leaves_room_for_the_drawn_gutter() {
+        let text_size = 12.0;
+        let character_width = text_size * 0.604;
+        for line_digits in [1, 3, 7] {
+            let columns = viewport_wrap_columns(400.0, line_digits, text_size);
+            let used = f64::from(code_gutter_width(line_digits));
+            assert!(
+                f64::from(usize_f32(columns)) * character_width + used <= 400.0,
+                "{line_digits} digits wrap at {columns} columns"
+            );
+        }
+    }
+
+    #[test]
+    fn content_rows_count_the_display_rows_at_the_offered_width() {
+        let descriptor = DocumentDescriptor {
+            source: "short\n\tindented line that is long enough to wrap\n\nend"
+                .to_owned()
+                .into(),
+            label: "Sample".to_owned(),
+            file_name: None,
+            language: None,
+        };
+        let document =
+            Arc::new(crate::prepare_document(&descriptor, &SyntaxRegistry::new()).unwrap());
+        for columns in [None, Some(1), Some(6), Some(20), Some(200)] {
+            assert_eq!(
+                code_display_rows(&document, columns, 4),
+                build_code_display(&document, columns, 4).len(),
+                "{columns:?} columns"
+            );
+        }
+        let measured = Rc::new(Cell::new(None));
+        let rows = ContentRows {
+            document: Some(Arc::clone(&document)),
+            display: build_code_display(&document, None, 4),
+            display_columns: None,
+            wrap: DocumentWrap::Viewport,
+            tab_size: 4,
+            line_digits: 1,
+            text_size: 14.0,
+            measured_columns: Rc::clone(&measured),
+            last: Cell::new(None),
+        };
+        // Without a definite width, as in an intrinsic-size pass, lines stay whole.
+        assert_eq!(rows.rows(None), 4);
+        assert_eq!(measured.get(), None);
+        assert_eq!(rows.rows(Some(px(2000.0))), 4);
+        let columns = viewport_wrap_columns(200.0, 1, 14.0);
+        let narrow = rows.rows(Some(px(200.0)));
+        assert_eq!(measured.get(), Some(columns));
+        assert_eq!(
+            narrow,
+            build_code_display(&document, Some(columns), 4).len()
+        );
+        assert!(narrow > 4, "the long line wraps at 200px: {narrow} rows");
+        let unprepared = ContentRows {
+            document: None,
+            ..rows
+        };
+        assert_eq!(unprepared.rows(Some(px(200.0))), 1);
+    }
+
+    #[test]
+    fn content_height_is_the_rows_up_to_the_maximum() {
+        assert!((content_height(3, 22.0, None) - 66.0).abs() < f32::EPSILON);
+        assert!((content_height(3, 22.0, Some(200.0)) - 66.0).abs() < f32::EPSILON);
+        assert!((content_height(40, 22.0, Some(200.0)) - 200.0).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -3998,8 +4699,8 @@ mod tests {
 
     #[test]
     fn overlapping_highlight_layers_become_ordered_composed_runs() {
-        let syntax_color = gpui::rgb_to_hsla(rgba(0x1122_33ff));
-        let selection_color = gpui::rgb_to_hsla(rgba(0x4455_66ff));
+        let syntax_color = rgba(0x1122_33ff).into();
+        let selection_color = rgba(0x4455_66ff).into();
         let runs = compose_highlights(
             4,
             &[

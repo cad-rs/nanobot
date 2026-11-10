@@ -3,20 +3,34 @@ name = "nanobot-llm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "nanobot LLM provider adapter seam: StreamChunk/BlockAssembler vocabulary + LlmAdapter trait + OpenAI-compatible and Scripted adapters"
+description = "nanobot LLM provider adapter seam: StreamChunk/BlockAssembler vocabulary + LlmAdapter trait + Scripted adapter, with the OpenAI-compatible adapter behind a feature"
 
 [lib]
 crate-type = ["rlib"]
 
+[features]
+default = ["providers"]
+# The HTTP provider adapter (OpenAI-compatible: OpenAI, DeepSeek, Ollama,
+# vLLM, …). With this off the crate builds network-free — only the provider
+# seam, the streaming vocabulary and the scripted adapter — which is what a
+# headless CLI, an MCP server or a test wants.
+#
+# Instrumentation is a choice; so is the network stack.
+providers = ["dep:reqwest", "dep:eventsource-stream", "dep:bytes"]
+
 [dependencies]
-bytes.workspace = true
-reqwest.workspace = true
-eventsource-stream.workspace = true
+bytes = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+eventsource-stream = { workspace = true, optional = true }
 futures-core.workspace = true
 futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+nanobot-telemetry = { workspace = true }
 
 [dev-dependencies]
 futures-executor = "0.3"
+# The OpenAI-compatible adapter is reqwest-based, so its integration tests need
+# a reactor to drive the request. Test-only.
+tokio = { version = "1", features = ["rt", "net", "time"] }
