@@ -38,13 +38,14 @@ use nanobot_boot::Settings;
 use nanobot_gpu::{ViewportProjection, ViewportSlot};
 
 use crate::model::{
-    plan_progress, PlanDecision, ProjectId,
+    PlanDecision, ProjectId,
     SessionId, SessionStatus, SessionStore, SessionView, WorkspaceView,
 };
 use crate::panels::{PanelArea, PanelDef, PanelHost};
 use crate::commands::{Candidate, Command, RewindMode};
 use crate::composer::{ApprovalDecision, Delivery, MessageQueue, PermissionMode};
 use crate::palette::{Completion, PaletteState};
+use crate::sidebar::Renaming;
 use crate::i18n::Locale;
 use crate::icons::{self, sized, Icon};
 use crate::layout::{Divider, Fold, Layout, LayoutState, Stacked};
@@ -98,6 +99,24 @@ actions!(
         PaletteDown,
         /// Closes the palette.
         PaletteClose,
+        /// Puts the keyboard in the sidebar.
+        FocusSidebar,
+        /// Moves up in the sidebar.
+        SidebarUp,
+        /// Moves down in the sidebar.
+        SidebarDown,
+        /// Opens the session, or folds or unfolds the heading, the keyboard is on.
+        SidebarOpen,
+        /// Folds the heading the keyboard is on.
+        SidebarFold,
+        /// Unfolds the heading the keyboard is on.
+        SidebarUnfold,
+        /// Renames the session the keyboard is on.
+        SidebarRename,
+        /// Archives the session the keyboard is on.
+        SidebarArchive,
+        /// Puts the keyboard in the sidebar's filter.
+        SidebarFilter,
     ]
 );
 
@@ -105,6 +124,8 @@ actions!(
 pub const KEY_CONTEXT: &str = "HarnessShell";
 /// The key context of the open command palette.
 pub const PALETTE_CONTEXT: &str = "HarnessPalette";
+/// The key context of the session sidebar.
+pub const SIDEBAR_CONTEXT: &str = "HarnessSidebar";
 
 /// Installs the shell's default key bindings. The product calls this once at
 /// startup (after `gpui_component::init`); bindings it adds afterwards win.
@@ -123,6 +144,15 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("up", PaletteUp, Some(PALETTE_CONTEXT)),
         KeyBinding::new("down", PaletteDown, Some(PALETTE_CONTEXT)),
         KeyBinding::new("escape", PaletteClose, Some(PALETTE_CONTEXT)),
+        KeyBinding::new("ctrl-alt-;", FocusSidebar, Some(KEY_CONTEXT)),
+        KeyBinding::new("up", SidebarUp, Some(SIDEBAR_CONTEXT)),
+        KeyBinding::new("down", SidebarDown, Some(SIDEBAR_CONTEXT)),
+        KeyBinding::new("enter", SidebarOpen, Some(SIDEBAR_CONTEXT)),
+        KeyBinding::new("left", SidebarFold, Some(SIDEBAR_CONTEXT)),
+        KeyBinding::new("right", SidebarUnfold, Some(SIDEBAR_CONTEXT)),
+        KeyBinding::new("f2", SidebarRename, Some(SIDEBAR_CONTEXT)),
+        KeyBinding::new("shift-backspace", SidebarArchive, Some(SIDEBAR_CONTEXT)),
+        KeyBinding::new("ctrl-f", SidebarFilter, Some(SIDEBAR_CONTEXT)),
     ]);
 }
 
@@ -149,6 +179,12 @@ type CompletionSource = Rc<dyn Fn(char, &str) -> Vec<Candidate>>;
 /// Told to rewind: the session, the user message's event sequence, how far
 /// back, and what the message says now.
 type RewindCallback = Rc<dyn Fn(&SessionId, u64, RewindMode, &str)>;
+
+/// Told to rename a session: the session and its new title.
+pub(crate) type RenameCallback = Rc<dyn Fn(&SessionId, &str)>;
+
+/// Told to archive a session.
+pub(crate) type ArchiveCallback = Rc<dyn Fn(&SessionId)>;
 
 /// A contingent-plan decision callback.
 type PlanDecisionCallback = Rc<RefCell<dyn Fn(&SessionId, PlanDecision)>>;
@@ -202,6 +238,18 @@ pub struct HarnessShell<S: SessionView> {
     /// The user message being rewound to, by its event sequence.
     pub(crate) rewinding: Option<u64>,
     pub(crate) on_rewind: Option<RewindCallback>,
+    /// The sidebar: which projects show their sessions, which show their
+    /// long-idle ones, what is typed in the filter and where the keyboard is.
+    pub(crate) expanded_projects: HashSet<ProjectId>,
+    pub(crate) earlier_expanded: HashSet<ProjectId>,
+    pub(crate) sidebar_query: String,
+    pub(crate) sidebar_filter: Option<Entity<InputState>>,
+    _sidebar_filter_sub: Option<Subscription>,
+    pub(crate) sidebar_selected: Option<usize>,
+    pub(crate) sidebar_focus: Option<FocusHandle>,
+    pub(crate) renaming: Option<Renaming>,
+    pub(crate) on_rename: Option<RenameCallback>,
+    pub(crate) on_archive: Option<ArchiveCallback>,
     /// Callback invoked when the user decides a contingent plan.
     pub(crate) on_plan_decision: Option<PlanDecisionCallback>,
     /// Undo/redo and container save/load/import: the app layer forwards them to
@@ -210,7 +258,7 @@ pub struct HarnessShell<S: SessionView> {
     on_redo: Option<SessionCallback>,
     /// An optional product projection of the sidebar (design-rooted groups
     /// instead of the flat session list). `None` = the default view.
-    sidebar_projection: Option<Rc<dyn crate::model::SidebarProjection<S>>>,
+    pub(crate) sidebar_projection: Option<Rc<dyn crate::model::SidebarProjection<S>>>,
     on_save: Option<SessionCallback>,
     on_load: Option<SessionCallback>,
     on_import: Option<SessionCallback>,
@@ -264,7 +312,7 @@ pub struct HarnessShell<S: SessionView> {
     /// The conversation as rows of a virtualised list.
     pub(crate) stream: StreamState,
     /// Sessions that finished a turn while another was on screen.
-    unread: RefCell<HashSet<SessionId>>,
+    pub(crate) unread: RefCell<HashSet<SessionId>>,
 }
 
 /// One script plugin as the plugins panel shows it.
@@ -303,6 +351,16 @@ impl<S: SessionView> HarnessShell<S> {
             completion: None,
             rewinding: None,
             on_rewind: None,
+            expanded_projects: HashSet::new(),
+            earlier_expanded: HashSet::new(),
+            sidebar_query: String::new(),
+            sidebar_filter: None,
+            _sidebar_filter_sub: None,
+            sidebar_selected: None,
+            sidebar_focus: None,
+            renaming: None,
+            on_rename: None,
+            on_archive: None,
             on_message_sent: None,
             on_plan_decision: None,
             sidebar_projection: None,
@@ -333,6 +391,9 @@ impl<S: SessionView> HarnessShell<S> {
             stream: StreamState::default(),
             unread: RefCell::new(HashSet::new()),
         };
+        // The open project starts unfolded; the others wait to be asked.
+        let open = shell.store.borrow().open_project_id().clone();
+        shell.expanded_projects.insert(open);
         // Framework chrome: the diagnostics panel is always there (it reads
         // nothing but shell state), the settings panel joins when the app
         // layer shares a store.
@@ -467,11 +528,28 @@ impl<S: SessionView> HarnessShell<S> {
             }
         });
 
+        // The sidebar's filter: what is typed narrows the rows as it is typed.
+        let filter = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(crate::i18n::t(locale, "sidebar.filter"))
+        });
+        let filter_sub = cx.subscribe_in(
+            &filter,
+            window,
+            |shell: &mut Self, input, event: &InputEvent, _window, cx| {
+                if matches!(event, InputEvent::Change) {
+                    shell.set_sidebar_filter(input.read(cx).value().to_string());
+                    cx.notify();
+                }
+            },
+        );
+
         let mut shell = Self::new(store);
         shell.locale = locale;
         shell.composer = Some(composer);
         shell._composer_sub = Some(subscription);
         shell._completion_keys = Some(keys);
+        shell.sidebar_filter = Some(filter);
+        shell._sidebar_filter_sub = Some(filter_sub);
         shell
     }
 
@@ -1011,6 +1089,7 @@ impl<S: SessionView> HarnessShell<S> {
         if !self.store.borrow_mut().set_open_project(id) {
             return false;
         }
+        self.expanded_projects.insert(id.clone());
         let session_id = self.store.borrow().open_project().session_index.clone();
         self.workspace = None;
         if let Some(session_id) = session_id {
@@ -1058,26 +1137,6 @@ fn session_color(status: SessionStatus, p: Palette) -> Hsla {
         SessionStatus::Running => p.info,
         SessionStatus::AwaitingUser => p.warning,
         SessionStatus::Error => p.danger,
-    }
-}
-
-/// The mark a session row carries, if any: its words and its colour.
-fn badge_mark(badge: SessionBadge, locale: Locale, p: Palette) -> Option<(&'static str, Hsla)> {
-    match badge {
-        SessionBadge::AwaitingUser => Some((
-            SessionStatus::AwaitingUser.label(locale),
-            session_color(SessionStatus::AwaitingUser, p),
-        )),
-        SessionBadge::Error => Some((
-            SessionStatus::Error.label(locale),
-            session_color(SessionStatus::Error, p),
-        )),
-        SessionBadge::Running => Some((
-            SessionStatus::Running.label(locale),
-            session_color(SessionStatus::Running, p),
-        )),
-        SessionBadge::Unread => Some((crate::i18n::t(locale, "status.unread"), p.accent)),
-        SessionBadge::None => None,
     }
 }
 
@@ -1251,6 +1310,8 @@ impl<S: SessionView> HarnessShell<S> {
                         if this.layout.reveal_sidebar(width) {
                             this.save_layout();
                         }
+                        // And the keyboard lands on who is waiting.
+                        this.select_first_waiting();
                         cx.notify();
                     }),
                 ))
@@ -1472,162 +1533,8 @@ impl<S: SessionView> HarnessShell<S> {
             .child(import_btn)
     }
 
-    /// The session list (home sidebar): project switcher on top, then the open
-    /// project's sessions grouped by project.
-    fn sidebar(&self, width: f32, cx: &mut Context<Self>) -> impl IntoElement {
-        let p = palette(cx);
-        let mut projects = div().flex().flex_col().gap_1();
-        for project in self.store.borrow().projects() {
-            let id = project.id.clone();
-            let selected = &id == self.store.borrow().open_project_id();
-            let sessions = project.sessions.len();
-            projects = projects.child(
-                div()
-                    .px_2()
-                    .py_1()
-                    .rounded(px(4.))
-                    .cursor_pointer()
-                    .when(selected, |d| d.bg(p.accent))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this: &mut Self, _ev: &MouseDownEvent, _w, cx| {
-                            if this.switch_project(&id) {
-                                cx.notify();
-                            }
-                        }),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .text_sm()
-                                    .when(selected, |d| d.font_semibold())
-                                    .child(project.name.clone()),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(p.muted)
-                                    .child(format!("{sessions}")),
-                            ),
-                    ),
-            );
-        }
 
-        let mut project_tree = div().flex().flex_col().gap_1();
-        for project in self.store.borrow().projects() {
-            let project_id = project.id.clone();
-            let selected_project = &project_id == self.store.borrow().open_project_id();
-            let sessions = project.sessions.clone();
-            let project_name = project.name.clone();
-            let session_count = sessions.len();
-
-            let project_row = div()
-                .px_2()
-                .py_1()
-                .rounded(px(4.))
-                .cursor_pointer()
-                .when(selected_project, |d| d.bg(p.accent.opacity(0.3)))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this: &mut Self, _ev: &MouseDownEvent, _w, cx| {
-                        if this.switch_project(&project_id) {
-                            cx.notify();
-                        }
-                    }),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_2()
-                        .child(div().text_xs().text_color(p.info).child("▸".to_string()))
-                        .child(
-                            div()
-                                .flex_1()
-                                .text_sm()
-                                .when(selected_project, |d| d.font_semibold())
-                                .child(project_name),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(p.muted)
-                                .child(format!("{session_count}")),
-                        ),
-                );
-
-            project_tree = project_tree.child(project_row);
-
-            if selected_project {
-                for (label, members) in crate::model::resolve_sidebar_groups(
-                    &self.store.borrow(),
-                    self.sidebar_projection.as_deref(),
-                ) {
-                    if self.sidebar_projection.is_some() {
-                        project_tree = project_tree.child(
-                            div()
-                                .px_2()
-                                .pt_1()
-                                .text_xs()
-                                .text_color(p.muted)
-                                .child(label),
-                        );
-                    }
-                    for session in &members {
-                        project_tree = project_tree.child(self.session_row(session, p, cx));
-                    }
-                }
-            }
-        }
-
-        div()
-            .w(px(width))
-            .h_full()
-            .flex_none()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .p_2()
-            .border_r_1()
-            .border_color(p.border)
-            .child(div().text_xs().text_color(p.muted).child(self.tr("shell.projects")))
-            .child(projects)
-            .child(
-                div()
-                    .flex_none()
-                    .px_2()
-                    .pt_2()
-                    .text_xs()
-                    .text_color(p.muted)
-                    .child(self.trf(
-                        "shell.sessions",
-                        &[
-                            ("count", &self.store.borrow().open_project().name),
-                            ("total", &self.store.borrow().open_project_sessions().len().to_string()),
-                        ],
-                    )),
-            )
-            .child(
-                div()
-                    .id("harness-session-list".to_string())
-                    .flex_1()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .overflow_y_scroll()
-                    .child(project_tree),
-            )
-            .child(self.sidebar_footer(p, cx))
-    }
-
-    fn sidebar_footer(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn sidebar_footer(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex_none()
             .px_2()
@@ -1731,53 +1638,6 @@ impl<S: SessionView> HarnessShell<S> {
         }
     }
 
-    fn session_row(&self, session: &S, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
-        let id = session.id().clone();
-        let selected = self.active_session_id() == Some(&id);
-        let (done, total) = plan_progress(&session.plan());
-        let mark = badge_mark(self.badge_of(session), self.locale, p);
-        let title = session.title();
-        let branch = session.branch_marker();
-        div()
-            .px_2()
-            .py_2()
-            .rounded(px(6.))
-            .cursor_pointer()
-            .when(selected, |d| d.bg(p.accent))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this: &mut Self, _ev: &MouseDownEvent, _w, cx| {
-                    if this.switch_session(&id) {
-                        cx.notify();
-                    }
-                }),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .when_some(branch, |d, _marker| {
-                        d.child(icons::icon(Icon::Branch, p.info))
-                    })
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_sm()
-                            .when(selected, |d| d.font_semibold())
-                            .child(title),
-                    )
-                    .when_some(mark, |d, (label, color)| d.child(badge(label, color))),
-            )
-            .child(
-                div()
-                    .mt_1()
-                    .text_xs()
-                    .text_color(p.muted)
-                    .child(self.trf("shell.plan_progress", &[("done", &done.to_string()), ("total", &total.to_string())])),
-            )
-    }
 
 
     fn viewport_slot(&self) -> impl IntoElement {
@@ -2294,6 +2154,11 @@ impl<S: SessionView> Render for HarnessShell<S> {
         if window.focused(cx).is_none() {
             window.focus(&anchor, cx);
         }
+        // The sidebar takes the keyboard as a whole: its rows are moved
+        // through with the arrows.
+        if self.sidebar_focus.is_none() {
+            self.sidebar_focus = Some(cx.focus_handle());
+        }
 
         // The registry is cloned out so the panel factories can be called with
         // an immutable borrow of the shell.
@@ -2306,7 +2171,7 @@ impl<S: SessionView> Render for HarnessShell<S> {
         let mut body = div().flex_1().flex().flex_row().overflow_hidden().child(left);
         if let Some(width) = regions.sidebar {
             body = body
-                .child(self.sidebar(width, cx))
+                .child(self.render_sidebar(width, cx))
                 .child(self.divider(Divider::Sidebar, cx));
         }
         match self.workspace.as_ref() {
@@ -2424,6 +2289,20 @@ impl<S: SessionView> Render for HarnessShell<S> {
             }))
             .on_action(cx.listener(|this: &mut Self, _: &PaletteClose, window, cx| {
                 this.close_palette(window, cx);
+            }))
+            .on_action(cx.listener(|this: &mut Self, _: &FocusSidebar, window, cx| {
+                // A hidden sidebar is shown first.
+                let width = f32::from(window.viewport_size().width);
+                if this.layout.reveal_sidebar(width) {
+                    this.save_layout();
+                }
+                if let Some(focus) = this.sidebar_focus.clone() {
+                    window.focus(&focus, cx);
+                }
+                if this.sidebar_selected.is_none() {
+                    this.step_sidebar(1);
+                }
+                cx.notify();
             }))
             // A divider drag is followed here, at the root, so it keeps going
             // wherever the pointer is.

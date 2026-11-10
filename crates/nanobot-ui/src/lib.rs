@@ -33,6 +33,7 @@ pub mod palette;
 pub mod panels;
 pub mod poll;
 pub mod shell;
+pub mod sidebar;
 pub mod stream;
 pub mod theme;
 pub mod transcript;
@@ -50,6 +51,7 @@ pub use transcript::{
     ToolStatus, Transcript, TurnPhase,
 };
 pub use layout::{Divider, Fold, Layout, LayoutState, Regions, Stacked};
+pub use sidebar::{SidebarRow, INACTIVE_AFTER_MS};
 pub use shell::{
     init, CyclePermissionMode, HarnessShell, OpenPalette, StopTurn, ToggleDock, ToggleSidebar,
     KEY_CONTEXT, PALETTE_CONTEXT,
@@ -1395,6 +1397,145 @@ mod tests {
             assert!(!shell.palette_is_open());
             assert_eq!(shell.active_session_id().unwrap().as_str(), "s2");
         });
+    }
+
+    // ---- the sidebar ----
+
+    /// The sidebar's rows as short words: "P:p1", "S:s1", "E:2".
+    fn sidebar_brief(shell: &HarnessShell<TestSession>) -> Vec<String> {
+        shell
+            .sidebar_rows()
+            .iter()
+            .map(|row| match row {
+                SidebarRow::Project { id, .. } => format!("P:{id}"),
+                SidebarRow::Group { label } => format!("G:{label}"),
+                SidebarRow::Session { id, .. } => format!("S:{id}"),
+                SidebarRow::Earlier { count, .. } => format!("E:{count}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_sidebar_starts_with_the_open_project_unfolded() {
+        let mut shell = HarnessShell::new(two_project_store());
+        assert_eq!(sidebar_brief(&shell), ["P:p1", "S:s1", "S:s2", "P:p2"]);
+
+        shell.toggle_project(&ProjectId::new("p2"));
+        assert_eq!(sidebar_brief(&shell), ["P:p1", "S:s1", "S:s2", "P:p2", "S:s3"]);
+        shell.toggle_project(&ProjectId::new("p1"));
+        assert_eq!(sidebar_brief(&shell), ["P:p1", "P:p2", "S:s3"]);
+    }
+
+    #[test]
+    fn a_session_of_another_project_opens_its_project_first() {
+        let mut shell = HarnessShell::new(two_project_store());
+        shell.toggle_project(&ProjectId::new("p2"));
+        assert!(shell.open_session(&ProjectId::new("p2"), &SessionId::new("s3")));
+        assert_eq!(shell.store().open_project_id(), &ProjectId::new("p2"));
+        assert_eq!(shell.active_session_id().unwrap().as_str(), "s3");
+
+        // Back, to a session that is not the one the project remembers.
+        assert!(shell.open_session(&ProjectId::new("p1"), &SessionId::new("s2")));
+        assert_eq!(shell.active_session_id().unwrap().as_str(), "s2");
+        assert!(!shell.open_session(&ProjectId::new("p1"), &SessionId::new("nope")));
+        assert!(!shell.open_session(&ProjectId::new("p1"), &SessionId::new("s2")), "already there");
+    }
+
+    #[test]
+    fn the_keyboard_moves_through_the_sidebar_without_changing_what_is_on_screen() {
+        let mut shell = HarnessShell::new(two_project_store());
+        let on_screen = |shell: &HarnessShell<TestSession>| shell.active_session_id().unwrap().to_string();
+        assert_eq!(shell.sidebar_selection(), None);
+
+        shell.step_sidebar(1); // P:p1
+        shell.step_sidebar(1); // S:s1
+        shell.step_sidebar(1); // S:s2
+        assert_eq!(shell.sidebar_selection(), Some(2));
+        assert_eq!(shell.selected_session(), Some(SessionId::new("s2")));
+        assert_eq!(on_screen(&shell), "s1", "looking is not opening");
+
+        assert!(shell.activate_sidebar_selection());
+        assert_eq!(on_screen(&shell), "s2");
+
+        // On a heading, Enter and the arrows fold and unfold.
+        shell.step_sidebar(1); // P:p2
+        assert_eq!(shell.selected_session(), None);
+        shell.set_sidebar_selection_expanded(true);
+        assert_eq!(sidebar_brief(&shell).last().unwrap(), "S:s3");
+        shell.set_sidebar_selection_expanded(true);
+        assert_eq!(sidebar_brief(&shell).len(), 5, "already unfolded: nothing to do");
+        shell.set_sidebar_selection_expanded(false);
+        assert_eq!(sidebar_brief(&shell).last().unwrap(), "P:p2");
+        assert!(shell.activate_sidebar_selection());
+        assert_eq!(sidebar_brief(&shell).last().unwrap(), "S:s3");
+    }
+
+    #[test]
+    fn the_filter_narrows_the_sidebar() {
+        let mut shell = HarnessShell::new(two_project_store());
+        shell.step_sidebar(1);
+        shell.set_sidebar_filter("session s3");
+        assert_eq!(sidebar_brief(&shell), ["P:p2", "S:s3"], "its project unfolds for it");
+        assert_eq!(shell.sidebar_selection(), None, "the rows under the selection changed");
+        shell.set_sidebar_filter("");
+        assert_eq!(sidebar_brief(&shell), ["P:p1", "S:s1", "S:s2", "P:p2"]);
+    }
+
+    #[test]
+    fn the_attention_count_takes_the_keyboard_to_who_is_waiting() {
+        let mut shell = HarnessShell::new(one_project(vec![
+            TestSession::new("s1"),
+            TestSession::new("s2"),
+            with_status("s3", SessionStatus::AwaitingUser),
+        ]));
+        shell.select_first_waiting();
+        assert_eq!(shell.selected_session(), Some(SessionId::new("s3")));
+        // It sorted to the top of its project.
+        assert_eq!(sidebar_brief(&shell), ["P:p1", "S:s3", "S:s1", "S:s2"]);
+    }
+
+    #[test]
+    fn renaming_and_archiving_ask_the_product() {
+        let asked = Rc::new(RefCell::new(Vec::new()));
+        let mut shell = HarnessShell::new(two_project_store());
+        let s2 = SessionId::new("s2");
+        assert!(!shell.rename_session(&s2, "New name"), "no way to rename yet");
+        assert!(!shell.archive_session(&s2));
+
+        let log = asked.clone();
+        shell.set_on_rename(move |id, title| log.borrow_mut().push(format!("rename {id} {title}")));
+        let log = asked.clone();
+        shell.set_on_archive(move |id| log.borrow_mut().push(format!("archive {id}")));
+        assert!(shell.rename_session(&s2, "  Bracket holes "));
+        assert!(!shell.rename_session(&s2, "   "), "a title needs words");
+        assert!(shell.archive_session(&s2));
+        assert_eq!(*asked.borrow(), ["rename s2 Bracket holes", "archive s2"]);
+    }
+
+    #[gpui::test]
+    fn the_sidebar_is_driven_from_the_keyboard(cx: &mut gpui::TestAppContext) {
+        let (shell, cx) = typing_shell(cx);
+        // From the composer to the sidebar; the first row is selected.
+        cx.simulate_keystrokes("ctrl-alt-;");
+        redraw(&shell, cx);
+        assert_eq!(shell.read_with(cx, |shell, _| shell.sidebar_selection()), Some(0));
+
+        // Down to the second session and open it.
+        cx.simulate_keystrokes("down down enter");
+        redraw(&shell, cx);
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.active_session_id().unwrap().as_str(), "s2");
+        });
+        // Arrows in the sidebar did not type into the composer.
+        assert_eq!(composed(&shell, cx), "");
+
+        // Up to the project heading; left folds it away.
+        cx.simulate_keystrokes("up up left");
+        redraw(&shell, cx);
+        assert_eq!(shell.read_with(cx, |shell, _| sidebar_brief(shell)), ["P:p1"]);
+        cx.simulate_keystrokes("right");
+        redraw(&shell, cx);
+        assert_eq!(shell.read_with(cx, |shell, _| sidebar_brief(shell)).len(), 3);
     }
 
     // ---- panel host ----

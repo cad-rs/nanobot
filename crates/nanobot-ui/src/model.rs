@@ -273,6 +273,12 @@ pub trait SessionView: Clone + 'static {
     fn plan_phase(&self) -> PlanPhase;
     fn clarify_questions(&self) -> Vec<String>;
     fn branch_marker(&self) -> Option<BranchMarker>;
+    /// When the session was last active, in ms since the unix epoch: what the
+    /// sidebar orders by and shows as an age. `None` when the product does
+    /// not track it.
+    fn last_active_ms(&self) -> Option<u64> {
+        None
+    }
     /// Whether the session is archived: kept, but out of the sidebar's list.
     fn archived(&self) -> bool {
         false

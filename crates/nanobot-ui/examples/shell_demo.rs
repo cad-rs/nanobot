@@ -35,6 +35,14 @@
 //! - Ctrl+Tab / Ctrl+Shift+Tab change session, Ctrl+N starts one, Ctrl+L puts
 //!   the keyboard in the composer, Ctrl+End jumps to the end.
 //!
+//! The sidebar:
+//! - both projects are groups; click a heading to fold it (a folded one still
+//!   shows how many sessions are waiting);
+//! - sessions that want you come first; two old ones sit under "较早";
+//! - type in the filter; Ctrl+Alt+; puts the keyboard in the sidebar, then
+//!   arrows, Enter, left and right, F2 to rename, Shift+Backspace to archive
+//!   (renaming and archiving only log here).
+//!
 //! The layout is saved in `shell_demo/settings.json` under the user's config
 //! directory; delete it to start over.
 
@@ -145,6 +153,8 @@ struct Demo {
     conversation: Rc<RefCell<Conversation>>,
     plan: Vec<PlanStep>,
     plan_phase: PlanPhase,
+    /// Hours since it was last active, for the sidebar's ages.
+    idle_hours: u64,
 }
 
 /// One of every kind of entry, so every kind of row is on screen.
@@ -273,6 +283,7 @@ impl Demo {
                 },
             ],
             plan_phase: PlanPhase::Executing,
+            idle_hours: 0,
         }
     }
 }
@@ -340,6 +351,9 @@ impl SessionView for Demo {
     fn clarify_questions(&self) -> Vec<String> {
         Vec::new()
     }
+    fn last_active_ms(&self) -> Option<u64> {
+        Some(nanobot_boot::account::now_ms().saturating_sub(self.idle_hours * 3_600_000))
+    }
     fn branch_marker(&self) -> Option<BranchMarker> {
         None
     }
@@ -363,6 +377,18 @@ fn store(streaming: Rc<RefCell<Conversation>>) -> SessionStore<Demo> {
                     },
                     Demo::new("s5", "壁厚检查出错", SessionStatus::Error),
                     Demo::new("s4", "加强筋待确认", SessionStatus::AwaitingUser),
+                    Demo {
+                        idle_hours: 5,
+                        ..Demo::new("s6", "圆角方案", SessionStatus::Idle)
+                    },
+                    Demo {
+                        idle_hours: 200,
+                        ..Demo::new("s7", "上周的草图", SessionStatus::Idle)
+                    },
+                    Demo {
+                        idle_hours: 900,
+                        ..Demo::new("s8", "上月的备选方案", SessionStatus::Idle)
+                    },
                 ],
                 session_index: Some(SessionId::new("s1")),
             },
@@ -497,6 +523,8 @@ fn main() {
                     }
                 });
                 shell.set_on_stop(|id| log::info!("stop {id}"));
+                shell.set_on_rename(|id, title| log::info!("rename {id} to {title}"));
+                shell.set_on_archive(|id| log::info!("archive {id}"));
                 shell.set_on_permission_mode(|mode| log::info!("permission mode: {mode:?}"));
                 // The running session's answer arrives a little every tick,
                 // ends, rests, and starts over.
