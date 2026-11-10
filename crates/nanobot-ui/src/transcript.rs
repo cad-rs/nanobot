@@ -2,24 +2,20 @@
 //! (docs/ui-redesign-design.md §5.2, §11).
 //!
 //! A conversation is a list of [`Entry`] values, each anchored to the event
-//! sequence that produced it. Unlike the flat text blocks they replace, entries
+//! sequence that produced it. Entries
 //! say what they are — a user message, an assistant answer in markdown, a
 //! thinking span, a tool call with its kind, status and output — because the
 //! shell draws each differently: most tool calls as one line, a few as a card.
 //!
-//! The product still hands over its conversation whole ([`Conversation`]); it
-//! is a projection of an event log, and re-projecting is the product's simplest
-//! path. What the shell does with it is [`Transcript::reconcile`]: compare the
-//! new projection with the one on screen and reduce the difference to
-//! [`Change`]s at entry indices — appended here, updated there, removed from
-//! there on. A virtualised list applies those in place instead of rebuilding,
-//! which is what keeps a streaming answer cheap.
+//! The product hands over its conversation whole ([`Conversation`]); it is a
+//! projection of an event log, and re-projecting is the product's simplest
+//! path. [`Transcript`] holds the one on screen and says whether a new one
+//! differs; what changed row by row is worked out where the rows are
+//! ([`crate::stream`]).
 //!
 //! [`TurnPhase`] is the other half: where the turn stands, stated by the
-//! product rather than guessed from the last entry. What the send button does,
-//! what the activity bar shows and which badge a session carries all read it.
-
-use std::ops::Range;
+//! product rather than guessed from the last entry. What the send button does
+//! and what the activity bar shows both read it.
 
 use crate::model::{PlanStep, SessionStatus};
 
@@ -61,11 +57,6 @@ pub enum ToolStatus {
 }
 
 impl ToolStatus {
-    /// Whether the call is over, one way or another.
-    pub fn is_settled(self) -> bool {
-        !matches!(self, Self::AwaitingApproval | Self::Running)
-    }
-
     pub fn label(self, locale: crate::i18n::Locale) -> &'static str {
         crate::i18n::t(
             locale,
@@ -302,28 +293,6 @@ impl Conversation {
     pub fn last_seq(&self) -> u64 {
         self.entries.last().map_or(0, |entry| entry.seq)
     }
-
-    /// Entries must anchor to strictly increasing event sequences.
-    pub fn anchors_are_monotonic(&self) -> bool {
-        self.entries
-            .windows(2)
-            .all(|pair| pair[0].seq < pair[1].seq)
-    }
-}
-
-/// How the entries on screen differ from a new projection, at entry indices.
-/// A list applies them in the order given.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum Change {
-    /// The entry at this index is the same event with new content (a
-    /// streaming answer grew, a tool call finished).
-    Updated(usize),
-    /// The entries in this range are gone (a rewind, or history that changed
-    /// from here on).
-    Removed(Range<usize>),
-    /// `count` entries were added starting at index `at`, which is the end of
-    /// the list at that point.
-    Appended { at: usize, count: usize },
 }
 
 /// The conversation on screen: the last projection the shell was given.
@@ -337,44 +306,11 @@ impl Transcript {
         &self.entries
     }
 
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    /// Takes a new projection and returns what changed, in the order a list
-    /// should apply it.
-    ///
-    /// Entries are matched by their event sequence. While the sequences agree
-    /// from the start, an entry whose content differs is an update. From the
-    /// first index where they disagree, the old entries are removed and the
-    /// new ones appended: histories that diverge share only their beginning.
-    pub fn reconcile(&mut self, conversation: Conversation) -> Vec<Change> {
-        let new = conversation.entries;
-        let shared = self
-            .entries
-            .iter()
-            .zip(&new)
-            .take_while(|(old, new)| old.seq == new.seq)
-            .count();
-        let mut changes: Vec<Change> = (0..shared)
-            .filter(|&ix| self.entries[ix] != new[ix])
-            .map(Change::Updated)
-            .collect();
-        if self.entries.len() > shared {
-            changes.push(Change::Removed(shared..self.entries.len()));
-        }
-        if new.len() > shared {
-            changes.push(Change::Appended {
-                at: shared,
-                count: new.len() - shared,
-            });
-        }
-        self.entries = new;
-        changes
+    /// Takes a new projection. True when it differs from the one on screen.
+    pub fn replace(&mut self, conversation: Conversation) -> bool {
+        let changed = self.entries != conversation.entries;
+        self.entries = conversation.entries;
+        changed
     }
 }
 
@@ -405,14 +341,6 @@ impl TurnPhase {
         !matches!(self, Self::Idle | Self::Error)
     }
 
-    /// Whether the turn is stopped until the user does something.
-    pub fn awaits_user(self) -> bool {
-        matches!(
-            self,
-            Self::AwaitingApproval | Self::AwaitingClarification | Self::AwaitingDecision
-        )
-    }
-
     /// What the composer's button does now, given whether anything is typed.
     pub fn composer_action(self, has_input: bool) -> ComposerAction {
         match (self, has_input) {
@@ -425,30 +353,6 @@ impl TurnPhase {
             (Self::Generating, true) => ComposerAction::Queue,
             (_, false) => ComposerAction::Stop,
         }
-    }
-
-    /// The session status this phase amounts to, as the sidebar counts it.
-    pub fn status(self) -> SessionStatus {
-        match self {
-            Self::Idle => SessionStatus::Idle,
-            Self::Generating => SessionStatus::Running,
-            Self::Error => SessionStatus::Error,
-            _ => SessionStatus::AwaitingUser,
-        }
-    }
-
-    pub fn label(self, locale: crate::i18n::Locale) -> &'static str {
-        crate::i18n::t(
-            locale,
-            match self {
-                Self::Idle => "turn.idle",
-                Self::Generating => "turn.generating",
-                Self::AwaitingApproval => "turn.awaiting_approval",
-                Self::AwaitingClarification => "turn.awaiting_clarification",
-                Self::AwaitingDecision => "turn.awaiting_decision",
-                Self::Error => "turn.error",
-            },
-        )
     }
 }
 
@@ -463,9 +367,8 @@ pub enum ComposerAction {
     Stop,
 }
 
-/// The mark a session carries in the sidebar. More urgent ones come first:
-/// a session waiting for the user outranks one that merely finished.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, PartialOrd, Ord, Hash)]
+/// The mark a session carries in the sidebar.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum SessionBadge {
     /// Waiting for the user: an approval, a question or a plan to decide.
     AwaitingUser,
@@ -502,10 +405,6 @@ impl SessionBadge {
 mod tests {
     use super::*;
 
-    fn read(seq: u64, status: ToolStatus) -> Entry {
-        Entry::tool(seq, ToolCall::new(ToolKind::Read, "read Body1", status))
-    }
-
     #[test]
     fn only_some_tool_calls_are_cards() {
         let call = |kind, status| ToolCall::new(kind, "x", status);
@@ -529,156 +428,6 @@ mod tests {
     }
 
     #[test]
-    fn anchors_must_strictly_increase() {
-        let mut conversation =
-            Conversation::from_entries(vec![Entry::user(1, "hi"), Entry::assistant(2, "hello")]);
-        assert!(conversation.anchors_are_monotonic());
-        assert_eq!(conversation.last_seq(), 2);
-        conversation.entries[1].seq = 1;
-        assert!(!conversation.anchors_are_monotonic());
-        assert_eq!(Conversation::default().last_seq(), 0);
-    }
-
-    #[test]
-    fn a_first_projection_is_all_appended() {
-        let mut transcript = Transcript::default();
-        let changes = transcript.reconcile(Conversation::from_entries(vec![
-            Entry::user(1, "hi"),
-            Entry::assistant(2, "hello"),
-        ]));
-        assert_eq!(changes, [Change::Appended { at: 0, count: 2 }]);
-        assert_eq!(transcript.len(), 2);
-        // The same projection again: nothing to do.
-        let again = Conversation::from_entries(transcript.entries().to_vec());
-        assert!(transcript.reconcile(again).is_empty());
-    }
-
-    #[test]
-    fn a_streaming_answer_updates_one_entry() {
-        let mut transcript = Transcript::default();
-        transcript.reconcile(Conversation::from_entries(vec![
-            Entry::user(1, "hi"),
-            Entry::assistant_streaming(2, "hel"),
-        ]));
-        let changes = transcript.reconcile(Conversation::from_entries(vec![
-            Entry::user(1, "hi"),
-            Entry::assistant_streaming(2, "hello, wor"),
-        ]));
-        assert_eq!(changes, [Change::Updated(1)], "the user message is untouched");
-
-        // It finishes, and a tool call follows in the same projection.
-        let changes = transcript.reconcile(Conversation::from_entries(vec![
-            Entry::user(1, "hi"),
-            Entry::assistant(2, "hello, world"),
-            read(3, ToolStatus::Running),
-        ]));
-        assert_eq!(
-            changes,
-            [Change::Updated(1), Change::Appended { at: 2, count: 1 }]
-        );
-    }
-
-    #[test]
-    fn a_tool_call_finishing_is_an_update() {
-        let mut transcript = Transcript::default();
-        transcript.reconcile(Conversation::from_entries(vec![
-            read(1, ToolStatus::Running),
-            read(2, ToolStatus::Running),
-        ]));
-        let changes = transcript.reconcile(Conversation::from_entries(vec![
-            read(1, ToolStatus::Done),
-            read(2, ToolStatus::Running),
-        ]));
-        assert_eq!(changes, [Change::Updated(0)]);
-    }
-
-    #[test]
-    fn a_rewind_removes_the_tail() {
-        let mut transcript = Transcript::default();
-        transcript.reconcile(Conversation::from_entries(
-            (1..=5).map(|seq| Entry::user(seq, "m")).collect(),
-        ));
-        let changes = transcript.reconcile(Conversation::from_entries(
-            (1..=2).map(|seq| Entry::user(seq, "m")).collect(),
-        ));
-        assert_eq!(changes, [Change::Removed(2..5)]);
-        assert_eq!(transcript.len(), 2);
-
-        let changes = transcript.reconcile(Conversation::default());
-        assert_eq!(changes, [Change::Removed(0..2)]);
-        assert!(transcript.is_empty());
-    }
-
-    #[test]
-    fn histories_that_diverge_keep_only_their_shared_start() {
-        let mut transcript = Transcript::default();
-        transcript.reconcile(Conversation::from_entries(vec![
-            Entry::user(1, "a"),
-            Entry::assistant(2, "b"),
-            Entry::user(3, "c"),
-        ]));
-        // After a rewind to 1 the session went on differently: 4, 5.
-        let changes = transcript.reconcile(Conversation::from_entries(vec![
-            Entry::user(1, "a"),
-            Entry::user(4, "d"),
-            Entry::assistant(5, "e"),
-        ]));
-        assert_eq!(
-            changes,
-            [Change::Removed(1..3), Change::Appended { at: 1, count: 2 }]
-        );
-        assert_eq!(transcript.entries()[1].seq, 4);
-    }
-
-    #[test]
-    fn another_sessions_conversation_replaces_everything() {
-        let mut transcript = Transcript::default();
-        transcript.reconcile(Conversation::from_entries(vec![Entry::user(7, "a")]));
-        let changes =
-            transcript.reconcile(Conversation::from_entries(vec![Entry::user(1, "b")]));
-        assert_eq!(
-            changes,
-            [Change::Removed(0..1), Change::Appended { at: 0, count: 1 }]
-        );
-    }
-
-    /// Applying the changes to a mirror of the old list gives the new one:
-    /// what a virtualised list does with them.
-    #[test]
-    fn changes_replay_onto_a_list() {
-        let steps: Vec<Vec<Entry>> = vec![
-            vec![Entry::user(1, "a")],
-            vec![Entry::user(1, "a"), Entry::assistant_streaming(2, "b")],
-            vec![
-                Entry::user(1, "a"),
-                Entry::assistant(2, "bb"),
-                read(3, ToolStatus::Running),
-            ],
-            vec![Entry::user(1, "a")],
-            vec![Entry::user(1, "a"), Entry::user(9, "z"), Entry::user(10, "y")],
-            vec![],
-        ];
-        let mut transcript = Transcript::default();
-        let mut mirror: Vec<u64> = Vec::new();
-        for step in steps {
-            for change in transcript.reconcile(Conversation::from_entries(step.clone())) {
-                match change {
-                    Change::Updated(ix) => assert_eq!(mirror[ix], step[ix].seq),
-                    Change::Removed(range) => {
-                        mirror.drain(range);
-                    }
-                    Change::Appended { at, count } => {
-                        assert_eq!(at, mirror.len(), "appends land at the end");
-                        mirror.extend(step[at..at + count].iter().map(|entry| entry.seq));
-                    }
-                }
-            }
-            let expected: Vec<u64> = step.iter().map(|entry| entry.seq).collect();
-            assert_eq!(mirror, expected);
-        }
-    }
-
-    #[test]
     fn the_composer_button_follows_the_turn() {
         use ComposerAction::{Queue, Send, Stop};
         assert_eq!(TurnPhase::Idle.composer_action(true), Send);
@@ -695,36 +444,30 @@ mod tests {
         ] {
             assert_eq!(phase.composer_action(true), Send, "{phase:?}");
             assert_eq!(phase.composer_action(false), Stop, "{phase:?}");
-            assert!(phase.awaits_user() && phase.is_busy());
+            assert!(phase.is_busy());
         }
         assert!(!TurnPhase::Idle.is_busy() && !TurnPhase::Error.is_busy());
     }
 
     #[test]
-    fn badges_rank_by_urgency() {
+    fn a_badge_says_what_a_session_needs() {
         use SessionBadge as B;
         assert_eq!(B::of(SessionStatus::AwaitingUser, true), B::AwaitingUser);
         assert_eq!(B::of(SessionStatus::Error, false), B::Error);
         assert_eq!(B::of(SessionStatus::Running, true), B::Running);
         assert_eq!(B::of(SessionStatus::Idle, true), B::Unread);
         assert_eq!(B::of(SessionStatus::Idle, false), B::None);
-
-        let mut badges = [B::None, B::Unread, B::Running, B::Error, B::AwaitingUser];
-        badges.sort();
-        assert_eq!(
-            badges,
-            [B::AwaitingUser, B::Error, B::Running, B::Unread, B::None]
-        );
         assert!(B::AwaitingUser.needs_attention() && B::Error.needs_attention());
         assert!(!B::Running.needs_attention() && !B::Unread.needs_attention());
     }
 
     #[test]
-    fn a_turn_phase_amounts_to_a_session_status() {
-        assert_eq!(TurnPhase::Idle.status(), SessionStatus::Idle);
-        assert_eq!(TurnPhase::Generating.status(), SessionStatus::Running);
-        assert_eq!(TurnPhase::AwaitingApproval.status(), SessionStatus::AwaitingUser);
-        assert_eq!(TurnPhase::AwaitingDecision.status(), SessionStatus::AwaitingUser);
-        assert_eq!(TurnPhase::Error.status(), SessionStatus::Error);
+    fn a_transcript_says_whether_the_projection_changed() {
+        let mut transcript = Transcript::default();
+        let talk = || Conversation::from_entries(vec![Entry::user(1, "hi")]);
+        assert!(transcript.replace(talk()));
+        assert!(!transcript.replace(talk()), "the same projection again");
+        assert!(transcript.replace(Conversation::default()));
+        assert!(transcript.entries().is_empty());
     }
 }

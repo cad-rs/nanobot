@@ -94,14 +94,14 @@ impl<S: SessionView> HarnessShell<S> {
 
     fn deliver(&self, id: &SessionId, text: &str, delivery: Delivery) {
         if let Some(sender) = self.on_message_sent.clone() {
-            (sender.borrow())(id, text, delivery);
+            sender(id, text, delivery);
         }
     }
 
     fn answer_approval(&mut self, id: &SessionId, seq: u64, decision: ApprovalDecision) {
         self.always_scope_open = false;
         if let Some(callback) = self.on_approval.clone() {
-            (callback.borrow())(id, seq, decision);
+            callback(id, seq, decision);
         }
     }
 
@@ -126,7 +126,7 @@ impl<S: SessionView> HarnessShell<S> {
             return false;
         }
         if let Some(callback) = self.on_stop.clone() {
-            (callback.borrow())(&id);
+            callback(&id);
         }
         true
     }
@@ -142,11 +142,9 @@ impl<S: SessionView> HarnessShell<S> {
             return;
         }
         self.permission_mode = mode;
-        if let Some(Ok(mut settings)) = self.settings.as_ref().map(|s| s.lock()) {
-            let _ = settings.set(PERMISSION_MODE_KEY, Value::from(mode.code()));
-        }
+        self.save_setting(PERMISSION_MODE_KEY, Value::from(mode.code()));
         if let Some(callback) = self.on_permission_mode.clone() {
-            (callback.borrow())(mode);
+            callback(mode);
         }
     }
 
@@ -234,7 +232,7 @@ impl<S: SessionView> HarnessShell<S> {
 // ---------------------------------------------------------------------------
 // Drawing.
 
-fn step_color(status: StepStatus, p: Palette) -> Hsla {
+pub(crate) fn step_color(status: StepStatus, p: Palette) -> Hsla {
     match status {
         StepStatus::Pending => p.muted,
         StepStatus::InProgress => p.info,
@@ -243,7 +241,7 @@ fn step_color(status: StepStatus, p: Palette) -> Hsla {
 }
 
 /// A section of the activity bar: separated from what is above it.
-fn section(p: Palette) -> Div {
+pub(crate) fn section(p: Palette) -> Div {
     div()
         .flex_none()
         .px_2()
@@ -256,7 +254,7 @@ fn section(p: Palette) -> Div {
 }
 
 /// A button of the activity bar: a word in a bordered pill.
-fn action(id: impl Into<gpui::ElementId>, label: &'static str, color: Hsla) -> Stateful<Div> {
+pub(crate) fn action(id: impl Into<gpui::ElementId>, label: &'static str, color: Hsla) -> Stateful<Div> {
     div()
         .id(id)
         .px_2()
@@ -415,7 +413,7 @@ impl<S: SessionView> HarnessShell<S> {
             buttons = buttons.child(action(key, self.tr(key), color).on_click(
                 move |_, _, _| {
                     if let Some(callback) = callback.clone() {
-                        (callback.borrow())(&session_id, decision);
+                        callback(&session_id, decision);
                     }
                 },
             ));
@@ -738,9 +736,6 @@ impl<S: SessionView> HarnessShell<S> {
         let Some(row) = self.composer_row(ws, cx) else {
             return div().into_any_element();
         };
-        let phase = ws.turn_phase();
-        let mark = crate::motion::Mark::of_turn(phase);
-        let color = if mark == crate::motion::Mark::Pulse { p.warning } else { p.info };
         div()
             .flex_none()
             .border_t_1()
@@ -748,9 +743,10 @@ impl<S: SessionView> HarnessShell<S> {
             .flex()
             .flex_row()
             .items_center()
-            .children(crate::motion::mark(mark, "harness-strip-mark", color, self.still(cx)).map(
-                |mark| div().pl_3().flex_none().child(mark),
-            ))
+            .children(
+                self.turn_mark(ws.turn_phase(), "harness-strip-mark", cx)
+                    .map(|mark| div().pl_3().flex_none().child(mark)),
+            )
             .child(row.flex_1().min_w_0())
             .into_any_element()
     }

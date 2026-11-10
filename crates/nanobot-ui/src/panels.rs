@@ -280,7 +280,7 @@ impl<S: SessionView> PanelHost<S> {
         }
     }
 
-    /// Panels of one region the current user may see, in registration order.
+    /// Panels of one region the current user may see, by their `order`.
     pub fn panels_in(&self, area: PanelArea) -> Vec<&PanelDef<S>> {
         let mut found: Vec<&PanelDef<S>> = self
             .panels

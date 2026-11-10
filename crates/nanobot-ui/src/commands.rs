@@ -35,9 +35,6 @@ impl Command {
 /// How well `title` answers `query`; `None` when it does not. Lower is better.
 fn rank(title: &str, query: &str) -> Option<u8> {
     let (title, query) = (title.to_lowercase(), query.to_lowercase());
-    if query.is_empty() {
-        return Some(0);
-    }
     if title.starts_with(&query) {
         return Some(0);
     }

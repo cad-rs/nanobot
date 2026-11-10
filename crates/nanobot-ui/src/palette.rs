@@ -11,6 +11,7 @@ use gpui::{
 use gpui_component::input::{InlineToken, Input, InputEvent, InputState};
 use gpui_component::ActiveTheme as _;
 
+use crate::activity::{action, section};
 use crate::commands::{filter, trigger_at, Candidate, Command, RewindMode, Selection, Trigger};
 use crate::icons::{icon, Icon};
 use crate::model::{SessionId, SessionView, WorkspaceView};
@@ -115,8 +116,8 @@ impl<S: SessionView> HarnessShell<S> {
         commands
     }
 
-    /// The session `step` places after the one on screen in the sidebar's
-    /// order, wrapping round. `None` when there is nowhere else to go.
+    /// The session `step` places after the one on screen in the open
+    /// project, wrapping round. `None` when there is nowhere else to go.
     fn neighbour_session(&self, step: isize) -> Option<SessionId> {
         let ids: Vec<SessionId> = self
             .store()
@@ -131,8 +132,8 @@ impl<S: SessionView> HarnessShell<S> {
     }
 
     /// Runs the command `command`. `window_width` is for the ones that fold
-    /// the layout; theme changes need a window and are left to the caller
-    /// (`true` is returned and `wants_theme_toggle` is set). False when the
+    /// the layout. Changing the theme needs a window, so here it only answers
+    /// true: [`run_command_in`](Self::run_command_in) does it. False when the
     /// command is unknown or cannot run now.
     pub fn run_command(&mut self, command: &str, window_width: f32) -> bool {
         match command {
@@ -142,7 +143,7 @@ impl<S: SessionView> HarnessShell<S> {
             id::JUMP_TO_END => self.stream().follow(),
             id::TOGGLE_TOOLS => return self.stream.toggle_tools(),
             id::STOP_TURN => return self.stop_turn(),
-            id::TOGGLE_THEME => self.wants_theme_toggle = true,
+            id::TOGGLE_THEME => {}
             id::OPEN_SETTINGS => self.open_settings(),
             id::TOGGLE_MOTION => self.set_reduce_motion(!self.reduce_motion()),
             id::NEW_SESSION => match self.on_new_session.clone() {
@@ -305,7 +306,7 @@ impl<S: SessionView> HarnessShell<S> {
 }
 
 // ---------------------------------------------------------------------------
-// With a window.
+// What is on screen, for tests and for the product.
 
 impl<S: SessionView> HarnessShell<S> {
 
@@ -424,7 +425,7 @@ impl<S: SessionView> HarnessShell<S> {
     ) {
         let width = f32::from(window.viewport_size().width);
         self.run_command(command, width);
-        if std::mem::take(&mut self.wants_theme_toggle) {
+        if command == id::TOGGLE_THEME {
             let next = self.theme().toggled();
             self.switch_theme(next, window, cx);
         }
@@ -653,23 +654,12 @@ impl<S: SessionView> HarnessShell<S> {
                 RewindMode::Fork => ("rewind.fork", p.fg),
             };
             buttons = buttons.child(
-                div()
-                    .id(key)
-                    .px_2()
-                    .py_1()
-                    .rounded(px(4.))
-                    .border_1()
-                    .border_color(color.opacity(0.5))
-                    .text_xs()
-                    .text_color(color)
-                    .cursor_pointer()
-                    .child(self.tr(key))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this: &mut Self, _ev: &MouseDownEvent, window, cx| {
-                            this.rewind_in(mode, window, cx);
-                        }),
-                    ),
+                action(key, self.tr(key), color).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this: &mut Self, _ev: &MouseDownEvent, window, cx| {
+                        this.rewind_in(mode, window, cx);
+                    }),
+                ),
             );
         }
         buttons = buttons.child(
@@ -690,16 +680,8 @@ impl<S: SessionView> HarnessShell<S> {
                 ),
         );
         Some(
-            div()
-                .flex_none()
-                .px_2()
-                .py_1()
-                .border_t_1()
-                .border_color(p.border)
+            section(p)
                 .bg(p.info.opacity(0.06))
-                .flex()
-                .flex_col()
-                .gap_1()
                 .child(
                     div()
                         .flex()

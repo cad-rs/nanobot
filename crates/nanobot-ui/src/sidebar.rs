@@ -3,7 +3,7 @@
 //!
 //! Every project is a group; its sessions are rows under it. The rows are
 //! computed here from the store, as plain data, and tested without a window;
-//! `shell.rs` only draws them.
+//! the second half of this file draws them.
 //!
 //! - A project folds. Folded, its heading still says how many of its sessions
 //!   are waiting for the user — otherwise folding it would hide that.
@@ -129,11 +129,13 @@ fn urgency(badge: SessionBadge) -> u8 {
 }
 
 /// Most pressing first, then most recently active; ties keep the given order.
-fn ordered<'a, S: SessionView>(mut sessions: Vec<&'a S>, unread: &HashSet<SessionId>) -> Vec<&'a S> {
+fn ordered<S: SessionView>(
+    mut sessions: Vec<&S>,
+    badge_of: impl Fn(&S) -> SessionBadge,
+) -> Vec<&S> {
     sessions.sort_by_key(|session| {
-        let badge = SessionBadge::of(session.status(), unread.contains(session.id()));
         (
-            urgency(badge),
+            urgency(badge_of(session)),
             std::cmp::Reverse(session.last_active_ms().unwrap_or(0)),
         )
     });
@@ -234,7 +236,7 @@ pub fn rows<S: SessionView>(input: &SidebarInput<'_, S>) -> Vec<SidebarRow> {
             if let Some(label) = label {
                 rows.push(SidebarRow::Group { label });
             }
-            rows.extend(ordered(current, input.unread).into_iter().map(row_of));
+            rows.extend(ordered(current, badge_of).into_iter().map(row_of));
         }
         if !earlier.is_empty() {
             let unfolded = input.earlier_expanded.contains(&project.id);
@@ -244,7 +246,7 @@ pub fn rows<S: SessionView>(input: &SidebarInput<'_, S>) -> Vec<SidebarRow> {
                 expanded: unfolded,
             });
             if unfolded {
-                rows.extend(ordered(earlier, input.unread).into_iter().map(row_of));
+                rows.extend(ordered(earlier, badge_of).into_iter().map(row_of));
             }
         }
     }

@@ -1,8 +1,8 @@
 //! Shell chrome localization: the shell's user-visible strings in the two
 //! locales the framework ships (zh-CN, en).
 //!
-//! A flat message table behind a locale. [`t`] returns the localized text,
-//! falling back to the other locale and then to the key itself — a missing
+//! A flat message table behind a locale. [`t`] returns the localized text, or
+//! the key itself when there is none — a missing
 //! translation is visible in the UI, never a blank.
 //!
 //! The locale is a user setting (`ui.locale`) and defaults from the harness
@@ -43,7 +43,6 @@ const MESSAGES: &[Msg] = &[
     ("shell.diagnostics", "诊断", "Diagnostics"),
     ("shell.settings", "设置", "Settings"),
     ("shell.plugins", "插件", "Plugins"),
-    ("shell.projects", "项目", "Projects"),
     ("shell.no_sessions", "（无会话）", "(no sessions)"),
     ("shell.attention", "{count} 个等待处理", "{count} waiting"),
     ("shell.show_viewport", "视口", "Viewport"),
@@ -53,20 +52,8 @@ const MESSAGES: &[Msg] = &[
     ("shell.save", "存档", "Save"),
     ("shell.load", "开档", "Open"),
     ("shell.import", "导入", "Import"),
-    (
-        "shell.sessions",
-        "会话 · {count}（{total} 个）",
-        "Sessions · {count} ({total})",
-    ),
     ("shell.guest_signin", "访客 · 点击登录", "Guest · click to sign in"),
     ("shell.plan_progress", "计划 {done}/{total}", "Plan {done}/{total}"),
-    ("shell.plan_state", "plan 状态", "Plan state"),
-    (
-        "shell.compute_progress",
-        "计算进度 {done}/{total}",
-        "Compute progress {done}/{total}",
-    ),
-    ("shell.conversation", "对话流", "Conversation"),
     (
         "shell.clarify_prompt",
         "AI 需要补充信息，请回答以下问题（通过输入框提交）：",
@@ -80,7 +67,6 @@ const MESSAGES: &[Msg] = &[
     ("shell.accept", "接受", "Accept"),
     ("shell.reject", "回滚", "Roll back"),
     ("shell.modify", "修改", "Modify"),
-    ("shell.itemized", "逐项: ", "Itemized: "),
     (
         "shell.no_sessions_in_project",
         "工程「{name}」还没有会话",
@@ -102,13 +88,6 @@ const MESSAGES: &[Msg] = &[
     ("status.running", "运行中", "Running"),
     ("status.awaiting_user", "等待确认", "Needs you"),
     ("status.error", "出错", "Error"),
-    ("status.unread", "未读", "Unread"),
-    ("turn.idle", "空闲", "Idle"),
-    ("turn.generating", "生成中", "Working"),
-    ("turn.awaiting_approval", "等待批准", "Awaiting approval"),
-    ("turn.awaiting_clarification", "等待回答", "Awaiting your answer"),
-    ("turn.awaiting_decision", "等待裁决", "Awaiting your decision"),
-    ("turn.error", "出错", "Error"),
     ("step.pending", "待办", "Pending"),
     ("step.in_progress", "进行中", "In progress"),
     ("step.done", "完成", "Done"),
@@ -120,14 +99,8 @@ const MESSAGES: &[Msg] = &[
     ("plan.contingent", "待审查", "Contingent"),
     ("plan.rejected", "已回滚", "Rejected"),
     ("plan.clarify", "待补充", "Clarify"),
-    ("entry.user", "你", "You"),
-    ("entry.assistant", "AI", "AI"),
     ("entry.thinking", "思考", "Thinking"),
-    ("entry.tool", "工具", "Tool"),
     ("entry.plan", "计划", "Plan"),
-    ("entry.check", "检查", "Check"),
-    ("entry.turn_end", "回合结束", "Turn ended"),
-    ("entry.error", "错误", "Error"),
     ("entry.retry", "重试", "Retry"),
     ("toolkind.read", "读取", "Read"),
     ("toolkind.edit", "修改", "Edit"),
@@ -138,8 +111,6 @@ const MESSAGES: &[Msg] = &[
     ("toolkind.think", "思考", "Think"),
     ("toolkind.fetch", "获取", "Fetch"),
     ("toolkind.other", "工具", "Tool"),
-    ("check.passed", "通过", "Passed"),
-    ("check.failed", "未通过", "Failed"),
     ("permission.ask", "逐项询问", "Ask each time"),
     ("permission.accept_low_risk", "自动接受低风险", "Accept low risk"),
     ("permission.plan_only", "只规划", "Plan only"),
@@ -259,7 +230,7 @@ const MESSAGES: &[Msg] = &[
     ),
 ];
 
-/// The localized text for `key`. Falls back to the other locale, then to the
+/// The localized text for `key`, or the
 /// key itself so a gap is visible rather than silent. The result lives as
 /// long as `key` (known messages are `'static`).
 pub fn t(locale: Locale, key: &str) -> &str {
@@ -316,12 +287,12 @@ mod tests {
     fn replacement_fills_every_placeholder() {
         let out = t_replace(
             Locale::ZhCn,
-            "shell.sessions",
-            &[("count", "3"), ("total", "12")],
+            "shell.plan_progress",
+            &[("done", "3"), ("total", "12")],
         );
-        assert_eq!(out, "会话 · 3（12 个）");
-        let out = t_replace(Locale::En, "shell.sessions", &[("count", "3"), ("total", "12")]);
-        assert_eq!(out, "Sessions · 3 (12)");
+        assert_eq!(out, "计划 3/12");
+        let out = t_replace(Locale::En, "shell.plan_progress", &[("done", "3"), ("total", "12")]);
+        assert_eq!(out, "Plan 3/12");
     }
 
     /// Every key the shell asks for exists: a missing one would show its own

@@ -9,7 +9,7 @@
 //! domain word.
 //!
 //! ```text
-//! header (identity · undo/redo · file ops · status)
+//! header (identity · undo/redo · file ops)
 //! ┌──────────┬───────────────────────┬──────────┬──────────┐
 //! │ session  │ session workspace     │ viewport │ right    │
 //! │ list     │ conversation + plan   │ (product │ dock     │
@@ -30,7 +30,7 @@ use gpui::{
     MouseButton, MouseDownEvent, Render, Subscription, Window,
 };
 use gpui_component::{
-    input::{Input, InputEvent, InputState, TextareaState},
+    input::{InputEvent, InputState, TextareaState},
     ActiveTheme as _, StyledExt as _,
 };
 use nanobot_boot::account::Account;
@@ -51,9 +51,7 @@ use crate::icons::{self, sized, Icon};
 use crate::layout::{Divider, Fold, Layout, LayoutState, Stacked};
 use crate::stream::StreamState;
 use crate::theme::ThemeKind;
-use crate::transcript::{SessionBadge, Transcript, TurnPhase};
-
-
+use crate::transcript::{Conversation, SessionBadge, Transcript, TurnPhase};
 
 
 /// A divider drag in progress: which divider, where the pointer was when it
@@ -165,19 +163,19 @@ pub fn init(cx: &mut App) {
     ]);
 }
 
-/// A shell callback keyed by session (activate / undo / redo / save / load /
-/// import all share the shape).
-type SessionCallback = Rc<RefCell<dyn Fn(&SessionId)>>;
+/// A shell callback keyed by session (activate, stop, undo, redo, save, load,
+/// import, archive, fork and delete all share the shape).
+pub(crate) type SessionCallback = Rc<dyn Fn(&SessionId)>;
 
 /// The composer's submit callback.
-type MessageCallback = Rc<RefCell<dyn Fn(&SessionId, &str, Delivery)>>;
+type MessageCallback = Rc<dyn Fn(&SessionId, &str, Delivery)>;
 
 /// The answer to a tool call waiting for approval: the session, the call's
 /// event sequence and the decision.
-type ApprovalCallback = Rc<RefCell<dyn Fn(&SessionId, u64, ApprovalDecision)>>;
+type ApprovalCallback = Rc<dyn Fn(&SessionId, u64, ApprovalDecision)>;
 
 /// Told when the user turns the permission dial.
-type PermissionModeCallback = Rc<RefCell<dyn Fn(PermissionMode)>>;
+type PermissionModeCallback = Rc<dyn Fn(PermissionMode)>;
 
 /// A command of the product's in the palette, with what running it does.
 type ProductCommand = (Command, Rc<dyn Fn()>);
@@ -189,17 +187,14 @@ type CompletionSource = Rc<dyn Fn(char, &str) -> Vec<Candidate>>;
 /// back, and what the message says now.
 type RewindCallback = Rc<dyn Fn(&SessionId, u64, RewindMode, &str)>;
 
-/// Told to rename a session: the session and its new title.
-pub(crate) type RenameCallback = Rc<dyn Fn(&SessionId, &str)>;
+/// A session and a text about it: its new title, or the object to show.
+pub(crate) type SessionTextCallback = Rc<dyn Fn(&SessionId, &str)>;
 
 /// Told to try again: the session and the error entry's sequence.
 pub(crate) type RetryCallback = Rc<dyn Fn(&SessionId, u64)>;
 
-/// Told to archive, fork or delete a session.
-pub(crate) type ArchiveCallback = Rc<dyn Fn(&SessionId)>;
-
 /// A contingent-plan decision callback.
-type PlanDecisionCallback = Rc<RefCell<dyn Fn(&SessionId, PlanDecision)>>;
+type PlanDecisionCallback = Rc<dyn Fn(&SessionId, PlanDecision)>;
 
 /// The harness shell: the session list plus the active session's workspace.
 pub struct HarnessShell<S: SessionView> {
@@ -245,7 +240,6 @@ pub struct HarnessShell<S: SessionView> {
     pub(crate) product_commands: Vec<ProductCommand>,
     pub(crate) on_new_session: Option<Rc<dyn Fn()>>,
     /// A command asked for the theme to flip; done where a window is to hand.
-    pub(crate) wants_theme_toggle: bool,
     /// The composer's candidate list and where its rows come from.
     pub(crate) completion_source: Option<CompletionSource>,
     pub(crate) completion: Option<Completion>,
@@ -262,14 +256,14 @@ pub struct HarnessShell<S: SessionView> {
     pub(crate) sidebar_selected: Option<usize>,
     pub(crate) sidebar_focus: Option<FocusHandle>,
     pub(crate) renaming: Option<Renaming>,
-    pub(crate) on_rename: Option<RenameCallback>,
-    pub(crate) on_archive: Option<ArchiveCallback>,
-    pub(crate) on_fork: Option<ArchiveCallback>,
+    pub(crate) on_rename: Option<SessionTextCallback>,
+    pub(crate) on_archive: Option<SessionCallback>,
+    pub(crate) on_fork: Option<SessionCallback>,
     /// Told to try again after the error entry at this sequence.
     pub(crate) on_retry: Option<RetryCallback>,
     /// Told to show the object an entry is about.
-    pub(crate) on_anchor: Option<RenameCallback>,
-    pub(crate) on_delete: Option<ArchiveCallback>,
+    pub(crate) on_anchor: Option<SessionTextCallback>,
+    pub(crate) on_delete: Option<SessionCallback>,
     pub(crate) session_menu: Option<crate::session_menu::SessionMenu>,
     /// Whether the settings dialog is open.
     pub(crate) settings_open: bool,
@@ -307,8 +301,8 @@ pub struct HarnessShell<S: SessionView> {
     /// signing in and out mean (its own dialog, a license import) — the
     /// framework never authenticates.
     account: Option<Account>,
-    on_sign_in: Option<Rc<RefCell<dyn Fn()>>>,
-    on_sign_out: Option<Rc<RefCell<dyn Fn()>>>,
+    on_sign_in: Option<Rc<dyn Fn()>>,
+    on_sign_out: Option<Rc<dyn Fn()>>,
     /// The script plugins the app layer loaded, as the plugins panel shows
     /// them (`None` = the panel is not registered). Enabled state is
     /// runtime: the panel's disable removes a plugin's panels.
@@ -319,8 +313,8 @@ pub struct HarnessShell<S: SessionView> {
     /// (`ui.locale`), defaulted from the harness profile.
     pub(crate) locale: Locale,
     /// The settings dialog's font-family input, created on first show.
-    font_input: Rc<RefCell<Option<Entity<InputState>>>>,
-    _font_input_sub: Rc<RefCell<Option<Subscription>>>,
+    pub(crate) font_input: RefCell<Option<Entity<InputState>>>,
+    pub(crate) font_input_sub: RefCell<Option<Subscription>>,
     /// How the window is divided: the saved preference and what the window's
     /// width does to it now.
     pub(crate) layout: LayoutState,
@@ -370,7 +364,6 @@ impl<S: SessionView> HarnessShell<S> {
             palette: None,
             product_commands: Vec::new(),
             on_new_session: None,
-            wants_theme_toggle: false,
             completion_source: None,
             completion: None,
             rewinding: None,
@@ -412,8 +405,8 @@ impl<S: SessionView> HarnessShell<S> {
             plugins: None,
             rejected_plugins: Vec::new(),
             locale: Locale::default(),
-            font_input: Rc::new(RefCell::new(None)),
-            _font_input_sub: Rc::new(RefCell::new(None)),
+            font_input: RefCell::new(None),
+            font_input_sub: RefCell::new(None),
             layout: LayoutState::default(),
             dragging: None,
             focus_anchor: None,
@@ -595,14 +588,14 @@ impl<S: SessionView> HarnessShell<S> {
     where
         F: Fn(&SessionId) + 'static,
     {
-        self.on_session_activated = Some(Rc::new(RefCell::new(callback)));
+        self.on_session_activated = Some(Rc::new(callback));
     }
 
     pub fn set_on_message_sent<F>(&mut self, callback: F)
     where
         F: Fn(&SessionId, &str, Delivery) + 'static,
     {
-        self.on_message_sent = Some(Rc::new(RefCell::new(callback)));
+        self.on_message_sent = Some(Rc::new(callback));
     }
 
     /// What stopping the turn in progress does (the composer's button while
@@ -611,7 +604,7 @@ impl<S: SessionView> HarnessShell<S> {
     where
         F: Fn(&SessionId) + 'static,
     {
-        self.on_stop = Some(Rc::new(RefCell::new(callback)));
+        self.on_stop = Some(Rc::new(callback));
     }
 
     /// What answering a tool call that waits for approval does: the session,
@@ -620,7 +613,7 @@ impl<S: SessionView> HarnessShell<S> {
     where
         F: Fn(&SessionId, u64, ApprovalDecision) + 'static,
     {
-        self.on_approval = Some(Rc::new(RefCell::new(callback)));
+        self.on_approval = Some(Rc::new(callback));
     }
 
     /// What turning the permission dial does. The shell shows and remembers
@@ -629,14 +622,14 @@ impl<S: SessionView> HarnessShell<S> {
     where
         F: Fn(PermissionMode) + 'static,
     {
-        self.on_permission_mode = Some(Rc::new(RefCell::new(callback)));
+        self.on_permission_mode = Some(Rc::new(callback));
     }
 
     pub fn set_on_plan_decision<F>(&mut self, callback: F)
     where
         F: Fn(&SessionId, PlanDecision) + 'static,
     {
-        self.on_plan_decision = Some(Rc::new(RefCell::new(callback)));
+        self.on_plan_decision = Some(Rc::new(callback));
     }
 
     /// Supply (or replace) the sidebar's projection. `None` restores the
@@ -658,35 +651,35 @@ impl<S: SessionView> HarnessShell<S> {
     where
         F: Fn(&SessionId) + 'static,
     {
-        self.on_undo = Some(Rc::new(RefCell::new(callback)));
+        self.on_undo = Some(Rc::new(callback));
     }
 
     pub fn set_on_redo<F>(&mut self, callback: F)
     where
         F: Fn(&SessionId) + 'static,
     {
-        self.on_redo = Some(Rc::new(RefCell::new(callback)));
+        self.on_redo = Some(Rc::new(callback));
     }
 
     pub fn set_on_save<F>(&mut self, callback: F)
     where
         F: Fn(&SessionId) + 'static,
     {
-        self.on_save = Some(Rc::new(RefCell::new(callback)));
+        self.on_save = Some(Rc::new(callback));
     }
 
     pub fn set_on_load<F>(&mut self, callback: F)
     where
         F: Fn(&SessionId) + 'static,
     {
-        self.on_load = Some(Rc::new(RefCell::new(callback)));
+        self.on_load = Some(Rc::new(callback));
     }
 
     pub fn set_on_import<F>(&mut self, callback: F)
     where
         F: Fn(&SessionId) + 'static,
     {
-        self.on_import = Some(Rc::new(RefCell::new(callback)));
+        self.on_import = Some(Rc::new(callback));
     }
 
     /// Shares the harness's user settings with the shell: the layout, the
@@ -694,17 +687,11 @@ impl<S: SessionView> HarnessShell<S> {
     /// and what the settings dialog changes is written back to it.
     pub fn set_settings(&mut self, settings: Option<Arc<Mutex<Settings>>>) {
         if let Some(store) = &settings {
-            self.theme =
-                store.lock().map(|s| crate::theme::kind_from_settings(&s)).unwrap_or(self.theme);
-            if let Some(code) = store
-                .lock()
-                .ok()
-                .and_then(|s| s.get(crate::theme::LOCALE_KEY).cloned())
-                .and_then(|v| v.as_str().map(str::to_string))
-            {
-                self.locale = Locale::from_code(&code);
-            }
             if let Ok(store) = store.lock() {
+                self.theme = crate::theme::kind_from_settings(&store);
+                if let Some(code) = store.get(crate::theme::LOCALE_KEY).and_then(|v| v.as_str()) {
+                    self.locale = Locale::from_code(code);
+                }
                 self.layout = LayoutState::new(Layout::load(&store));
                 self.permission_mode = PermissionMode::from_code(
                     &store.get_str(crate::activity::PERMISSION_MODE_KEY, ""),
@@ -723,9 +710,8 @@ impl<S: SessionView> HarnessShell<S> {
         self.settings.clone()
     }
 
-    /// The settings file's path as the panels show it (`None` = in-memory,
-    /// nothing shared). The single read the settings and diagnostics panels
-    /// share.
+    /// The settings file's path as the settings dialog and the diagnostics
+    /// panel show it (`None` = in-memory, nothing shared).
     pub fn settings_path(&self) -> Option<String> {
         self.settings
             .as_ref()
@@ -749,20 +735,9 @@ impl<S: SessionView> HarnessShell<S> {
         self.locale = locale;
     }
 
-    /// The settings dialog's font input handle (the dialog creates it on
-    /// first show).
-    pub fn font_input(&self) -> Rc<RefCell<Option<Entity<InputState>>>> {
-        self.font_input.clone()
-    }
-
-    pub(crate) fn font_input_sub(&self) -> Rc<RefCell<Option<Subscription>>> {
-        self._font_input_sub.clone()
-    }
-
-    /// Writes one font setting and re-themes the window. The settings dialog
-    /// is the only caller today; the app layer applies the stored fonts at
-    /// launch through [`crate::theme::apply_font`].
-    fn set_font_setting(
+    /// Writes one font setting and re-themes the window. The app layer applies
+    /// the stored fonts at launch through [`crate::theme::apply_font`].
+    pub(crate) fn set_font_setting(
         &mut self,
         key: &'static str,
         value: serde_json::Value,
@@ -822,7 +797,7 @@ impl<S: SessionView> HarnessShell<S> {
     where
         F: Fn() + 'static,
     {
-        self.on_sign_in = Some(Rc::new(RefCell::new(callback)));
+        self.on_sign_in = Some(Rc::new(callback));
     }
 
     /// What the chip's sign-out affordance does.
@@ -830,7 +805,7 @@ impl<S: SessionView> HarnessShell<S> {
     where
         F: Fn() + 'static,
     {
-        self.on_sign_out = Some(Rc::new(RefCell::new(callback)));
+        self.on_sign_out = Some(Rc::new(callback));
     }
 
     /// Shares the plugin load result with the shell: registers the plugins
@@ -1049,6 +1024,15 @@ impl<S: SessionView> HarnessShell<S> {
         self.panel_host.script_errors()
     }
 
+    /// Takes the conversation to show. When it differs from the one on
+    /// screen, the list is told what changed as rows to remeasure and a
+    /// splice, so a streaming answer costs its last row, not the whole stream.
+    fn show_conversation(&mut self, conversation: Conversation) {
+        if self.transcript.replace(conversation) {
+            self.stream.set_entries(self.transcript.entries());
+        }
+    }
+
     /// Builds and installs the workspace of `id` (the whole-replacement step)
     /// and records it as the project's session index.
     fn present(&mut self, id: &SessionId) -> bool {
@@ -1058,13 +1042,12 @@ impl<S: SessionView> HarnessShell<S> {
         self.store.borrow_mut().set_session_index(id);
         let viewport = self.viewport_of(id);
         let workspace = session.build_workspace(viewport);
-        self.transcript.reconcile(workspace.conversation());
-        self.stream.set_entries(self.transcript.entries());
+        self.show_conversation(workspace.conversation());
         self.workspace = Some(workspace);
         // On screen now: it is no longer news.
         self.unread.borrow_mut().remove(id);
         if let Some(ref callback) = self.on_session_activated {
-            callback.borrow()(id);
+            callback(id);
         }
         true
     }
@@ -1083,8 +1066,7 @@ impl<S: SessionView> HarnessShell<S> {
         };
         let viewport = self.viewport_of(&id);
         let workspace = session.build_workspace(viewport);
-        self.transcript.reconcile(workspace.conversation());
-        self.stream.set_entries(self.transcript.entries());
+        self.show_conversation(workspace.conversation());
         self.workspace = Some(workspace);
         true
     }
@@ -1182,6 +1164,14 @@ impl<S: SessionView> HarnessShell<S> {
     /// The saved layout preference (sidebar and dock open, the three widths).
     pub fn layout(&self) -> Layout {
         self.layout.layout()
+    }
+
+    /// Writes one setting through the settings store, when the app layer
+    /// shared one. A failed write loses the preference, never the UI.
+    pub(crate) fn save_setting(&self, key: &str, value: serde_json::Value) {
+        if let Some(Ok(mut settings)) = self.settings.as_ref().map(|s| s.lock()) {
+            let _ = settings.set(key, value);
+        }
     }
 
     /// Writes the layout preference through the settings store, when the app
@@ -1342,19 +1332,7 @@ impl<S: SessionView> HarnessShell<S> {
                     .child(title),
             )
             // What the turn is doing right now, then the session's status.
-            .children(workspace.and_then(|_| {
-                let phase = self.turn_phase();
-                let color = match crate::motion::Mark::of_turn(phase) {
-                    crate::motion::Mark::Pulse => p.warning,
-                    _ => p.info,
-                };
-                crate::motion::mark(
-                    crate::motion::Mark::of_turn(phase),
-                    "harness-turn-mark",
-                    color,
-                    self.still(cx),
-                )
-            }))
+            .children(workspace.and_then(|_| self.turn_mark(self.turn_phase(), "harness-turn-mark", cx)))
             .when_some(status, |d, status| {
                 d.child(badge(status.label(self.locale), session_color(status, p)))
             })
@@ -1439,14 +1417,7 @@ impl<S: SessionView> HarnessShell<S> {
             .child(div().font_semibold().child(self.product_name.clone()))
             .child(div().text_sm().text_color(p.muted).child(project))
             .child(div().flex_1())
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap_2()
-                    .child(self.undo_redo_buttons(cx))
-                    .child(self.file_ops_buttons(cx)),
-            )
+            .child(self.session_buttons(cx))
             .when(has_dock && fold != Fold::Stacked, |d| {
                 d.child(toolbar_button("harness-toggle-dock", Icon::Dock, p.muted).on_mouse_down(
                     MouseButton::Left,
@@ -1458,111 +1429,30 @@ impl<S: SessionView> HarnessShell<S> {
             })
     }
 
-    fn undo_redo_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The operations on the session on screen: undo, redo, save, load,
+    /// import. Each calls the product's callback, when there is one.
+    fn session_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
-        let session_id = self.workspace.as_ref().map(|ws| ws.session_id().clone());
-
-        let undo_cb = self
-            .on_undo
-            .clone()
-            .unwrap_or_else(|| Rc::new(RefCell::new(|_: &SessionId| {})));
-        let sid_undo = session_id.clone().unwrap_or_else(|| SessionId::new(""));
-        let undo_btn = div()
-            .id("harness-undo")
-            .text_sm()
-            .px_2()
-            .py_1()
-            .border_1()
-            .border_color(p.border)
-            .cursor_pointer()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_1()
-            .child(
-                icons::icon(Icon::Undo, p.fg),
-            )
-            .child(self.tr("shell.undo"))
-            .on_click(move |_, _, _| {
-                undo_cb.borrow()(&sid_undo);
-            });
-
-        let redo_cb = self
-            .on_redo
-            .clone()
-            .unwrap_or_else(|| Rc::new(RefCell::new(|_: &SessionId| {})));
-        let sid_redo = session_id.unwrap_or_else(|| SessionId::new(""));
-        let redo_btn = div()
-            .id("harness-redo")
-            .text_sm()
-            .px_2()
-            .py_1()
-            .border_1()
-            .border_color(p.border)
-            .cursor_pointer()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_1()
-            .child(
-                icons::icon(Icon::Redo, p.fg),
-            )
-            .child(self.tr("shell.redo"))
-            .on_click(move |_, _, _| {
-                redo_cb.borrow()(&sid_redo);
-            });
-
-        div()
-            .flex()
-            .flex_row()
-            .gap_2()
-            .child(undo_btn)
-            .child(redo_btn)
+        let session = self
+            .workspace
+            .as_ref()
+            .map_or_else(|| SessionId::new(""), |ws| ws.session_id().clone());
+        let buttons = [
+            ("harness-undo", Icon::Undo, "shell.undo", &self.on_undo),
+            ("harness-redo", Icon::Redo, "shell.redo", &self.on_redo),
+            ("harness-save", Icon::Save, "shell.save", &self.on_save),
+            ("harness-load", Icon::Load, "shell.load", &self.on_load),
+            ("harness-import", Icon::Import, "shell.import", &self.on_import),
+        ];
+        div().flex().flex_row().gap_2().children(buttons.map(|(id, icon, label, callback)| {
+            let (callback, session) = (callback.clone(), session.clone());
+            header_button(id, icon, self.tr(label), p.fg, p.border).on_click(move |_, _, _| {
+                if let Some(callback) = &callback {
+                    callback(&session);
+                }
+            })
+        }))
     }
-
-    fn file_ops_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let p = palette(cx);
-        let sid = self.workspace.as_ref().map(|ws| ws.session_id().clone());
-
-        let sid_save = sid.clone().unwrap_or_else(|| SessionId::new(""));
-        let save_cb = self
-            .on_save
-            .clone()
-            .unwrap_or_else(|| Rc::new(RefCell::new(|_: &SessionId| {})));
-        let save_btn = header_button("harness-save", Icon::Save, self.tr("shell.save"), p.fg, p.border)
-            .on_click(move |_, _, _| {
-                save_cb.borrow()(&sid_save);
-            });
-
-        let sid_load = sid.clone().unwrap_or_else(|| SessionId::new(""));
-        let load_cb = self
-            .on_load
-            .clone()
-            .unwrap_or_else(|| Rc::new(RefCell::new(|_: &SessionId| {})));
-        let load_btn = header_button("harness-load", Icon::Load, self.tr("shell.load"), p.fg, p.border)
-            .on_click(move |_, _, _| {
-                load_cb.borrow()(&sid_load);
-            });
-
-        let sid_import = sid.unwrap_or_else(|| SessionId::new(""));
-        let import_cb = self
-            .on_import
-            .clone()
-            .unwrap_or_else(|| Rc::new(RefCell::new(|_: &SessionId| {})));
-        let import_btn = header_button("harness-import", Icon::Import, self.tr("shell.import"), p.fg, p.border)
-            .on_click(move |_, _, _| {
-                import_cb.borrow()(&sid_import);
-            });
-
-        div()
-            .flex()
-            .flex_row()
-            .gap_2()
-            .child(save_btn)
-            .child(load_btn)
-            .child(import_btn)
-    }
-
 
     pub(crate) fn sidebar_footer(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
         div()
@@ -1577,20 +1467,12 @@ impl<S: SessionView> HarnessShell<S> {
             .gap_2()
             .child(self.account_chip(p, cx))
             .child(div().flex_1())
-            .child(
-                div()
-                    .id("harness-settings")
-                    .p_1()
-                    .rounded(px(4.))
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |shell, _event, _window, cx| {
-                        shell.open_settings();
-                        cx.notify();
-                    }))
-                    .child(
-                        sized(Icon::Settings, 16., p.muted),
-                    ),
-            )
+            .child(toolbar_button("harness-settings", Icon::Settings, p.muted).on_click(
+                cx.listener(|shell, _event, _window, cx| {
+                    shell.open_settings();
+                    cx.notify();
+                }),
+            ))
     }
 
     /// The sidebar footer's account chip: the identity the account provider
@@ -1611,7 +1493,7 @@ impl<S: SessionView> HarnessShell<S> {
                     .cursor_pointer()
                     .on_click(cx.listener(move |shell, _event, _window, _cx| {
                         if let Some(sign_out) = shell.on_sign_out.clone() {
-                            (sign_out.borrow())();
+                            sign_out();
                         }
                     }))
                     .child(
@@ -1648,7 +1530,7 @@ impl<S: SessionView> HarnessShell<S> {
                 .cursor_pointer()
                 .on_click(cx.listener(move |shell, _event, _window, _cx| {
                     if let Some(sign_in) = shell.on_sign_in.clone() {
-                        (sign_in.borrow())();
+                        sign_in();
                     }
                 }))
                 .child(
@@ -1782,7 +1664,7 @@ impl<S: SessionView> HarnessShell<S> {
     }
 }
 
-/// A header icon button (save / load / import).
+/// A header button: an icon and a word.
 fn header_button(
     id: &'static str,
     icon: Icon,
@@ -1975,218 +1857,18 @@ fn diagnostics_panel<S: SessionView>(
         .into_any_element()
 }
 
-/// What the settings dialog holds: theme, motion, language, font, and where
-/// the settings file is.
-pub(crate) fn settings_body<S: SessionView>(
-    shell: &HarnessShell<S>,
-    window: &mut Window,
-    cx: &mut Context<HarnessShell<S>>,
-) -> AnyElement {
-    let p = palette(cx);
-    let current = shell.theme();
-    let path = shell.settings_path();
-
-    let theme_button =
-        |kind: ThemeKind, label: &'static str, cx: &mut Context<HarnessShell<S>>| {
-            let color = if current == kind { p.accent } else { p.muted };
-            crate::widgets::button(
-                format!("harness-theme-{}", kind.as_str()),
-                label,
-                color,
-                cx,
-                cx.listener(move |shell, _event, window, cx| {
-                    shell.switch_theme(kind, window, cx);
-                }),
-            )
-        };
-
-    let motion_button = |reduce: bool, label: &'static str, cx: &mut Context<HarnessShell<S>>| {
-        let color = if shell.reduce_motion() == reduce { p.accent } else { p.muted };
-        crate::widgets::button(
-            if reduce { "harness-motion-reduced" } else { "harness-motion-full" },
-            label,
-            color,
-            cx,
-            cx.listener(move |shell, _event, _window, cx| {
-                shell.set_reduce_motion(reduce);
-                cx.notify();
-            }),
-        )
-    };
-
-    let locale_button = |locale: Locale,
-                         label: &'static str,
-                         cx: &mut Context<HarnessShell<S>>| {
-        let active = shell.locale() == locale;
-        let color = if active { p.accent } else { p.muted };
-        crate::widgets::button(
-            format!("harness-locale-{}", locale.code()),
-            label,
-            color,
-            cx,
-            cx.listener(move |shell, _event, _window, _cx| {
-                shell.set_locale(locale);
-                if let Some(store) = shell.settings() {
-                    if let Ok(mut store) = store.lock() {
-                        let _ = store.set(crate::theme::LOCALE_KEY, serde_json::json!(locale.code()));
-                    }
-                }
-            }),
-        )
-    };
-
-    let size_button = |size: f64, label: &'static str, cx: &mut Context<HarnessShell<S>>| {
-        let current = shell.settings().and_then(|store| {
-            store
-                .lock()
-                .ok()
-                .and_then(|store| store.get(crate::theme::FONT_SIZE_KEY).and_then(|v| v.as_f64()))
-        });
-        let active = current
-            .map(|current| (current - size).abs() < f64::EPSILON)
-            .unwrap_or((size - 16.0).abs() < f64::EPSILON);
-        let color = if active { p.accent } else { p.muted };
-        crate::widgets::button(
-            format!("harness-font-size-{size}"),
-            label,
-            color,
-            cx,
-            cx.listener(move |shell, _event, window, cx| {
-                shell.set_font_setting(
-                    crate::theme::FONT_SIZE_KEY,
-                    serde_json::json!(size),
-                    window,
-                    cx,
-                );
-            }),
-        )
-    };
-
-    // The font family input is created on first show; Enter applies it.
-    if shell.font_input().borrow().is_none() {
-        let input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder(crate::i18n::t(shell.locale(), "settings.font.placeholder"))
-        });
-        let subscription = cx.subscribe_in(
-            &input,
-            window,
-            |shell: &mut HarnessShell<S>, input, event: &InputEvent, window, cx| {
-                if !matches!(event, InputEvent::PressEnter { .. }) {
-                    return;
-                }
-                let family = input.read(cx).value().to_string();
-                if !family.trim().is_empty() {
-                    shell.set_font_setting(
-                        crate::theme::FONT_FAMILY_KEY,
-                        serde_json::json!(family),
-                        window,
-                        cx,
-                    );
-                }
-            },
-        );
-        *shell.font_input().borrow_mut() = Some(input);
-        *shell.font_input_sub().borrow_mut() = Some(subscription);
-    }
-
-    div()
-        .flex()
-        .flex_col()
-        .gap_3()
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .child(div().w(px(96.)).flex_none().text_sm().text_color(p.muted).child(shell.tr("settings.theme")))
-                .child(theme_button(ThemeKind::Dark, shell.tr("settings.theme_dark"), cx))
-                .child(theme_button(ThemeKind::Light, shell.tr("settings.theme_light"), cx)),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .child(div().w(px(96.)).flex_none().text_sm().text_color(p.muted).child(shell.tr("settings.motion")))
-                .child(motion_button(false, shell.tr("settings.motion_full"), cx))
-                .child(motion_button(true, shell.tr("settings.motion_reduced"), cx)),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .child(div().w(px(96.)).flex_none().text_sm().text_color(p.muted).child(shell.tr("settings.locale")))
-                .child(locale_button(
-                    Locale::ZhCn,
-                    crate::i18n::t(Locale::ZhCn, "settings.locale.zh"),
-                    cx,
-                ))
-                .child(locale_button(
-                    Locale::En,
-                    crate::i18n::t(Locale::En, "settings.locale.en"),
-                    cx,
-                )),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .child(div().w(px(96.)).flex_none().text_sm().text_color(p.muted).child(shell.tr("settings.font")))
-                .child(size_button(14.0, shell.tr("settings.font.small"), cx))
-                .child(size_button(16.0, shell.tr("settings.font.normal"), cx))
-                .child(size_button(18.0, shell.tr("settings.font.large"), cx)),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .child(div().w(px(96.)).flex_none().text_sm().text_color(p.muted).child(shell.tr("settings.font.family")))
-                .child(
-                    div()
-                        .w(px(180.))
-                        .when(shell.font_input().borrow().is_some(), |row| {
-                            row.child(
-                                Input::new(&shell.font_input().borrow().clone().expect("checked above"))
-                                    .w_full()
-                                    .text_xs(),
-                            )
-                        }),
-                ),
-        )
-        .child(div().flex_1())
-        .child(div().text_xs().text_color(p.muted).child(
-            crate::widgets::truncate(
-                &path.unwrap_or_else(|| shell.tr("settings.memory_mode").to_string()),
-                64,
-            ),
-        ))
-        .into_any_element()
-}
 
 
 impl<S: SessionView> Render for HarnessShell<S> {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
-        // Bring the conversation on screen up to the workspace's projection:
-        // what changed reaches the list as rows to remeasure and a splice, so
-        // a streaming answer costs its last row, not the whole stream.
+        // Bring the conversation on screen up to the workspace's projection.
         let conversation = self
             .workspace
             .as_ref()
             .map(|ws| ws.conversation())
             .unwrap_or_default();
-        if !self.transcript.reconcile(conversation).is_empty() {
-            self.stream.set_entries(self.transcript.entries());
-        }
+        self.show_conversation(conversation);
         // A session that has gone idle gets the next message it was holding.
         self.drain_queues();
         let window_width = f32::from(window.viewport_size().width);
@@ -2309,11 +1991,7 @@ impl<S: SessionView> Render for HarnessShell<S> {
             }))
             .on_action(cx.listener(|this: &mut Self, _: &StopTurn, _window, cx| {
                 // An open menu or dialog takes Escape first.
-                if this.close_settings() {
-                    cx.notify();
-                    return;
-                }
-                if this.close_session_menu() {
+                if this.close_settings() || this.close_session_menu() {
                     cx.notify();
                     return;
                 }
