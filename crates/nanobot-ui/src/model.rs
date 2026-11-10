@@ -14,6 +14,8 @@ use std::fmt;
 
 use nanobot_gpu::ViewportSlot;
 
+use crate::transcript::{Conversation, TurnPhase};
+
 /// Identity of a project — stable across renames and moves.
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct ProjectId(String);
@@ -66,40 +68,55 @@ impl From<&str> for SessionId {
     }
 }
 
-/// Lifecycle status of a session.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// Where a session stands, as its product reports it.
+///
+/// "Being looked at" is not a status — that is the shell's selection — and
+/// neither is "finished but not yet seen", which only the shell can know; see
+/// [`SessionBadge`](crate::transcript::SessionBadge) for the mark the sidebar
+/// makes of the two together. Archiving is a separate flag
+/// ([`SessionView::archived`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
 pub enum SessionStatus {
-    /// The session the workspace currently shows.
-    Active,
-    /// Background session still executing.
+    /// Nothing running, nothing wanted from the user.
+    #[default]
+    Idle,
+    /// A turn is in progress.
     Running,
-    /// Waiting for the user's review — the decision bar belongs here.
-    AwaitingReview,
-    Archived,
+    /// Stopped until the user answers: an approval, a question, a plan to
+    /// decide.
+    AwaitingUser,
+    /// The last turn ended in an error.
+    Error,
 }
 
 impl SessionStatus {
     pub fn label(self, locale: crate::i18n::Locale) -> &'static str {
         match self {
-            SessionStatus::Active => crate::i18n::t(locale, "status.active"),
+            SessionStatus::Idle => crate::i18n::t(locale, "status.idle"),
             SessionStatus::Running => crate::i18n::t(locale, "status.running"),
-            SessionStatus::AwaitingReview => crate::i18n::t(locale, "status.awaiting_review"),
-            SessionStatus::Archived => crate::i18n::t(locale, "status.archived"),
+            SessionStatus::AwaitingUser => crate::i18n::t(locale, "status.awaiting_user"),
+            SessionStatus::Error => crate::i18n::t(locale, "status.error"),
         }
     }
 }
 
-/// The container's session status maps 1:1 onto the shell's (the shell owns
-/// the UI wording; see [`SessionStatus::label`]).
+/// The container's session status as the shell's. The container's `Archived`
+/// is not a status here: read it with [`is_archived`] into
+/// [`SessionView::archived`].
 impl From<nanobot_boot::container::SessionStatus> for SessionStatus {
     fn from(status: nanobot_boot::container::SessionStatus) -> Self {
         match status {
-            nanobot_boot::container::SessionStatus::Active => Self::Active,
             nanobot_boot::container::SessionStatus::Running => Self::Running,
-            nanobot_boot::container::SessionStatus::AwaitingReview => Self::AwaitingReview,
-            nanobot_boot::container::SessionStatus::Archived => Self::Archived,
+            nanobot_boot::container::SessionStatus::AwaitingReview => Self::AwaitingUser,
+            nanobot_boot::container::SessionStatus::Active
+            | nanobot_boot::container::SessionStatus::Archived => Self::Idle,
         }
     }
+}
+
+/// Whether the container marks a session archived.
+pub fn is_archived(status: nanobot_boot::container::SessionStatus) -> bool {
+    status == nanobot_boot::container::SessionStatus::Archived
 }
 
 /// One step of a session's plan.
@@ -179,122 +196,6 @@ pub enum PlanDecision {
     Modify,
 }
 
-/// The kind of a conversation block.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum BlockKind {
-    User,
-    Assistant,
-    Tool,
-    Plan,
-    Check,
-}
-
-impl BlockKind {
-    pub fn label(self, locale: crate::i18n::Locale) -> &'static str {
-        match self {
-            BlockKind::User => crate::i18n::t(locale, "block.user"),
-            BlockKind::Assistant => crate::i18n::t(locale, "block.assistant"),
-            BlockKind::Tool => crate::i18n::t(locale, "block.tool"),
-            BlockKind::Plan => crate::i18n::t(locale, "block.plan"),
-            BlockKind::Check => crate::i18n::t(locale, "block.check"),
-        }
-    }
-}
-
-/// Execution state of a tool block.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ToolState {
-    Running,
-    Done,
-    Failed,
-}
-
-impl ToolState {
-    pub fn label(self, locale: crate::i18n::Locale) -> &'static str {
-        match self {
-            ToolState::Running => crate::i18n::t(locale, "tool.running"),
-            ToolState::Done => crate::i18n::t(locale, "tool.done"),
-            ToolState::Failed => crate::i18n::t(locale, "tool.failed"),
-        }
-    }
-}
-
-/// One block of the conversation stream, anchored to an event sequence.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Block {
-    pub kind: BlockKind,
-    pub text: String,
-    pub event_seq: u64,
-    pub tool_state: Option<ToolState>,
-    /// Optional spatial anchor (a selection reference) rendered as a chip.
-    pub selection_ref: Option<String>,
-}
-
-impl Block {
-    pub fn new(kind: BlockKind, event_seq: u64, text: impl Into<String>) -> Self {
-        Self {
-            kind,
-            text: text.into(),
-            event_seq,
-            tool_state: None,
-            selection_ref: None,
-        }
-    }
-
-    pub fn user(event_seq: u64, text: impl Into<String>) -> Self {
-        Self::new(BlockKind::User, event_seq, text)
-    }
-
-    pub fn assistant(event_seq: u64, text: impl Into<String>) -> Self {
-        Self::new(BlockKind::Assistant, event_seq, text)
-    }
-
-    pub fn tool(event_seq: u64, text: impl Into<String>, state: ToolState) -> Self {
-        Self::new(BlockKind::Tool, event_seq, text).with_tool_state(state)
-    }
-
-    pub fn plan(event_seq: u64, text: impl Into<String>) -> Self {
-        Self::new(BlockKind::Plan, event_seq, text)
-    }
-
-    pub fn check(event_seq: u64, text: impl Into<String>) -> Self {
-        Self::new(BlockKind::Check, event_seq, text)
-    }
-
-    pub fn with_tool_state(mut self, state: ToolState) -> Self {
-        self.tool_state = Some(state);
-        self
-    }
-
-    pub fn with_selection(mut self, selection_ref: impl Into<String>) -> Self {
-        self.selection_ref = Some(selection_ref.into());
-        self
-    }
-}
-
-/// The conversation stream of a session.
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
-pub struct Conversation {
-    pub blocks: Vec<Block>,
-}
-
-impl Conversation {
-    pub fn from_blocks(blocks: Vec<Block>) -> Self {
-        Self { blocks }
-    }
-
-    pub fn last_seq(&self) -> u64 {
-        self.blocks.last().map(|b| b.event_seq).unwrap_or(0)
-    }
-
-    /// Blocks must anchor to strictly increasing event sequences.
-    pub fn anchors_are_monotonic(&self) -> bool {
-        self.blocks
-            .windows(2)
-            .all(|pair| pair[0].event_seq < pair[1].event_seq)
-    }
-}
-
 /// Fork relationship to a parent session.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct BranchMarker {
@@ -325,6 +226,32 @@ pub trait WorkspaceView: Clone + 'static {
     fn settlement_items(&self) -> Vec<(String, bool)> {
         Vec::new()
     }
+    /// The model the session runs on, as the line under the composer names it.
+    fn model_label(&self) -> Option<String> {
+        None
+    }
+    /// The share of the context window in use, 0 to 1, when the product knows.
+    fn context_usage(&self) -> Option<f32> {
+        None
+    }
+    /// Whether the product can put its own state back as it was at an earlier
+    /// message. Without it a rewind offers only the conversation and a fork.
+    fn can_restore_state(&self) -> bool {
+        false
+    }
+    /// Where the turn stands. A product whose agent reports its own phase
+    /// overrides this; the default reads it off the plan phase and the status,
+    /// which cannot tell a pending approval from a pending question.
+    fn turn_phase(&self) -> TurnPhase {
+        match (self.plan_phase(), self.status()) {
+            (PlanPhase::Clarify, _) => TurnPhase::AwaitingClarification,
+            (PlanPhase::Contingent, _) => TurnPhase::AwaitingDecision,
+            (_, SessionStatus::Running) => TurnPhase::Generating,
+            (_, SessionStatus::AwaitingUser) => TurnPhase::AwaitingApproval,
+            (_, SessionStatus::Error) => TurnPhase::Error,
+            (_, SessionStatus::Idle) => TurnPhase::Idle,
+        }
+    }
 }
 
 /// A session as the shell sees it. The product implements this over its own
@@ -346,6 +273,16 @@ pub trait SessionView: Clone + 'static {
     fn plan_phase(&self) -> PlanPhase;
     fn clarify_questions(&self) -> Vec<String>;
     fn branch_marker(&self) -> Option<BranchMarker>;
+    /// When the session was last active, in ms since the unix epoch: what the
+    /// sidebar orders by and shows as an age. `None` when the product does
+    /// not track it.
+    fn last_active_ms(&self) -> Option<u64> {
+        None
+    }
+    /// Whether the session is archived: kept, but out of the sidebar's list.
+    fn archived(&self) -> bool {
+        false
+    }
 
     /// Builds the whole workspace for this session, owning a fresh viewport
     /// handle. Called on every activation, so switching back and forth gives
@@ -389,7 +326,13 @@ pub fn resolve_sidebar_groups<S: SessionView>(
     store: &SessionStore<S>,
     projection: Option<&dyn SidebarProjection<S>>,
 ) -> Vec<(String, Vec<S>)> {
-    let sessions: Vec<S> = store.open_project_sessions().to_vec();
+    // Archived sessions are kept, but not listed.
+    let sessions: Vec<S> = store
+        .open_project_sessions()
+        .iter()
+        .filter(|session| !session.archived())
+        .cloned()
+        .collect();
     let Some(projection) = projection else {
         return vec![(store.open_project().name.clone(), sessions)];
     };
@@ -400,6 +343,7 @@ pub fn resolve_sidebar_groups<S: SessionView>(
             .sessions
             .iter()
             .filter_map(|id| store.session(id).cloned())
+            .filter(|session| !session.archived())
             .collect();
         if members.is_empty() {
             continue;

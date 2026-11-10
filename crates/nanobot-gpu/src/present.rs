@@ -62,6 +62,26 @@ fn scroll_pixels(delta: ScrollDelta) -> f32 {
     }
 }
 
+thread_local! {
+    /// See [`suspend_viewport_input`].
+    static INPUT_SUSPENDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// While suspended, no viewport takes pointer or wheel input, and over a
+/// native surface the events go to GPUI's own listeners instead.
+///
+/// The shell turns this on for the length of a divider drag: the pointer
+/// crosses the viewport while a neighbouring region is resized, and on Windows
+/// the native surface would otherwise swallow the moves and the release, so
+/// the drag would stall at the viewport's edge. Turn it off when the drag ends.
+pub fn suspend_viewport_input(suspended: bool) {
+    INPUT_SUSPENDED.with(|flag| flag.set(suspended));
+}
+
+fn input_suspended() -> bool {
+    INPUT_SUSPENDED.with(std::cell::Cell::get)
+}
+
 /// What a native surface calls back into outside GPUI's frames.
 trait ViewportOwner {
     /// True when the view changed and needs a new frame.
@@ -163,6 +183,9 @@ impl<C: ViewportContent> Viewport<C> {
 
 impl<C: ViewportContent> ViewportOwner for Viewport<C> {
     fn feed(&mut self, input: ViewportInput) -> bool {
+        if input_suspended() {
+            return false;
+        }
         let changed = self.content.input(input);
         self.dirty |= changed;
         changed
@@ -937,6 +960,13 @@ mod native {
             });
             let weak = Rc::downgrade(&shared);
             composition.on_input(surface.id(), move |event| {
+                // A divider drag in progress: let GPUI's listeners have it.
+                if super::input_suspended() {
+                    return DispatchEventResult {
+                        propagate: true,
+                        default_prevented: false,
+                    };
+                }
                 let input = match event {
                     PlatformInput::MouseDown(event) if event.button == MouseButton::Left => {
                         ViewportInput {
