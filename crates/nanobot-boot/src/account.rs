@@ -215,6 +215,8 @@ pub fn denial_events(capability: &str, reason: &str) -> Vec<SessionEvent> {
             check_id: format!("account:{capability}"),
             passed: false,
             details: format!("capability `{capability}` denied: {reason}"),
+            measurements: std::collections::BTreeMap::new(),
+            scorer_version: None,
             payload: Some(serde_json::json!({
                 "capability": capability,
                 "denied": true,
@@ -282,7 +284,13 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert!(matches!(&events[0], SessionEvent::CheckRun { check_id } if check_id == "account:agent.turn"));
         match &events[1] {
-            SessionEvent::CheckResult { check_id, passed, details, payload } => {
+            SessionEvent::CheckResult {
+                check_id,
+                passed,
+                details,
+                payload,
+                ..
+            } => {
                 assert_eq!(check_id, "account:agent.turn");
                 assert!(!passed);
                 assert!(details.contains("plan expired"));

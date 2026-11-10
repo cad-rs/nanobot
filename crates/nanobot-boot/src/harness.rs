@@ -1257,6 +1257,7 @@ mod tests {
                 SessionEvent::StepStart { turn: 0, step: 0 },
                 SessionEvent::UserMessage {
                     content: "build it".to_string(),
+                    image: None,
                 },
                 crashed_call("c1", "build_sfq"),
             ],

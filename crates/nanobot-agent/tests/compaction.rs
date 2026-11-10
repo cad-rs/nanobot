@@ -16,6 +16,7 @@ fn session_with_turns(turns: usize, messages_per_turn: usize) -> Session {
         for index in 0..messages_per_turn {
             session.append(SessionEvent::UserMessage {
                 content: format!("turn {turn} message {index}"),
+                image: None,
             });
             session.append(SessionEvent::AssistantMessage {
                 content: format!("turn {turn} reply {index}"),
@@ -78,7 +79,7 @@ fn compaction_summarizes_the_older_turns_and_keeps_the_log() {
     assert!(
         !projected
             .iter()
-            .any(|m| matches!(m, ProjectedMessage::User(t) if t.contains("turn 0"))),
+            .any(|m| matches!(m, ProjectedMessage::User { content, .. } if content.contains("turn 0"))),
         "the covered turns are gone from the model history: {projected:?}"
     );
 }

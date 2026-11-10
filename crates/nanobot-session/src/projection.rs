@@ -198,6 +198,7 @@ mod tests {
         let session = Session::new("sess-compact");
         session.append(SessionEvent::UserMessage {
             content: "old request".to_string(),
+            image: None,
         });
         session.append(SessionEvent::AssistantMessage {
             content: "old answer".to_string(),
@@ -206,6 +207,7 @@ mod tests {
 
         session.append(SessionEvent::UserMessage {
             content: "new request".to_string(),
+            image: None,
         });
         session.append(SessionEvent::CompactionEntry {
             from_seq: 0,
@@ -220,7 +222,10 @@ mod tests {
                 ProjectedMessage::System(
                     "earlier: the chip was a 17-bit counter".to_string()
                 ),
-                ProjectedMessage::User("new request".to_string()),
+                ProjectedMessage::User {
+                    content: "new request".to_string(),
+                    image: None,
+                },
             ],
             "the covered events are replaced by the summary"
         );
@@ -233,6 +238,7 @@ mod tests {
         let session = Session::new("sess-compact-audit");
         session.append(SessionEvent::UserMessage {
             content: "old".to_string(),
+            image: None,
         });
         let covered_up_to = session.events().last().unwrap().seq;
         session.append(SessionEvent::CompactionEntry {
@@ -254,6 +260,7 @@ mod tests {
         let session = Session::new("sess-compact-twice");
         session.append(SessionEvent::UserMessage {
             content: "a".to_string(),
+            image: None,
         });
         session.append(SessionEvent::CompactionEntry {
             from_seq: 0,
@@ -280,10 +287,14 @@ mod tests {
         let session = Session::new("sess-compact-none");
         session.append(SessionEvent::UserMessage {
             content: "hi".to_string(),
+            image: None,
         });
         assert_eq!(
             messages(&session),
-            vec![ProjectedMessage::User("hi".to_string())]
+            vec![ProjectedMessage::User {
+                content: "hi".to_string(),
+                image: None,
+            }]
         );
     }
 }
