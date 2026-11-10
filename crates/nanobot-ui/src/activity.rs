@@ -689,13 +689,10 @@ impl<S: SessionView> HarnessShell<S> {
             })
     }
 
-    /// The composer: the text area with its one button, and the line below it
-    /// that says what the agent is running as.
-    pub(crate) fn composer_area(&self, ws: &S::Workspace, cx: &mut Context<Self>) -> AnyElement {
+    /// The composer and its one button: send, queue or stop.
+    fn composer_row(&self, ws: &S::Workspace, cx: &mut Context<Self>) -> Option<gpui::Div> {
         let p = palette(cx);
-        let Some(composer) = self.composer.clone() else {
-            return div().into_any_element();
-        };
+        let composer = self.composer.clone()?;
         let act = ws.turn_phase().composer_action(self.composer_has_text);
         let (button_icon, button_color) = match act {
             ComposerAction::Send => (Icon::Send, p.accent),
@@ -704,25 +701,7 @@ impl<S: SessionView> HarnessShell<S> {
         };
         // Nothing to send and nothing to stop: the button rests.
         let idle = act == ComposerAction::Send && !self.composer_has_text;
-        let mode = self.permission_mode;
-        let mode_color = if mode.is_unguarded() { p.warning } else { p.muted };
-        let context = ws.context_usage().map(|used| {
-            let color = match ContextLevel::of(used) {
-                ContextLevel::Normal => p.muted,
-                ContextLevel::Warning => p.warning,
-                ContextLevel::Critical => p.danger,
-            };
-            let percent = (used * 100.).round().clamp(0., 999.) as u32;
-            (self.trf("composer.context", &[("percent", &percent.to_string())]), color)
-        });
-
-        div()
-            .flex_none()
-            .border_t_1()
-            .border_color(p.border)
-            .flex()
-            .flex_col()
-            .child(
+        Some(
                 div()
                     .p_2()
                     .flex()
@@ -747,8 +726,61 @@ impl<S: SessionView> HarnessShell<S> {
                                     cx.notify();
                                 }),
                             ),
-                    ),
-            )
+                    )
+        )
+    }
+
+    /// The composer alone, under a viewport that has the window to itself:
+    /// what the turn is doing, the text box and its button. Everything else
+    /// about the session is one step away, in the column.
+    pub(crate) fn composer_strip(&self, ws: &S::Workspace, cx: &mut Context<Self>) -> AnyElement {
+        let p = palette(cx);
+        let Some(row) = self.composer_row(ws, cx) else {
+            return div().into_any_element();
+        };
+        let phase = ws.turn_phase();
+        let mark = crate::motion::Mark::of_turn(phase);
+        let color = if mark == crate::motion::Mark::Pulse { p.warning } else { p.info };
+        div()
+            .flex_none()
+            .border_t_1()
+            .border_color(p.border)
+            .flex()
+            .flex_row()
+            .items_center()
+            .children(crate::motion::mark(mark, "harness-strip-mark", color, self.still(cx)).map(
+                |mark| div().pl_3().flex_none().child(mark),
+            ))
+            .child(row.flex_1().min_w_0())
+            .into_any_element()
+    }
+
+    /// The composer: the text area with its one button, and the line below it
+    /// that says what the agent is running as.
+    pub(crate) fn composer_area(&self, ws: &S::Workspace, cx: &mut Context<Self>) -> AnyElement {
+        let p = palette(cx);
+        if self.composer.is_none() {
+            return div().into_any_element();
+        }
+        let mode = self.permission_mode;
+        let mode_color = if mode.is_unguarded() { p.warning } else { p.muted };
+        let context = ws.context_usage().map(|used| {
+            let color = match ContextLevel::of(used) {
+                ContextLevel::Normal => p.muted,
+                ContextLevel::Warning => p.warning,
+                ContextLevel::Critical => p.danger,
+            };
+            let percent = (used * 100.).round().clamp(0., 999.) as u32;
+            (self.trf("composer.context", &[("percent", &percent.to_string())]), color)
+        });
+
+        div()
+            .flex_none()
+            .border_t_1()
+            .border_color(p.border)
+            .flex()
+            .flex_col()
+            .children(self.composer_row(ws, cx))
             .child(
                 div()
                     .px_3()

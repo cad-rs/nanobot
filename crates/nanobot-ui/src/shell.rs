@@ -91,6 +91,9 @@ actions!(
         PreviousSession,
         /// Scrolls the conversation to its end and follows it.
         JumpToEnd,
+        ToggleTools,
+        PreviousUserMessage,
+        NextUserMessage,
         /// Puts the keyboard in the composer.
         FocusComposer,
         /// Moves up in the palette.
@@ -140,6 +143,9 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-tab", NextSession, Some(KEY_CONTEXT)),
         KeyBinding::new("ctrl-shift-tab", PreviousSession, Some(KEY_CONTEXT)),
         KeyBinding::new("ctrl-end", JumpToEnd, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-o", ToggleTools, Some(KEY_CONTEXT)),
+        KeyBinding::new("shift-pageup", PreviousUserMessage, Some(KEY_CONTEXT)),
+        KeyBinding::new("shift-pagedown", NextUserMessage, Some(KEY_CONTEXT)),
         KeyBinding::new("ctrl-l", FocusComposer, Some(KEY_CONTEXT)),
         KeyBinding::new("up", PaletteUp, Some(PALETTE_CONTEXT)),
         KeyBinding::new("down", PaletteDown, Some(PALETTE_CONTEXT)),
@@ -183,7 +189,10 @@ type RewindCallback = Rc<dyn Fn(&SessionId, u64, RewindMode, &str)>;
 /// Told to rename a session: the session and its new title.
 pub(crate) type RenameCallback = Rc<dyn Fn(&SessionId, &str)>;
 
-/// Told to archive a session.
+/// Told to try again: the session and the error entry's sequence.
+pub(crate) type RetryCallback = Rc<dyn Fn(&SessionId, u64)>;
+
+/// Told to archive, fork or delete a session.
 pub(crate) type ArchiveCallback = Rc<dyn Fn(&SessionId)>;
 
 /// A contingent-plan decision callback.
@@ -252,6 +261,13 @@ pub struct HarnessShell<S: SessionView> {
     pub(crate) renaming: Option<Renaming>,
     pub(crate) on_rename: Option<RenameCallback>,
     pub(crate) on_archive: Option<ArchiveCallback>,
+    pub(crate) on_fork: Option<ArchiveCallback>,
+    /// Told to try again after the error entry at this sequence.
+    pub(crate) on_retry: Option<RetryCallback>,
+    /// Told to show the object an entry is about.
+    pub(crate) on_anchor: Option<RenameCallback>,
+    pub(crate) on_delete: Option<ArchiveCallback>,
+    pub(crate) session_menu: Option<crate::session_menu::SessionMenu>,
     /// Callback invoked when the user decides a contingent plan.
     pub(crate) on_plan_decision: Option<PlanDecisionCallback>,
     /// Undo/redo and container save/load/import: the app layer forwards them to
@@ -302,7 +318,7 @@ pub struct HarnessShell<S: SessionView> {
     _font_input_sub: Rc<RefCell<Option<Subscription>>>,
     /// How the window is divided: the saved preference and what the window's
     /// width does to it now.
-    layout: LayoutState,
+    pub(crate) layout: LayoutState,
     /// The divider being dragged, with where the drag began.
     dragging: Option<DividerDrag>,
     /// Where the keyboard rests when nothing else holds the focus, so the
@@ -364,6 +380,11 @@ impl<S: SessionView> HarnessShell<S> {
             renaming: None,
             on_rename: None,
             on_archive: None,
+            on_fork: None,
+            on_retry: None,
+            on_anchor: None,
+            on_delete: None,
+            session_menu: None,
             on_message_sent: None,
             on_plan_decision: None,
             sidebar_projection: None,
@@ -2256,7 +2277,12 @@ impl<S: SessionView> Render for HarnessShell<S> {
                             .when(regions.column.is_none(), |d| {
                                 d.child(self.viewport_return_bar(cx))
                             })
-                            .child(div().flex_1().min_h_0().child(self.viewport_slot())),
+                            .child(div().flex_1().min_h_0().child(self.viewport_slot()))
+                            // Alone in the window, the viewport keeps a way
+                            // to talk to the session under it.
+                            .when(regions.column.is_none(), |d| {
+                                d.child(self.composer_strip(ws, cx))
+                            }),
                     );
                 }
             }
@@ -2299,6 +2325,11 @@ impl<S: SessionView> Render for HarnessShell<S> {
                 cx.notify();
             }))
             .on_action(cx.listener(|this: &mut Self, _: &StopTurn, _window, cx| {
+                // An open menu takes Escape first.
+                if this.close_session_menu() {
+                    cx.notify();
+                    return;
+                }
                 // Escape with nothing running is for whatever else wants it.
                 if this.stop_turn() {
                     cx.notify();
@@ -2320,6 +2351,17 @@ impl<S: SessionView> Render for HarnessShell<S> {
             }))
             .on_action(cx.listener(|this: &mut Self, _: &JumpToEnd, window, cx| {
                 this.run_command_in(crate::palette::id::JUMP_TO_END, window, cx);
+            }))
+            .on_action(cx.listener(|this: &mut Self, _: &ToggleTools, window, cx| {
+                this.run_command_in(crate::palette::id::TOGGLE_TOOLS, window, cx);
+            }))
+            .on_action(cx.listener(|this: &mut Self, _: &PreviousUserMessage, _window, cx| {
+                this.stream.step_user_message(-1);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this: &mut Self, _: &NextUserMessage, _window, cx| {
+                this.stream.step_user_message(1);
+                cx.notify();
             }))
             .on_action(cx.listener(|this: &mut Self, _: &FocusComposer, window, cx| {
                 if let Some(composer) = this.composer.clone() {
@@ -2389,6 +2431,7 @@ impl<S: SessionView> Render for HarnessShell<S> {
             .child(top)
             .child(body)
             .child(bottom)
+            .children(self.session_menu_overlay(window, cx))
             .children(self.palette_overlay(cx))
     }
 }

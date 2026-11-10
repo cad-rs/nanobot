@@ -88,6 +88,7 @@ icons! {
     TurnEnd => "turn-end",
     Anchor => "anchor",
     Branch => "branch",
+    Archive => "archive",
     // tool kinds
     ToolRead => "tool-read",
     ToolEdit => "tool-edit",

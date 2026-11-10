@@ -26,7 +26,7 @@ use gpui_component::ActiveTheme as _;
 
 use crate::i18n::Locale;
 use crate::icons::{icon, Icon};
-use crate::model::{PlanStep, SessionView, StepStatus};
+use crate::model::{PlanStep, SessionId, SessionView, StepStatus};
 use crate::motion::{self, Mark};
 use crate::shell::{badge, palette, HarnessShell, Palette};
 use crate::transcript::{Entry, EntryKind, ToolCall, ToolKind, ToolStatus};
@@ -118,6 +118,8 @@ pub enum RowKind {
     Error {
         title: String,
         message: String,
+        /// Whether trying again could help.
+        retryable: bool,
     },
 }
 
@@ -194,7 +196,8 @@ pub fn rows(entries: &[Entry]) -> Vec<Row> {
             EntryKind::TurnEnd { summary } => rows.push(row(RowKind::TurnEnd {
                 summary: summary.clone(),
             })),
-            EntryKind::Error { title, message, .. } => rows.push(row(RowKind::Error {
+            EntryKind::Error { title, message, retryable } => rows.push(row(RowKind::Error {
+                retryable: *retryable,
                 title: title.clone(),
                 message: message.clone(),
             })),
@@ -323,6 +326,46 @@ impl StreamState {
         let top = self.list.logical_scroll_top();
         (top.item_ix, f32::from(top.offset_in_item))
     }
+
+    /// Unfolds every tool row, or folds them all when none is left to
+    /// unfold. True when there was a tool row at all.
+    pub fn toggle_tools(&mut self) -> bool {
+        let tools: Vec<RowKey> = self
+            .rows
+            .iter()
+            .filter(|row| matches!(row.kind, RowKind::Tools(_) | RowKind::ToolCard(_)))
+            .map(|row| row.key)
+            .collect();
+        if tools.is_empty() {
+            return false;
+        }
+        if tools.iter().all(|key| self.expanded.contains(key)) {
+            for key in &tools {
+                self.expanded.remove(key);
+            }
+        } else {
+            self.expanded.extend(tools);
+        }
+        self.list.remeasure();
+        true
+    }
+
+    /// Scrolls to the user's message `step` away from the top of what is
+    /// shown (-1: the one before, 1: the one after). False when there is none
+    /// that way.
+    pub fn step_user_message(&self, step: isize) -> bool {
+        let top = self.list.logical_scroll_top().item_ix;
+        match user_message_from(&self.rows, top, step) {
+            Some(ix) => {
+                self.list.scroll_to(gpui::ListOffset {
+                    item_ix: ix,
+                    offset_in_item: px(0.),
+                });
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 /// What a run of one-line tool calls amounts to: its title for one (the row
@@ -392,6 +435,53 @@ pub fn output_tail(output: &str, lines: usize) -> (&str, usize) {
     (&output[start..], hidden)
 }
 
+/// The row of the user's message `step` away from row `top` (-1: the nearest
+/// one before it, 1: the nearest one after it).
+pub fn user_message_from(rows: &[Row], top: usize, step: isize) -> Option<usize> {
+    let is_user = |ix: &usize| matches!(rows[*ix].kind, RowKind::User { .. });
+    if step < 0 {
+        (0..top.min(rows.len())).rev().find(is_user)
+    } else {
+        (top + 1..rows.len()).find(is_user)
+    }
+}
+
+/// What a line of a diff is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DiffLineKind {
+    Added,
+    Removed,
+    Context,
+    /// A hunk header (`@@ … @@`) or a file header (`---`, `+++`).
+    Header,
+}
+
+/// The lines of a unified diff, each without its marker, and how many were
+/// added and removed. Headers count as neither.
+pub fn diff_lines(diff: &str) -> (Vec<(DiffLineKind, &str)>, usize, usize) {
+    let (mut added, mut removed) = (0, 0);
+    let lines = diff
+        .lines()
+        .map(|line| {
+            if line.starts_with("@@") || line.starts_with("+++") || line.starts_with("---") {
+                (DiffLineKind::Header, line)
+            } else if let Some(rest) = line.strip_prefix('+') {
+                added += 1;
+                (DiffLineKind::Added, rest)
+            } else if let Some(rest) = line.strip_prefix('-') {
+                removed += 1;
+                (DiffLineKind::Removed, rest)
+            } else {
+                (DiffLineKind::Context, line.strip_prefix(' ').unwrap_or(line))
+            }
+        })
+        .collect();
+    (lines, added, removed)
+}
+
+/// How many lines of a diff a folded card shows.
+pub const DIFF_HEAD_LINES: usize = 12;
+
 /// A duration as the thinking row states it: "0.8s", "12s", "2m 05s".
 pub fn duration_label(ms: u64) -> String {
     let secs = ms / 1000;
@@ -426,6 +516,57 @@ fn step_color(status: StepStatus, p: Palette) -> Hsla {
 }
 
 impl<S: SessionView> HarnessShell<S> {
+    /// What pointing at an object does: the session, and the object's name
+    /// as the entry gave it. With this set, the chip under an entry is a
+    /// button.
+    pub fn set_on_anchor<F: Fn(&SessionId, &str) + 'static>(&mut self, callback: F) {
+        self.on_anchor = Some(std::rc::Rc::new(callback));
+    }
+
+    /// Asks the product to show `anchor`. In a stacked layout the viewport
+    /// takes the window, so what was pointed at can be seen.
+    pub fn show_anchor(&mut self, anchor: &str) -> bool {
+        match (self.on_anchor.clone(), self.active_session_id().cloned()) {
+            (Some(callback), Some(session)) => {
+                callback(&session, anchor);
+                self.layout.set_stacked(crate::layout::Stacked::Viewport);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// What trying again after an error does: the session, and the sequence
+    /// of the error entry.
+    pub fn set_on_retry<F: Fn(&SessionId, u64) + 'static>(&mut self, callback: F) {
+        self.on_retry = Some(std::rc::Rc::new(callback));
+    }
+
+    /// Whether the error at `seq` can be tried again: the entry says trying
+    /// again could help, the product gave a way,
+    /// nothing came after the error, and no turn is running.
+    pub fn can_retry(&self, seq: u64) -> bool {
+        self.on_retry.is_some()
+            && !self.turn_phase().is_busy()
+            && self.stream.rows().last().is_some_and(|row| {
+                row.key.seq == seq && matches!(row.kind, RowKind::Error { retryable: true, .. })
+            })
+    }
+
+    /// Asks the product to try again after the error at `seq`.
+    pub fn retry(&mut self, seq: u64) -> bool {
+        if !self.can_retry(seq) {
+            return false;
+        }
+        match (self.on_retry.clone(), self.active_session_id().cloned()) {
+            (Some(callback), Some(session)) => {
+                callback(&session, seq);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// The conversation stream: the list, and the way back to its end once the
     /// user has scrolled away from it.
     pub(crate) fn render_stream(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -717,7 +858,10 @@ impl<S: SessionView> HarnessShell<S> {
                     output_tail(&output, OUTPUT_TAIL_LINES)
                 };
                 let tail = tail.trim_end().to_string();
-                let has_more = hidden > 0 || call.input.is_some();
+                let diff_text = call.diff.clone().unwrap_or_default();
+                let (diff, added, removed) = diff_lines(&diff_text);
+                let diff_hidden = if open { 0 } else { diff.len().saturating_sub(DIFF_HEAD_LINES) };
+                let has_more = hidden > 0 || diff_hidden > 0 || call.input.is_some();
                 div()
                     .mx_2()
                     .rounded(px(6.))
@@ -754,6 +898,17 @@ impl<S: SessionView> HarnessShell<S> {
                                     .font_family(mono.clone())
                                     .child(call.title.clone()),
                             )
+                            .when(added + removed > 0, |d| {
+                                d.child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .gap_1()
+                                        .font_family(mono.clone())
+                                        .child(div().text_color(p.success).child(format!("+{added}")))
+                                        .child(div().text_color(p.danger).child(format!("−{removed}"))),
+                                )
+                            })
                             .children(motion::mark(
                                 Mark::of_tool(call.status),
                                 ("card-mark", ix),
@@ -773,6 +928,49 @@ impl<S: SessionView> HarnessShell<S> {
                                 .text_xs()
                                 .text_color(p.muted)
                                 .child(input),
+                        )
+                    })
+                    .when(!diff.is_empty(), |d| {
+                        let shown = diff.len() - diff_hidden;
+                        d.child(
+                            div()
+                                .id(("tool-diff", ix))
+                                .py_1()
+                                .border_t_1()
+                                .border_color(p.border)
+                                .max_h(px(320.))
+                                .overflow_y_scroll()
+                                .font_family(mono.clone())
+                                .text_xs()
+                                .children(diff.iter().take(shown).map(|(kind, text)| {
+                                    // The marker stays, so the diff reads
+                                    // without colour too.
+                                    let (mark, color, tint) = match kind {
+                                        DiffLineKind::Added => ("+", p.success, 0.12),
+                                        DiffLineKind::Removed => ("−", p.danger, 0.12),
+                                        DiffLineKind::Context => (" ", p.fg, 0.),
+                                        DiffLineKind::Header => (" ", p.muted, 0.),
+                                    };
+                                    div()
+                                        .px_2()
+                                        .flex()
+                                        .flex_row()
+                                        .gap_2()
+                                        .when(tint > 0., |d| d.bg(color.opacity(tint)))
+                                        .text_color(if *kind == DiffLineKind::Context {
+                                            p.fg
+                                        } else {
+                                            color
+                                        })
+                                        .child(div().flex_none().w(px(8.)).child(mark))
+                                        .child(div().flex_1().min_w_0().child(text.to_string()))
+                                }))
+                                .when(diff_hidden > 0, |d| {
+                                    d.child(div().px_2().text_color(p.muted).child(self.trf(
+                                        "stream.more_lines",
+                                        &[("count", &diff_hidden.to_string())],
+                                    )))
+                                }),
                         )
                     })
                     .when(!tail.is_empty(), |d| {
@@ -891,7 +1089,7 @@ impl<S: SessionView> HarnessShell<S> {
                 .child(icon(Icon::TurnEnd, p.muted))
                 .child(summary)
                 .into_any_element(),
-            RowKind::Error { title, message } => div()
+            RowKind::Error { title, message, .. } => div()
                 .mx_2()
                 .px_2()
                 .py_2()
@@ -914,6 +1112,31 @@ impl<S: SessionView> HarnessShell<S> {
                         .child(title),
                 )
                 .child(div().text_xs().child(message))
+                .when(self.can_retry(key.seq), |d| {
+                    d.child(
+                        div().flex().flex_row().child(
+                            div()
+                                .id(("harness-retry", ix))
+                                .px_2()
+                                .py_1()
+                                .rounded(px(4.))
+                                .border_1()
+                                .border_color(p.danger.opacity(0.5))
+                                .text_xs()
+                                .text_color(p.danger)
+                                .cursor_pointer()
+                                .hover(|d| d.bg(p.danger.opacity(0.12)))
+                                .child(self.tr("entry.retry"))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this: &mut Self, _ev: &MouseDownEvent, _w, cx| {
+                                        this.retry(key.seq);
+                                        cx.notify();
+                                    }),
+                                ),
+                        ),
+                    )
+                })
                 .into_any_element(),
         };
 
@@ -931,18 +1154,34 @@ impl<S: SessionView> HarnessShell<S> {
             .when(after_rewind, |d| d.opacity(0.4))
             .child(body)
             .when_some(chip, |d, anchor| {
+                let pointing = self.on_anchor.is_some();
+                let target = anchor.clone();
                 d.child(
-                    div().px_3().child(
+                    div().px_3().flex().flex_row().child(
                         div()
+                            .id(("harness-anchor", ix))
                             .px_2()
                             .rounded(px(3.))
                             .bg(p.info.opacity(0.16))
-                            .text_xs()
                             .text_xs()
                             .flex()
                             .flex_row()
                             .items_center()
                             .gap_1()
+                            // With a product that can show it, the chip is
+                            // the way to the object.
+                            .when(pointing, |d| {
+                                d.cursor_pointer()
+                                    .hover(|d| d.bg(p.info.opacity(0.3)))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this: &mut Self, _ev: &MouseDownEvent, _w, cx| {
+                                            this.show_anchor(&target);
+                                            cx.stop_propagation();
+                                            cx.notify();
+                                        }),
+                                    )
+                            })
                             .child(icon(Icon::Anchor, p.info))
                             .child(anchor),
                     ),
@@ -1189,5 +1428,79 @@ mod tests {
         assert_eq!(duration_label(4_250), "4.2s");
         assert_eq!(duration_label(12_900), "12s");
         assert_eq!(duration_label(125_000), "2m 05s");
+    }
+
+    #[test]
+    fn a_diff_is_read_line_by_line() {
+        let text = "--- a/part\n+++ b/part\n@@ hole pattern @@\n count: 4\n-diameter: 6\n+diameter: 8\n+depth: 12\nplain";
+        let (lines, added, removed) = diff_lines(text);
+        assert_eq!((added, removed), (2, 1), "headers count as neither");
+        use DiffLineKind::*;
+        assert_eq!(
+            lines,
+            [
+                (Header, "--- a/part"),
+                (Header, "+++ b/part"),
+                (Header, "@@ hole pattern @@"),
+                (Context, "count: 4"),
+                (Removed, "diameter: 6"),
+                (Added, "diameter: 8"),
+                (Added, "depth: 12"),
+                (Context, "plain"),
+            ]
+        );
+        assert_eq!(diff_lines(""), (vec![], 0, 0));
+    }
+
+    #[test]
+    fn a_call_with_a_diff_is_a_card() {
+        let read = ToolCall::new(ToolKind::Read, "read", ToolStatus::Done);
+        assert!(!read.is_card());
+        assert!(read.with_diff("+x").is_card());
+    }
+
+    #[test]
+    fn user_messages_are_stepped_through_from_what_is_on_top() {
+        let stream = rows(&[
+            Entry::user(1, "first"),
+            Entry::assistant(2, "a"),
+            Entry::user(3, "second"),
+            Entry::assistant(4, "b"),
+            Entry::user(5, "third"),
+        ]);
+        assert_eq!(user_message_from(&stream, 3, -1), Some(2));
+        assert_eq!(user_message_from(&stream, 2, -1), Some(0), "from one to the one before");
+        assert_eq!(user_message_from(&stream, 0, -1), None);
+        assert_eq!(user_message_from(&stream, 0, 1), Some(2));
+        assert_eq!(user_message_from(&stream, 3, 1), Some(4));
+        assert_eq!(user_message_from(&stream, 4, 1), None);
+        assert_eq!(user_message_from(&stream, 99, -1), Some(4), "past the end");
+        assert_eq!(user_message_from(&[], 0, 1), None);
+    }
+
+    #[test]
+    fn all_tool_rows_unfold_and_fold_together() {
+        let mut state = StreamState::default();
+        assert!(!state.toggle_tools(), "no tool rows");
+        state.set_entries(&[
+            Entry::user(1, "q"),
+            Entry::tool(2, ToolCall::new(ToolKind::Edit, "edit", ToolStatus::Done).with_output("x")),
+            Entry::assistant(3, "a"),
+            Entry::tool(4, ToolCall::new(ToolKind::Read, "read", ToolStatus::Done)),
+        ]);
+        let tools: Vec<RowKey> = state
+            .rows()
+            .iter()
+            .filter(|row| matches!(row.kind, RowKind::Tools(_) | RowKind::ToolCard(_)))
+            .map(|row| row.key)
+            .collect();
+        assert_eq!(tools.len(), 2);
+
+        // One is open already: the rest follow, then all close.
+        state.toggle(tools[0]);
+        assert!(state.toggle_tools());
+        assert!(tools.iter().all(|key| state.is_expanded(*key)));
+        assert!(state.toggle_tools());
+        assert!(tools.iter().all(|key| !state.is_expanded(*key)));
     }
 }

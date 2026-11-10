@@ -33,6 +33,7 @@ pub mod motion;
 pub mod palette;
 pub mod panels;
 pub mod poll;
+pub mod session_menu;
 pub mod shell;
 pub mod sidebar;
 pub mod stream;
@@ -52,6 +53,7 @@ pub use transcript::{
     ToolStatus, Transcript, TurnPhase,
 };
 pub use layout::{Divider, Fold, Layout, LayoutState, Regions, Stacked};
+pub use session_menu::{Chosen, SessionAction};
 pub use sidebar::{SidebarRow, INACTIVE_AFTER_MS};
 pub use shell::{
     init, CyclePermissionMode, HarnessShell, OpenPalette, StopTurn, ToggleDock, ToggleSidebar,
@@ -1978,5 +1980,189 @@ mod tests {
         redraw(&shell, cx);
         cx.executor().advance_clock(std::time::Duration::from_millis(500));
         redraw(&shell, cx);
+    }
+
+    // ---- the session menu ----
+
+    #[test]
+    fn the_session_menu_lists_what_the_product_can_do() {
+        let asked = Rc::new(RefCell::new(Vec::new()));
+        let mut shell = HarnessShell::new(two_project_store());
+        let s2 = SessionId::new("s2");
+        assert!(shell.session_actions().is_empty());
+        assert!(!shell.open_session_menu(s2.clone(), "session s2", (10., 10.)), "nothing to list");
+
+        for (name, set) in [("fork", 0), ("archive", 1), ("delete", 2)] {
+            let log = asked.clone();
+            let hook = move |id: &SessionId| log.borrow_mut().push(format!("{name} {id}"));
+            match set {
+                0 => shell.set_on_fork(hook),
+                1 => shell.set_on_archive(hook),
+                _ => shell.set_on_delete(hook),
+            }
+        }
+        assert_eq!(
+            shell.session_actions(),
+            [SessionAction::Fork, SessionAction::Archive, SessionAction::Delete]
+        );
+
+        assert!(shell.open_session_menu(s2.clone(), "session s2", (10., 10.)));
+        assert_eq!(shell.choose_session_action(SessionAction::Fork), Chosen::Done);
+        assert!(!shell.session_menu_is_open());
+        assert_eq!(shell.choose_session_action(SessionAction::Fork), Chosen::Nothing, "no menu");
+
+        // Renaming is not offered, so choosing it does nothing.
+        shell.open_session_menu(s2.clone(), "session s2", (10., 10.));
+        assert_eq!(shell.choose_session_action(SessionAction::Rename), Chosen::Nothing);
+        shell.set_on_rename(|_, _| {});
+        shell.open_session_menu(s2.clone(), "session s2", (10., 10.));
+        assert_eq!(
+            shell.choose_session_action(SessionAction::Rename),
+            Chosen::Rename { session: s2.clone(), title: "session s2".into() }
+        );
+        assert_eq!(*asked.borrow(), ["fork s2"]);
+    }
+
+    #[test]
+    fn deleting_a_session_asks_twice() {
+        let asked = Rc::new(RefCell::new(Vec::new()));
+        let mut shell = HarnessShell::new(two_project_store());
+        let log = asked.clone();
+        shell.set_on_delete(move |id| log.borrow_mut().push(id.to_string()));
+        let s2 = SessionId::new("s2");
+
+        shell.open_session_menu(s2.clone(), "session s2", (10., 10.));
+        assert_eq!(shell.choose_session_action(SessionAction::Delete), Chosen::ConfirmDelete);
+        assert!(shell.session_menu_is_open(), "the menu stays to be asked again");
+        assert!(asked.borrow().is_empty());
+        // Closing it instead forgets the first answer.
+        assert!(shell.close_session_menu());
+        shell.open_session_menu(s2.clone(), "session s2", (10., 10.));
+        assert_eq!(shell.choose_session_action(SessionAction::Delete), Chosen::ConfirmDelete);
+        assert_eq!(shell.choose_session_action(SessionAction::Delete), Chosen::Done);
+        assert_eq!(*asked.borrow(), ["s2"]);
+        assert!(!shell.session_menu_is_open());
+    }
+
+    #[test]
+    fn the_session_menu_stays_inside_the_window() {
+        use crate::session_menu::menu_origin;
+        assert_eq!(menu_origin((100., 100.), 4, (1200., 800.)), (100., 100.));
+        let (left, top) = menu_origin((1190., 790.), 4, (1200., 800.));
+        assert!(left + 200. <= 1200. && top + 4. * 28. <= 800.);
+        assert_eq!(menu_origin((-5., -5.), 4, (1200., 800.)), (4., 4.));
+    }
+
+    #[gpui::test]
+    fn the_right_button_opens_the_menu_and_escape_closes_it(cx: &mut gpui::TestAppContext) {
+        let (shell, cx) = typing_shell(cx);
+        shell.update(cx, |shell, _| shell.set_on_archive(|_| {}));
+        redraw(&shell, cx);
+        shell.update(cx, |shell, _| {
+            assert!(shell.open_session_menu(SessionId::new("s2"), "session s2", (40., 120.)));
+        });
+        redraw(&shell, cx);
+        cx.simulate_keystrokes("escape");
+        redraw(&shell, cx);
+        assert!(!shell.read_with(cx, |shell, _| shell.session_menu_is_open()));
+    }
+
+    // ---- retrying ----
+
+    #[gpui::test]
+    fn an_error_that_could_pass_next_time_offers_a_retry(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let live = Rc::new(RefCell::new(Conversation::default()));
+        let session = |status| TestSession {
+            live: Some(live.clone()),
+            status,
+            ..TestSession::new("s1")
+        };
+        let failed = session(SessionStatus::Error);
+        let (shell, cx) = cx.add_window_view(|_, _| HarnessShell::new(one_project(vec![failed])));
+        let set = |entries: Vec<Entry>| *live.borrow_mut() = Conversation::from_entries(entries);
+        let can = |cx: &mut gpui::VisualTestContext| shell.read_with(cx, |shell, _| shell.can_retry(2));
+
+        set(vec![Entry::user(1, "mesh it"), Entry::error(2, "Timed out", "no answer").retryable()]);
+        redraw(&shell, cx);
+        assert!(!can(cx), "the product gave no way to retry");
+
+        let asked = Rc::new(RefCell::new(Vec::new()));
+        let log = asked.clone();
+        shell.update(cx, |shell, _| {
+            shell.set_on_retry(move |id, seq| log.borrow_mut().push(format!("{id} {seq}")));
+        });
+        assert!(can(cx));
+        assert!(shell.update(cx, |shell, _| shell.retry(2)));
+        assert_eq!(*asked.borrow(), ["s1 2"]);
+
+        // Not an error that trying again would help.
+        set(vec![Entry::user(1, "mesh it"), Entry::error(2, "No licence", "ask sales")]);
+        redraw(&shell, cx);
+        assert!(!can(cx));
+        // Not once the conversation has moved on.
+        set(vec![
+            Entry::user(1, "mesh it"),
+            Entry::error(2, "Timed out", "no answer").retryable(),
+            Entry::user(3, "never mind"),
+        ]);
+        redraw(&shell, cx);
+        assert!(!can(cx));
+        assert!(!shell.update(cx, |shell, _| shell.retry(2)));
+        assert_eq!(asked.borrow().len(), 1);
+    }
+
+    #[test]
+    fn only_an_error_can_be_marked_retryable() {
+        assert_eq!(Entry::user(1, "q").retryable(), Entry::user(1, "q"));
+        assert_ne!(Entry::error(2, "t", "m").retryable(), Entry::error(2, "t", "m"));
+    }
+
+    // ---- pointing at objects, and the stream's keys ----
+
+    #[test]
+    fn a_chip_asks_the_product_to_show_its_object() {
+        let asked = Rc::new(RefCell::new(Vec::new()));
+        let mut shell = HarnessShell::new(two_project_store());
+        assert!(!shell.show_anchor("Body1.TopFace"), "the product cannot show anything yet");
+        let log = asked.clone();
+        shell.set_on_anchor(move |id, anchor| log.borrow_mut().push(format!("{id} {anchor}")));
+        assert!(shell.show_anchor("Body1.TopFace"));
+        assert_eq!(*asked.borrow(), ["s1 Body1.TopFace"]);
+        // Where only one of the two fits, the viewport is brought up.
+        assert_eq!(shell.layout.stacked(), crate::layout::Stacked::Viewport);
+    }
+
+    #[gpui::test]
+    fn tool_output_unfolds_from_the_keyboard_while_typing(cx: &mut gpui::TestAppContext) {
+        let (shell, cx) = typing_shell(cx);
+        let live = Rc::new(RefCell::new(Conversation::from_entries(vec![
+            Entry::user(1, "q"),
+            Entry::tool(2, ToolCall::new(ToolKind::Edit, "edit", ToolStatus::Done).with_output("x")),
+        ])));
+        shell.update(cx, |shell, _| {
+            shell.stream_mut().set_entries(&live.borrow().entries);
+        });
+        let open = |cx: &mut gpui::VisualTestContext| {
+            shell.read_with(cx, |shell, _| {
+                let stream = shell.stream();
+                stream.rows().iter().filter(|row| stream.is_expanded(row.key)).count()
+            })
+        };
+        assert_eq!(open(cx), 0);
+        cx.simulate_keystrokes("ctrl-o");
+        assert_eq!(open(cx), 1, "ctrl-o reaches the shell from the composer");
+    }
+
+    #[gpui::test]
+    fn a_viewport_alone_in_the_window_keeps_the_composer(cx: &mut gpui::TestAppContext) {
+        let (shell, cx) = typing_shell(cx);
+        // Narrow enough that only one of the two fits, and it is the viewport.
+        cx.simulate_resize(gpui::size(gpui::px(700.), gpui::px(600.)));
+        shell.update(cx, |shell, _| shell.layout.set_stacked(crate::layout::Stacked::Viewport));
+        redraw(&shell, cx);
+        cx.simulate_keystrokes("ctrl-l");
+        cx.simulate_input("add a rib");
+        assert_eq!(composed(&shell, cx), "add a rib", "typing still reaches the session");
     }
 }

@@ -196,7 +196,8 @@ fn showcase() -> Vec<Entry> {
                 ToolStatus::Done,
             )
             .with_input("{ \"face\": \"Body1.TopFace\", \"diameter\": 6.6 }")
-            .with_output("4 holes cut"),
+            .with_output("4 holes cut")
+            .with_diff(PATTERN_DIFF),
         )
         .with_anchor("Body1.TopFace"),
         Entry::tool(
@@ -223,7 +224,11 @@ fn showcase() -> Vec<Entry> {
                 "move_pattern(offset=1.5)",
                 ToolStatus::AwaitingApproval,
             )
-            .with_input("{ \"axis\": \"X\", \"offset\": 1.5 }"),
+            .with_input("{ \"axis\": \"X\", \"offset\": 1.5 }")
+            .with_diff("@@ HolePattern1 @@
+ count: 4
+-offset_x: 0
++offset_x: 1.5"),
         ),
         Entry::plan(
             12,
@@ -375,7 +380,13 @@ fn store(streaming: Rc<RefCell<Conversation>>) -> SessionStore<Demo> {
                         conversation: streaming,
                         ..Demo::new("s3", "法兰初稿（流式）", SessionStatus::Running)
                     },
-                    Demo::new("s5", "壁厚检查出错", SessionStatus::Error),
+                    Demo {
+                        conversation: Rc::new(RefCell::new(Conversation::from_entries(vec![
+                            Entry::user(1, "检查所有孔的壁厚。"),
+                            Entry::error(2, "壁厚检查超时", "求解器 30 秒内没有应答").retryable(),
+                        ]))),
+                        ..Demo::new("s5", "壁厚检查出错", SessionStatus::Error)
+                    },
                     Demo::new("s4", "加强筋待确认", SessionStatus::AwaitingUser),
                     Demo {
                         idle_hours: 5,
@@ -402,6 +413,9 @@ fn store(streaming: Rc<RefCell<Conversation>>) -> SessionStore<Demo> {
         ProjectId::new("bracket"),
     )
 }
+
+/// What the hole pattern changed, long enough to fold.
+const PATTERN_DIFF: &str = "--- Body1\n+++ Body1\n@@ features @@\n Extrude1\n Fillet1\n+HolePattern1\n@@ HolePattern1 @@\n+face: Body1.TopFace\n+count: 4\n+pitch: 40\n+diameter: 6.6\n+depth: through\n+Hole1: (20, 20)\n+Hole2: (60, 20)\n+Hole3: (20, 60)\n+Hole4: (60, 60)\n@@ Body1 @@\n-volume: 48000 mm3\n+volume: 47316 mm3\n-mass: 376.8 g\n+mass: 371.4 g";
 
 fn main() {
     let config = nanobot_boot::settings::user_config_dir("shell_demo");
@@ -525,6 +539,19 @@ fn main() {
                 shell.set_on_stop(|id| log::info!("stop {id}"));
                 shell.set_on_rename(|id, title| log::info!("rename {id} to {title}"));
                 shell.set_on_archive(|id| log::info!("archive {id}"));
+                shell.set_on_fork(|id| log::info!("fork {id}"));
+                shell.set_on_anchor(|id, anchor| log::info!("show {anchor} of {id}"));
+                shell.set_on_delete(|id| log::info!("delete {id}"));
+                // Trying again, played out: the error goes and an answer comes.
+                let talks = conversations.clone();
+                shell.set_on_retry(move |id, seq| {
+                    log::info!("retry {id} after {seq}");
+                    if let Some(talk) = talks.get(id.as_str()) {
+                        let mut talk = talk.borrow_mut();
+                        talk.entries.retain(|entry| entry.seq < seq);
+                        talk.entries.push(Entry::assistant(seq, "重试后通过：所有孔的壁厚不小于 3 mm。"));
+                    }
+                });
                 shell.set_on_permission_mode(|mode| log::info!("permission mode: {mode:?}"));
                 // The running session thinks, runs a tool, then its answer
                 // arrives a little every tick, ends, rests, and starts over.

@@ -749,7 +749,7 @@ impl<S: SessionView> HarnessShell<S> {
                         // Shown while the pointer is on the row.
                         .invisible()
                         .group_hover(group.clone(), |style| style.visible())
-                        .child(icon(Icon::Close, p.muted))
+                        .child(icon(Icon::Archive, p.muted))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this: &mut Self, _ev: &MouseDownEvent, _w, cx| {
@@ -772,6 +772,22 @@ impl<S: SessionView> HarnessShell<S> {
                     .when(*active, |d| d.bg(p.accent.opacity(0.22)))
                     .flex()
                     .flex_col()
+                    // The right button asks what can be done with it.
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener({
+                            let (session, title) = (id.clone(), title.clone());
+                            move |this: &mut Self, ev: &MouseDownEvent, _w, cx| {
+                                this.sidebar_selected = Some(ix);
+                                this.open_session_menu(
+                                    session.clone(),
+                                    &title,
+                                    (f32::from(ev.position.x), f32::from(ev.position.y)),
+                                );
+                                cx.notify();
+                            }
+                        }),
+                    )
                     .cursor_pointer()
                     .on_mouse_down(
                         MouseButton::Left,

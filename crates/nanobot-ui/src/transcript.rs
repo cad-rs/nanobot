@@ -92,6 +92,9 @@ pub struct ToolCall {
     pub input: Option<String>,
     /// What it produced so far. May grow while the call runs.
     pub output: Option<String>,
+    /// What it changed, as a unified diff (`-` and `+` lines; `@@` hunk
+    /// headers and file headers are optional).
+    pub diff: Option<String>,
 }
 
 impl ToolCall {
@@ -102,6 +105,7 @@ impl ToolCall {
             status,
             input: None,
             output: None,
+            diff: None,
         }
     }
 
@@ -115,13 +119,20 @@ impl ToolCall {
         self
     }
 
+    pub fn with_diff(mut self, diff: impl Into<String>) -> Self {
+        self.diff = Some(diff.into());
+        self
+    }
+
     /// The density rule: a call is drawn as a card only when it needs the
-    /// user's answer, changes the product's state, or is producing output as
+    /// user's answer, changes the product's state, has a diff to show, or is
+    /// producing output as
     /// it runs. Everything else — the reads and searches that make up most of
     /// a turn — is one line.
     pub fn is_card(&self) -> bool {
         self.status == ToolStatus::AwaitingApproval
             || self.kind.mutates()
+            || self.diff.is_some()
             || (self.status == ToolStatus::Running && self.output.is_some())
     }
 }
@@ -264,6 +275,15 @@ impl Entry {
 
     pub fn with_anchor(mut self, anchor: impl Into<String>) -> Self {
         self.anchor = Some(anchor.into());
+        self
+    }
+
+    /// Marks an error entry as one that trying again could help. Nothing
+    /// changes on any other kind of entry.
+    pub fn retryable(mut self) -> Self {
+        if let EntryKind::Error { retryable, .. } = &mut self.kind {
+            *retryable = true;
+        }
         self
     }
 }

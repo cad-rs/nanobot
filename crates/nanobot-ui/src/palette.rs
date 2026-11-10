@@ -43,6 +43,7 @@ pub mod id {
     pub const CYCLE_PERMISSION_MODE: &str = "shell.cycle_permission_mode";
     pub const STOP_TURN: &str = "shell.stop_turn";
     pub const JUMP_TO_END: &str = "shell.jump_to_end";
+    pub const TOGGLE_TOOLS: &str = "shell.toggle_tools";
     pub const TOGGLE_THEME: &str = "shell.toggle_theme";
     pub const TOGGLE_MOTION: &str = "shell.toggle_motion";
     /// Prefix of "switch to this session"; the session's id follows.
@@ -75,6 +76,7 @@ impl<S: SessionView> HarnessShell<S> {
             )
             .with_keys("Shift+Tab"),
             Command::new(id::JUMP_TO_END, self.tr("command.jump_to_end")).with_keys("Ctrl+End"),
+            Command::new(id::TOGGLE_TOOLS, self.tr("command.toggle_tools")).with_keys("Ctrl+O"),
             Command::new(id::NEXT_SESSION, self.tr("command.next_session")).with_keys("Ctrl+Tab"),
             Command::new(id::PREVIOUS_SESSION, self.tr("command.previous_session"))
                 .with_keys("Ctrl+Shift+Tab"),
@@ -136,6 +138,7 @@ impl<S: SessionView> HarnessShell<S> {
             id::TOGGLE_DOCK => self.toggle_dock(window_width),
             id::CYCLE_PERMISSION_MODE => self.cycle_permission_mode(),
             id::JUMP_TO_END => self.stream().follow(),
+            id::TOGGLE_TOOLS => return self.stream.toggle_tools(),
             id::STOP_TURN => return self.stop_turn(),
             id::TOGGLE_THEME => self.wants_theme_toggle = true,
             id::TOGGLE_MOTION => self.set_reduce_motion(!self.reduce_motion()),
