@@ -9,7 +9,7 @@
 //! domain word.
 //!
 //! ```text
-//! header (identity · undo/redo · file ops · status)
+//! header (identity · undo/redo · file ops)
 //! ┌──────────┬───────────────────────┬──────────┬──────────┐
 //! │ session  │ session workspace     │ viewport │ right    │
 //! │ list     │ conversation + plan   │ (product │ dock     │
@@ -30,7 +30,7 @@ use gpui::{
     MouseButton, MouseDownEvent, Render, Subscription, Window,
 };
 use gpui_component::{
-    input::{Input, InputEvent, InputState, TextareaState},
+    input::{InputEvent, InputState, TextareaState},
     ActiveTheme as _, StyledExt as _,
 };
 use nanobot_boot::account::Account;
@@ -313,8 +313,8 @@ pub struct HarnessShell<S: SessionView> {
     /// (`ui.locale`), defaulted from the harness profile.
     pub(crate) locale: Locale,
     /// The settings dialog's font-family input, created on first show.
-    font_input: Rc<RefCell<Option<Entity<InputState>>>>,
-    _font_input_sub: Rc<RefCell<Option<Subscription>>>,
+    pub(crate) font_input: RefCell<Option<Entity<InputState>>>,
+    pub(crate) font_input_sub: RefCell<Option<Subscription>>,
     /// How the window is divided: the saved preference and what the window's
     /// width does to it now.
     pub(crate) layout: LayoutState,
@@ -405,8 +405,8 @@ impl<S: SessionView> HarnessShell<S> {
             plugins: None,
             rejected_plugins: Vec::new(),
             locale: Locale::default(),
-            font_input: Rc::new(RefCell::new(None)),
-            _font_input_sub: Rc::new(RefCell::new(None)),
+            font_input: RefCell::new(None),
+            font_input_sub: RefCell::new(None),
             layout: LayoutState::default(),
             dragging: None,
             focus_anchor: None,
@@ -710,9 +710,8 @@ impl<S: SessionView> HarnessShell<S> {
         self.settings.clone()
     }
 
-    /// The settings file's path as the panels show it (`None` = in-memory,
-    /// nothing shared). The single read the settings and diagnostics panels
-    /// share.
+    /// The settings file's path as the settings dialog and the diagnostics
+    /// panel show it (`None` = in-memory, nothing shared).
     pub fn settings_path(&self) -> Option<String> {
         self.settings
             .as_ref()
@@ -736,20 +735,9 @@ impl<S: SessionView> HarnessShell<S> {
         self.locale = locale;
     }
 
-    /// The settings dialog's font input handle (the dialog creates it on
-    /// first show).
-    pub fn font_input(&self) -> Rc<RefCell<Option<Entity<InputState>>>> {
-        self.font_input.clone()
-    }
-
-    pub(crate) fn font_input_sub(&self) -> Rc<RefCell<Option<Subscription>>> {
-        self._font_input_sub.clone()
-    }
-
-    /// Writes one font setting and re-themes the window. The settings dialog
-    /// is the only caller today; the app layer applies the stored fonts at
-    /// launch through [`crate::theme::apply_font`].
-    fn set_font_setting(
+    /// Writes one font setting and re-themes the window. The app layer applies
+    /// the stored fonts at launch through [`crate::theme::apply_font`].
+    pub(crate) fn set_font_setting(
         &mut self,
         key: &'static str,
         value: serde_json::Value,
@@ -1344,19 +1332,7 @@ impl<S: SessionView> HarnessShell<S> {
                     .child(title),
             )
             // What the turn is doing right now, then the session's status.
-            .children(workspace.and_then(|_| {
-                let phase = self.turn_phase();
-                let color = match crate::motion::Mark::of_turn(phase) {
-                    crate::motion::Mark::Pulse => p.warning,
-                    _ => p.info,
-                };
-                crate::motion::mark(
-                    crate::motion::Mark::of_turn(phase),
-                    "harness-turn-mark",
-                    color,
-                    self.still(cx),
-                )
-            }))
+            .children(workspace.and_then(|_| self.turn_mark(self.turn_phase(), "harness-turn-mark", cx)))
             .when_some(status, |d, status| {
                 d.child(badge(status.label(self.locale), session_color(status, p)))
             })
@@ -1881,198 +1857,6 @@ fn diagnostics_panel<S: SessionView>(
         .into_any_element()
 }
 
-/// What the settings dialog holds: theme, motion, language, font, and where
-/// the settings file is.
-pub(crate) fn settings_body<S: SessionView>(
-    shell: &HarnessShell<S>,
-    window: &mut Window,
-    cx: &mut Context<HarnessShell<S>>,
-) -> AnyElement {
-    let p = palette(cx);
-    let current = shell.theme();
-    let path = shell.settings_path();
-
-    let theme_button =
-        |kind: ThemeKind, label: &'static str, cx: &mut Context<HarnessShell<S>>| {
-            let color = if current == kind { p.accent } else { p.muted };
-            crate::widgets::button(
-                format!("harness-theme-{}", kind.as_str()),
-                label,
-                color,
-                cx,
-                cx.listener(move |shell, _event, window, cx| {
-                    shell.switch_theme(kind, window, cx);
-                }),
-            )
-        };
-
-    let motion_button = |reduce: bool, label: &'static str, cx: &mut Context<HarnessShell<S>>| {
-        let color = if shell.reduce_motion() == reduce { p.accent } else { p.muted };
-        crate::widgets::button(
-            if reduce { "harness-motion-reduced" } else { "harness-motion-full" },
-            label,
-            color,
-            cx,
-            cx.listener(move |shell, _event, _window, cx| {
-                shell.set_reduce_motion(reduce);
-                cx.notify();
-            }),
-        )
-    };
-
-    let locale_button = |locale: Locale,
-                         label: &'static str,
-                         cx: &mut Context<HarnessShell<S>>| {
-        let active = shell.locale() == locale;
-        let color = if active { p.accent } else { p.muted };
-        crate::widgets::button(
-            format!("harness-locale-{}", locale.code()),
-            label,
-            color,
-            cx,
-            cx.listener(move |shell, _event, _window, _cx| {
-                shell.set_locale(locale);
-                shell.save_setting(crate::theme::LOCALE_KEY, serde_json::json!(locale.code()));
-            }),
-        )
-    };
-
-    let size_button = |size: f64, label: &'static str, cx: &mut Context<HarnessShell<S>>| {
-        let current = shell.settings().and_then(|store| {
-            store
-                .lock()
-                .ok()
-                .and_then(|store| store.get(crate::theme::FONT_SIZE_KEY).and_then(|v| v.as_f64()))
-        });
-        let active = current
-            .map(|current| (current - size).abs() < f64::EPSILON)
-            .unwrap_or((size - 16.0).abs() < f64::EPSILON);
-        let color = if active { p.accent } else { p.muted };
-        crate::widgets::button(
-            format!("harness-font-size-{size}"),
-            label,
-            color,
-            cx,
-            cx.listener(move |shell, _event, window, cx| {
-                shell.set_font_setting(
-                    crate::theme::FONT_SIZE_KEY,
-                    serde_json::json!(size),
-                    window,
-                    cx,
-                );
-            }),
-        )
-    };
-
-    // The font family input is created on first show; Enter applies it.
-    if shell.font_input().borrow().is_none() {
-        let input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder(crate::i18n::t(shell.locale(), "settings.font.placeholder"))
-        });
-        let subscription = cx.subscribe_in(
-            &input,
-            window,
-            |shell: &mut HarnessShell<S>, input, event: &InputEvent, window, cx| {
-                if !matches!(event, InputEvent::PressEnter { .. }) {
-                    return;
-                }
-                let family = input.read(cx).value().to_string();
-                if !family.trim().is_empty() {
-                    shell.set_font_setting(
-                        crate::theme::FONT_FAMILY_KEY,
-                        serde_json::json!(family),
-                        window,
-                        cx,
-                    );
-                }
-            },
-        );
-        *shell.font_input().borrow_mut() = Some(input);
-        *shell.font_input_sub().borrow_mut() = Some(subscription);
-    }
-
-    div()
-        .flex()
-        .flex_col()
-        .gap_3()
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .child(div().w(px(96.)).flex_none().text_sm().text_color(p.muted).child(shell.tr("settings.theme")))
-                .child(theme_button(ThemeKind::Dark, shell.tr("settings.theme_dark"), cx))
-                .child(theme_button(ThemeKind::Light, shell.tr("settings.theme_light"), cx)),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .child(div().w(px(96.)).flex_none().text_sm().text_color(p.muted).child(shell.tr("settings.motion")))
-                .child(motion_button(false, shell.tr("settings.motion_full"), cx))
-                .child(motion_button(true, shell.tr("settings.motion_reduced"), cx)),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .child(div().w(px(96.)).flex_none().text_sm().text_color(p.muted).child(shell.tr("settings.locale")))
-                .child(locale_button(
-                    Locale::ZhCn,
-                    crate::i18n::t(Locale::ZhCn, "settings.locale.zh"),
-                    cx,
-                ))
-                .child(locale_button(
-                    Locale::En,
-                    crate::i18n::t(Locale::En, "settings.locale.en"),
-                    cx,
-                )),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .child(div().w(px(96.)).flex_none().text_sm().text_color(p.muted).child(shell.tr("settings.font")))
-                .child(size_button(14.0, shell.tr("settings.font.small"), cx))
-                .child(size_button(16.0, shell.tr("settings.font.normal"), cx))
-                .child(size_button(18.0, shell.tr("settings.font.large"), cx)),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .child(div().w(px(96.)).flex_none().text_sm().text_color(p.muted).child(shell.tr("settings.font.family")))
-                .child(
-                    div()
-                        .w(px(180.))
-                        .when(shell.font_input().borrow().is_some(), |row| {
-                            row.child(
-                                Input::new(&shell.font_input().borrow().clone().expect("checked above"))
-                                    .w_full()
-                                    .text_xs(),
-                            )
-                        }),
-                ),
-        )
-        .child(div().flex_1())
-        .child(div().text_xs().text_color(p.muted).child(
-            crate::widgets::truncate(
-                &path.unwrap_or_else(|| shell.tr("settings.memory_mode").to_string()),
-                64,
-            ),
-        ))
-        .into_any_element()
-}
 
 
 impl<S: SessionView> Render for HarnessShell<S> {
@@ -2207,11 +1991,7 @@ impl<S: SessionView> Render for HarnessShell<S> {
             }))
             .on_action(cx.listener(|this: &mut Self, _: &StopTurn, _window, cx| {
                 // An open menu or dialog takes Escape first.
-                if this.close_settings() {
-                    cx.notify();
-                    return;
-                }
-                if this.close_session_menu() {
+                if this.close_settings() || this.close_session_menu() {
                     cx.notify();
                     return;
                 }

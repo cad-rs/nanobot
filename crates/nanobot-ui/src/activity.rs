@@ -241,7 +241,7 @@ pub(crate) fn step_color(status: StepStatus, p: Palette) -> Hsla {
 }
 
 /// A section of the activity bar: separated from what is above it.
-fn section(p: Palette) -> Div {
+pub(crate) fn section(p: Palette) -> Div {
     div()
         .flex_none()
         .px_2()
@@ -254,7 +254,7 @@ fn section(p: Palette) -> Div {
 }
 
 /// A button of the activity bar: a word in a bordered pill.
-fn action(id: impl Into<gpui::ElementId>, label: &'static str, color: Hsla) -> Stateful<Div> {
+pub(crate) fn action(id: impl Into<gpui::ElementId>, label: &'static str, color: Hsla) -> Stateful<Div> {
     div()
         .id(id)
         .px_2()
@@ -736,9 +736,6 @@ impl<S: SessionView> HarnessShell<S> {
         let Some(row) = self.composer_row(ws, cx) else {
             return div().into_any_element();
         };
-        let phase = ws.turn_phase();
-        let mark = crate::motion::Mark::of_turn(phase);
-        let color = if mark == crate::motion::Mark::Pulse { p.warning } else { p.info };
         div()
             .flex_none()
             .border_t_1()
@@ -746,9 +743,10 @@ impl<S: SessionView> HarnessShell<S> {
             .flex()
             .flex_row()
             .items_center()
-            .children(crate::motion::mark(mark, "harness-strip-mark", color, self.still(cx)).map(
-                |mark| div().pl_3().flex_none().child(mark),
-            ))
+            .children(
+                self.turn_mark(ws.turn_phase(), "harness-strip-mark", cx)
+                    .map(|mark| div().pl_3().flex_none().child(mark)),
+            )
             .child(row.flex_1().min_w_0())
             .into_any_element()
     }

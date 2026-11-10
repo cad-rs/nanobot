@@ -11,6 +11,7 @@ use gpui::{
 use gpui_component::input::{InlineToken, Input, InputEvent, InputState};
 use gpui_component::ActiveTheme as _;
 
+use crate::activity::{action, section};
 use crate::commands::{filter, trigger_at, Candidate, Command, RewindMode, Selection, Trigger};
 use crate::icons::{icon, Icon};
 use crate::model::{SessionId, SessionView, WorkspaceView};
@@ -115,8 +116,8 @@ impl<S: SessionView> HarnessShell<S> {
         commands
     }
 
-    /// The session `step` places after the one on screen in the sidebar's
-    /// order, wrapping round. `None` when there is nowhere else to go.
+    /// The session `step` places after the one on screen in the open
+    /// project, wrapping round. `None` when there is nowhere else to go.
     fn neighbour_session(&self, step: isize) -> Option<SessionId> {
         let ids: Vec<SessionId> = self
             .store()
@@ -305,7 +306,7 @@ impl<S: SessionView> HarnessShell<S> {
 }
 
 // ---------------------------------------------------------------------------
-// With a window.
+// What is on screen, for tests and for the product.
 
 impl<S: SessionView> HarnessShell<S> {
 
@@ -653,23 +654,12 @@ impl<S: SessionView> HarnessShell<S> {
                 RewindMode::Fork => ("rewind.fork", p.fg),
             };
             buttons = buttons.child(
-                div()
-                    .id(key)
-                    .px_2()
-                    .py_1()
-                    .rounded(px(4.))
-                    .border_1()
-                    .border_color(color.opacity(0.5))
-                    .text_xs()
-                    .text_color(color)
-                    .cursor_pointer()
-                    .child(self.tr(key))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this: &mut Self, _ev: &MouseDownEvent, window, cx| {
-                            this.rewind_in(mode, window, cx);
-                        }),
-                    ),
+                action(key, self.tr(key), color).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this: &mut Self, _ev: &MouseDownEvent, window, cx| {
+                        this.rewind_in(mode, window, cx);
+                    }),
+                ),
             );
         }
         buttons = buttons.child(
@@ -690,16 +680,8 @@ impl<S: SessionView> HarnessShell<S> {
                 ),
         );
         Some(
-            div()
-                .flex_none()
-                .px_2()
-                .py_1()
-                .border_t_1()
-                .border_color(p.border)
+            section(p)
                 .bg(p.info.opacity(0.06))
-                .flex()
-                .flex_col()
-                .gap_1()
                 .child(
                     div()
                         .flex()

@@ -220,7 +220,22 @@ impl<S: SessionView> HarnessShell<S> {
     pub(crate) fn still(&self, cx: &App) -> bool {
         self.reduce_motion || cx.reduce_motion()
     }
+
+    /// The mark of a turn in `phase`, in the colour of what it says: waiting
+    /// for the user is a warning, working is information.
+    pub(crate) fn turn_mark(
+        &self,
+        phase: TurnPhase,
+        id: &'static str,
+        cx: &App,
+    ) -> Option<AnyElement> {
+        let p = crate::shell::palette(cx);
+        let which = Mark::of_turn(phase);
+        let color = if which == Mark::Pulse { p.warning } else { p.info };
+        mark(which, id, color, self.still(cx))
+    }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
