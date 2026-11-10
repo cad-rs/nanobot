@@ -419,7 +419,8 @@ impl<M: Manifest> Project<M> {
         self.manifest.seal()?;
         let text = self.manifest.to_toml_string()?;
         let path = self.paths.manifest();
-        std::fs::write(&path, text).map_err(|source| BootError::Io { path, source })?;
+        crate::write_whole(&path, text.as_bytes())
+            .map_err(|source| BootError::Io { path, source })?;
         self.checksum = ChecksumState::Verified;
         Ok(())
     }

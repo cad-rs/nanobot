@@ -12,6 +12,7 @@ gpui = { workspace = true }
 # is the point of this crate.
 wgpu = { workspace = true }
 anyhow = { workspace = true }
+log = { workspace = true }
 
 # Web: GPUI's renderer is wgpu itself. The viewport renders on GPUI's device
 # into a WgpuDynamicTexture, which joins the draw order as an ordinary sprite.

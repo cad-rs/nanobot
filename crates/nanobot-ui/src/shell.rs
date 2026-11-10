@@ -2036,7 +2036,7 @@ impl<S: SessionView> Render for HarnessShell<S> {
         let p = palette(cx);
         // The registry is cloned out so the panel factories can be called with
         // an immutable borrow of the shell.
-        let panels = self.panel_host.panels().to_vec();
+        let panels = self.panel_host.visible_panels();
         let left = self.dock_region(PanelArea::Left, &panels, window, cx);
         let right = self.dock_region(PanelArea::Right, &panels, window, cx);
         let top = self.dock_region(PanelArea::Top, &panels, window, cx);

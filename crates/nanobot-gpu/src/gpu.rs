@@ -88,7 +88,7 @@ impl Gpu {
     fn from_web_context(context: gpui_wgpu::WgpuContext) -> Self {
         let missing = requirements().features - context.device.features();
         if !missing.is_empty() {
-            eprintln!("nanobot-gpu: GPUI's web device lacks requested features: {missing:?}");
+            log::warn!("GPUI's web device lacks requested features: {missing:?}");
         }
         Self {
             device: (*context.device).clone(),
@@ -138,7 +138,7 @@ impl Gpu {
         // Device errors are dispatched asynchronously; wgpu's default handler
         // panics, which would take the UI thread down with it.
         device.on_uncaptured_error(std::sync::Arc::new(|error: wgpu::Error| {
-            eprintln!("nanobot-gpu: wgpu error: {error}");
+            log::error!("wgpu error: {error}");
         }));
 
         Ok(Self {
@@ -207,7 +207,7 @@ pub fn shared_gpu(_window: &Window) -> Option<Rc<Gpu>> {
                 match Gpu::new() {
                     Ok(gpu) => *slot = GpuSlot::Ready(Rc::new(gpu)),
                     Err(error) => {
-                        eprintln!("nanobot-gpu: failed to init the wgpu device: {error:#}");
+                        log::error!("failed to init the wgpu device: {error:#}");
                         *slot = GpuSlot::Failed;
                     }
                 }

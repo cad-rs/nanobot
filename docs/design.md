@@ -25,6 +25,17 @@
 > 输入由槽路由而不再由壳转发。§3.2 第 5、6 条、§3.3、§4.9 已按此改写；
 > 文中其余提到 `paint_surface` / `gpui-ce` 的地方是当时的历史描述。
 >
+> **修订 2026-11-10（商业化缺口）**：对照 workbench-rs 近期提交补齐——
+> 整文件写入一律原子替换（事件日志快照 / 项目清单 / 用户设置）；
+> `nanobot_boot::diagnostics`（滚动日志文件、panic 崩溃报告、纯文本诊断导出、
+> 默认关闭的 `CrashReporter`）；`nanobot_auth::auth_code`（系统浏览器登录：
+> 授权码 + PKCE + 回环重定向，桌面端）；`RefreshSchedule` / `SessionGrace`
+> （何时重查权益、会话中途失效不收回正在用的能力）；插件清单 `requires` 与
+> `PanelDef::requires`（按能力放行插件与面板）；`deny.toml` 依赖许可证策略。
+> 未移植：浏览器登录的 Web 变体、文档格式版本升级、关闭前的未保存提示、
+> 设置 / 快捷键对话框（后三项属于 workbench-rs 的文档模型与界面，nanobot 的
+> 会话是追加式事件日志，没有对应物）。
+>
 > 相关文档（rcad-pro 侧）：`docs/design-harness.md`（ocad 产品设计）、
 > `docs/design-harness-architecture.md`（ocad 插件化架构，本设计的输入）、
 > `docs/agent-native-layering-principles.md`（分层原则）、

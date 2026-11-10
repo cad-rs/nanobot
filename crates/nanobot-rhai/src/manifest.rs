@@ -24,6 +24,11 @@ pub struct PluginInfo {
     pub version: String,
     pub api_version: String,
     pub entry_point: String,
+    /// Capabilities the plugin needs the current user to have (the names the
+    /// product's account provider answers for, e.g. `"export.gds"`). A plugin
+    /// whose requirement is refused is not loaded and its script never runs.
+    #[serde(default)]
+    pub requires: Vec<String>,
     #[serde(default)]
     pub modules: Vec<String>,
 }

@@ -6,16 +6,24 @@
 //! - [`oauth`] — the RFC 8628 device flow (the shape a desktop harness can
 //!   run: show a code, open a URL, poll), the [`oauth::OAuth2Provider`] over
 //!   its token cache, and the opt-in settings persistence for grants.
+//! - [`auth_code`] — browser sign-in on the desktop: authorization code +
+//!   PKCE with a loopback redirect. Nothing to type; it ends in the same
+//!   [`oauth::TokenSet`] the device flow does.
 //! - [`license`] — offline licenses: an ed25519-signed entitlement token
 //!   the harness verifies at load with only a public key, for the air-gapped
 //!   lab and the perpetual desktop sale.
 
 pub mod error;
+#[cfg(not(target_family = "wasm"))]
+pub mod auth_code;
 pub mod license;
 pub mod oauth;
 pub mod plugin;
 
 pub(crate) mod base64;
+
+#[cfg(not(target_family = "wasm"))]
+pub use auth_code::{AuthCodeConfig, AuthCodeFlow, AuthCodePoll, SignInRequest};
 
 pub use error::AuthError;
 pub use license::{

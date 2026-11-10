@@ -37,6 +37,8 @@ pub mod account;
 pub mod canonical;
 pub mod cli;
 pub mod container;
+pub mod diagnostics;
+pub mod entitlement_refresh;
 pub mod error;
 pub mod harness;
 pub mod harness_toml;
@@ -57,3 +59,14 @@ pub use error::BootError;
 pub use harness::{run_one_turn, Harness, HarnessBuilder, CLEAN_MARKER};
 pub use harness_toml::{ApprovalMode, HarnessProfile, ProviderConfig, HARNESS_TOML};
 pub use settings::{Settings, SETTINGS_FILE};
+pub use entitlement_refresh::{RefreshSchedule, SessionGrace};
+
+/// Writes a whole durable file (settings, the project manifest): all or
+/// nothing on native targets, where a crash mid-write must not destroy the
+/// previous content.
+pub(crate) fn write_whole(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(not(target_family = "wasm"))]
+    return nanobot_session::atomic::write(path, bytes);
+    #[cfg(target_family = "wasm")]
+    return std::fs::write(path, bytes);
+}

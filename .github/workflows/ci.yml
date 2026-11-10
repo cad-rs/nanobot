@@ -79,3 +79,16 @@ jobs:
         run: cargo clippy --workspace --lib --tests -- -D warnings
       - name: test (workspace)
         run: cargo test --workspace
+
+  dependencies:
+    # A product built on the framework inherits its dependency tree, so the
+    # tree is held to licenses that put no limit on commercial use and to
+    # known sources (deny.toml).
+    name: dependency licenses and sources
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses sources

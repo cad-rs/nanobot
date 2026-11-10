@@ -18,19 +18,20 @@ use std::path::Path;
 /// Save the event log to a JSONL file.
 ///
 /// Each entry is serialized as one JSON object per line. The file is
-/// truncated and rewritten in full (MVP snapshot strategy).
+/// rewritten in full (MVP snapshot strategy) and replaced atomically.
 #[cfg(not(target_family = "wasm"))]
 pub fn save(path: &Path, entries: &[LogEntry]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
 
-    let mut file = fs::File::create(path)?;
+    let mut bytes = Vec::new();
     for entry in entries {
-        let line = serde_json::to_string(entry)?;
-        writeln!(file, "{line}")?;
+        serde_json::to_writer(&mut bytes, entry)?;
+        bytes.push(b'\n');
     }
-    Ok(())
+    // All or nothing: a crash mid-save keeps the previous snapshot whole.
+    crate::atomic::write(path, &bytes)
 }
 
 /// Map a `.ocad/...` path to the OPFS-safe form (`_ocad/...`).

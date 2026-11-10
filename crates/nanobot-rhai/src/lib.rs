@@ -25,7 +25,7 @@ pub use host::{
     SharedCollected, TaskFailure, CANCEL_SENTINEL, DOCK_AREAS,
 };
 pub use loader::{
-    discover, load_all, load_all_with, load_one, PluginGate, CommandRegistration, LoadedPlugins,
+    discover, load_all, load_all_with, load_one, read_manifest, requires_gate, PluginGate, CommandRegistration, LoadedPlugins,
     PanelRegistration, ToolbarItemRegistration, ViewRegistration,
 };
 pub use manifest::{
@@ -331,4 +331,47 @@ fn c(task, args) { task.check_cancelled() }"#,
         let _ = std::fs::remove_dir_all(&parent);
     }
 
+    #[test]
+    fn a_plugin_loads_only_with_the_capabilities_it_requires() {
+        let gated = MANIFEST.replace(
+            "entry_point = \"plugin.rhai\"",
+            "entry_point = \"plugin.rhai\"\nrequires = [\"export.gds\", \"pro\"]",
+        );
+        let owns = |owned: &'static [&'static str]| {
+            move |capability: &str| {
+                if owned.contains(&capability) {
+                    Ok(())
+                } else {
+                    Err("not in your plan".to_string())
+                }
+            }
+        };
+
+        // Refused: the reason names the missing capability, and the script
+        // never runs — a broken one is not even compiled.
+        let parent = plugin_parent("requires-refused");
+        write_plugin(&parent, "gated", &gated, "fn register() { syntax error", &[]);
+        let check = owns(&["export.gds"]);
+        let loaded = load_all_with(std::slice::from_ref(&parent), &requires_gate(&check));
+        assert!(loaded.plugins_loaded.is_empty());
+        let reason = &loaded.plugins_rejected[0].1;
+        assert_eq!(reason, "license: requires `pro`: not in your plan");
+        let _ = std::fs::remove_dir_all(&parent);
+
+        // Every requirement allowed: loads.
+        let parent = plugin_parent("requires-allowed");
+        write_plugin(&parent, "gated", &gated, ENTRY, &[]);
+        let check = owns(&["export.gds", "pro"]);
+        let loaded = load_all_with(std::slice::from_ref(&parent), &requires_gate(&check));
+        assert_eq!(loaded.plugins_loaded.len(), 1, "{:?}", loaded.plugins_rejected);
+        let _ = std::fs::remove_dir_all(&parent);
+
+        // A plugin that requires nothing passes any answer.
+        let parent = plugin_parent("requires-nothing");
+        write_plugin(&parent, "open", MANIFEST, ENTRY, &[]);
+        let check = owns(&[]);
+        let loaded = load_all_with(std::slice::from_ref(&parent), &requires_gate(&check));
+        assert_eq!(loaded.plugins_loaded.len(), 1, "{:?}", loaded.plugins_rejected);
+        let _ = std::fs::remove_dir_all(&parent);
+    }
 }

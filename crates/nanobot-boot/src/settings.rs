@@ -99,6 +99,11 @@ impl Settings {
         self.path.as_deref()
     }
 
+    /// Every key and value, in key order (the diagnostics export).
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &Value)> {
+        self.values.iter().map(|(key, value)| (key.as_str(), value))
+    }
+
     pub fn get(&self, key: &str) -> Option<&Value> {
         self.values.get(key)
     }
@@ -134,7 +139,8 @@ impl Settings {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        std::fs::write(path, json).map_err(|e| format!("write settings {}: {e}", path.display()))
+        crate::write_whole(path, json.as_bytes())
+            .map_err(|e| format!("write settings {}: {e}", path.display()))
     }
 }
 

@@ -20,13 +20,13 @@ Extraction is incremental. See the migration path in the design doc:
 |---|---|
 | `nanobot-cordis` | **landed** — plugin kernel (moved from `ocad-cordis`, zero deps) |
 | `nanobot-llm` | **landed** — LLM adapter seam (moved from `ocad-llm`) |
-| `nanobot-session` | **landed** — event log + seq + projection + JSONL + fork; base vocabulary + `Extension` for product events; `hydrate()` for build-time log recovery |
+| `nanobot-session` | **landed** — event log + seq + projection + JSONL + fork; base vocabulary + `Extension` for product events; `hydrate()` for build-time log recovery; atomic snapshot writes (`atomic::write`) |
 | `nanobot-tools` | **landed** — ToolRegistry + three waterfalls + ApprovalPolicy + generalized ToolContract |
 | `nanobot-agent` | **landed** — turn/step loop, plan state machine, PlanVerifier seam |
 | `nanobot-skills` | **landed** — skill runner (manifest -> listeners), ships no skills |
-| `nanobot-boot` | **landed** — `Harness`/`HarnessBuilder` assembly, `harness.toml` identity, CLI modes (`--selfcheck` / `--selfcheck-crash` / `--agent-smoke` / `--agent-run` / `--smoke`), probe-style selfcheck with the three-phase crash-recovery probe, generic project container (`ProjectPaths` / `Manifest` / `Project`) |
+| `nanobot-boot` | **landed** — `Harness`/`HarnessBuilder` assembly, `harness.toml` identity, CLI modes (`--selfcheck` / `--selfcheck-crash` / `--agent-smoke` / `--agent-run` / `--smoke`), probe-style selfcheck with the three-phase crash-recovery probe, generic project container (`ProjectPaths` / `Manifest` / `Project`); atomic settings and manifest saves; `diagnostics` (rolling log file, panic crash reports, plain-text export, opt-in `CrashReporter`); `RefreshSchedule` + `SessionGrace` (when to re-check entitlements, and a lapse never closing what is in use) |
 | `nanobot-gpu` | **landed** — the wgpu↔gpui render slot: process-wide shared device (`shared_gpu`), per-platform presentation and input routing (`Viewport` / `ViewportContent` / `viewport_element`), and the `ViewportSlot` contract the product's renderer implements |
-| `nanobot-rhai` | **landed** — Rhai script plugin host: `plugin.toml` manifest plus an entry point that declares panels / views / commands / toolbar items; loading is isolated, so a bad plugin never stops the others |
+| `nanobot-rhai` | **landed** — Rhai script plugin host: `plugin.toml` manifest plus an entry point that declares panels / views / commands / toolbar items; loading is isolated, so a bad plugin never stops the others; a manifest's `requires` gates a plugin on the user's capabilities before its script runs |
 | `nanobot-ui` | **landed** — gpui workbench shell: session list, session workspace (conversation + plan review + approval / clarify bars + composer), viewport region, and the panel dock that hosts product and script-plugin panels. Generic over `SessionView` |
 
 ## Layout

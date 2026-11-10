@@ -83,14 +83,26 @@ pub fn discover(dirs: &[PathBuf]) -> Vec<PathBuf> {
     found
 }
 
-/// Loads one plugin directory. `Err(reason)` means the plugin is rejected.
-pub fn load_one(dir: &Path) -> Result<(PluginManifest, RhaiProgram, Collected), String> {
+/// Reads and validates a plugin directory's manifest, running nothing.
+pub fn read_manifest(dir: &Path) -> Result<PluginManifest, String> {
     let manifest_path = dir.join("plugin.toml");
     let text = std::fs::read_to_string(&manifest_path)
         .map_err(|e| format!("cannot read {}: {e}", manifest_path.display()))?;
     let manifest = parse(&text).map_err(|e| format!("{}: {e}", manifest_path.display()))?;
     validate(&manifest).map_err(|e| format!("{}: {e}", manifest_path.display()))?;
+    Ok(manifest)
+}
 
+/// Loads one plugin directory. `Err(reason)` means the plugin is rejected.
+pub fn load_one(dir: &Path) -> Result<(PluginManifest, RhaiProgram, Collected), String> {
+    let manifest = read_manifest(dir)?;
+    let (program, collected) = run_entry(dir, &manifest)?;
+    Ok((manifest, program, collected))
+}
+
+/// Compiles the plugin's entry script and runs its entry point, collecting
+/// what it declares.
+fn run_entry(dir: &Path, manifest: &PluginManifest) -> Result<(RhaiProgram, Collected), String> {
     let (entry_file, entry_fn) = split_entry_point(&manifest.plugin.entry_point);
     let entry_path = dir.join(&entry_file);
     let source = std::fs::read_to_string(&entry_path)
@@ -115,7 +127,7 @@ pub fn load_one(dir: &Path) -> Result<(PluginManifest, RhaiProgram, Collected), 
         .map_err(|_| "plugin engine still alive".to_string())?
         .into_inner()
         .map_err(|_| "collected bucket poisoned".to_string())?;
-    Ok((manifest, program, collected))
+    Ok((program, collected))
 }
 
 /// The license gate a plugin must pass before it loads: given the validated
@@ -126,6 +138,23 @@ pub fn load_one(dir: &Path) -> Result<(PluginManifest, RhaiProgram, Collected), 
 /// typically [`nanobot_auth::check_plugin_license`] over the vendor's
 /// verifying keys — so the plugin host stays free of keys and crypto.
 pub type PluginGate<'a> = &'a dyn Fn(&PluginManifest, &Path) -> Result<(), String>;
+
+/// A [`PluginGate`] over the product's entitlement answer: a plugin loads
+/// only if every capability its manifest `requires` is allowed.
+///
+/// `check` is the product's allow/deny question — typically
+/// `|capability| harness.check_entitlement(capability)` mapped to
+/// `Err(reason)` on a denial — so the plugin host stays free of accounts.
+/// Combine it with a license gate by calling both from one closure.
+pub fn requires_gate<'a>(
+    check: &'a dyn Fn(&str) -> Result<(), String>,
+) -> impl Fn(&PluginManifest, &Path) -> Result<(), String> + 'a {
+    move |manifest, _dir| {
+        manifest.plugin.requires.iter().try_for_each(|capability| {
+            check(capability).map_err(|reason| format!("requires `{capability}`: {reason}"))
+        })
+    }
+}
 
 /// Loads every plugin under `dirs` without license checking (an open plugin
 /// set). See [`load_all_with`].
@@ -149,17 +178,26 @@ pub fn load_all_with(dirs: &[PathBuf], gate: PluginGate<'_>) -> LoadedPlugins {
 
     for dir in discover(dirs) {
         let name = dir.display().to_string();
-        let (manifest, program, collected) = match load_one(&dir) {
+        let manifest = match read_manifest(&dir) {
+            Ok(manifest) => manifest,
+            Err(reason) => {
+                loaded.plugins_rejected.push((name, reason));
+                continue;
+            }
+        };
+        // Before anything of the plugin runs: a refused plugin's script is
+        // never compiled.
+        if let Err(reason) = gate(&manifest, &dir) {
+            loaded.plugins_rejected.push((name, format!("license: {reason}")));
+            continue;
+        }
+        let (program, collected) = match run_entry(&dir, &manifest) {
             Ok(loaded) => loaded,
             Err(reason) => {
                 loaded.plugins_rejected.push((name, reason));
                 continue;
             }
         };
-        if let Err(reason) = gate(&manifest, &dir) {
-            loaded.plugins_rejected.push((name, format!("license: {reason}")));
-            continue;
-        }
         if plugin_ids.contains(&manifest.plugin.id) {
             loaded.plugins_rejected.push((
                 name,

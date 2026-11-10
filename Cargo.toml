@@ -91,6 +91,7 @@ wgpu = { git = "https://github.com/gfx-rs/wgpu", rev = "cddb2f5d80dc0009b2ef6767
 # Readback presentation path (offscreen render → CPU readback → paint_image).
 image = { version = "0.25", default-features = false }
 anyhow = "1"
+log = { version = "0.4", features = ["std"] }
 # Blocking adapter/device request on the desktop, where the slot creates its
 # own device (gpui renders with D3D11 / Metal there).
 pollster = "0.4"
