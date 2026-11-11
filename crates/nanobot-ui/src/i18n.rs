@@ -52,6 +52,7 @@ const MESSAGES: &[Msg] = &[
     ("shell.save", "存档", "Save"),
     ("shell.load", "开档", "Open"),
     ("shell.import", "导入", "Import"),
+    ("shell.creator", "Creator", "Creator"),
     ("shell.guest_signin", "访客 · 点击登录", "Guest · click to sign in"),
     ("shell.plan_progress", "计划 {done}/{total}", "Plan {done}/{total}"),
     (

@@ -279,6 +279,10 @@ pub struct HarnessShell<S: SessionView> {
     on_save: Option<SessionCallback>,
     on_load: Option<SessionCallback>,
     on_import: Option<SessionCallback>,
+    /// Hands the current project to the creator desktop app (the manual-CAD
+    /// counterpart). The shell has no project path, so the app layer resolves
+    /// which member document to open.
+    on_open_in_creator: Option<SessionCallback>,
     /// Keeps the composer's submit subscription alive.
     _composer_sub: Option<Subscription>,
     /// Keeps the candidate list's hold on its keys alive.
@@ -392,6 +396,7 @@ impl<S: SessionView> HarnessShell<S> {
             on_save: None,
             on_load: None,
             on_import: None,
+            on_open_in_creator: None,
             _composer_sub: None,
             _completion_keys: None,
             selected_entity: None,
@@ -680,6 +685,16 @@ impl<S: SessionView> HarnessShell<S> {
         F: Fn(&SessionId) + 'static,
     {
         self.on_import = Some(Rc::new(callback));
+    }
+
+    /// Opens the current project in the creator desktop app. The shell only
+    /// knows the session, so the app layer resolves the project's member
+    /// document and hands it over.
+    pub fn set_on_open_in_creator<F>(&mut self, callback: F)
+    where
+        F: Fn(&SessionId) + 'static,
+    {
+        self.on_open_in_creator = Some(Rc::new(callback));
     }
 
     /// Shares the harness's user settings with the shell: the layout, the
@@ -1443,6 +1458,12 @@ impl<S: SessionView> HarnessShell<S> {
             ("harness-save", Icon::Save, "shell.save", &self.on_save),
             ("harness-load", Icon::Load, "shell.load", &self.on_load),
             ("harness-import", Icon::Import, "shell.import", &self.on_import),
+            (
+                "harness-open-in-creator",
+                Icon::External,
+                "shell.creator",
+                &self.on_open_in_creator,
+            ),
         ];
         div().flex().flex_row().gap_2().children(buttons.map(|(id, icon, label, callback)| {
             let (callback, session) = (callback.clone(), session.clone());
