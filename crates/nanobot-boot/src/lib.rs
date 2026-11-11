@@ -59,7 +59,8 @@ pub use error::BootError;
 pub use harness::{run_one_turn, Harness, HarnessBuilder, CLEAN_MARKER};
 pub use harness_toml::{ApprovalMode, HarnessProfile, ProviderConfig, HARNESS_TOML};
 pub use settings::{Settings, SETTINGS_FILE};
-pub use entitlement_refresh::{RefreshSchedule, SessionGrace};
+pub use entitlement_refresh::SessionGrace;
+pub use product_kit::RefreshSchedule;
 
 /// Writes a whole durable file (settings, the project manifest): all or
 /// nothing on native targets, where a crash mid-write must not destroy the
