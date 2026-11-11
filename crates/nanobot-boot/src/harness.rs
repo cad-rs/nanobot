@@ -580,7 +580,7 @@ impl HarnessBuilder {
         let settings_file = settings_path.unwrap_or_else(|| {
             crate::settings::user_config_dir(&profile.id).join(SETTINGS_FILE)
         });
-        let (settings, settings_error) = Settings::load(&settings_file);
+        let (settings, settings_error) = crate::settings::load_settings(&settings_file);
         if let Some(error) = settings_error {
             notes.push(error);
         }
@@ -1025,7 +1025,7 @@ mod tests {
         }
         // The harness dropped: the changed setting is on disk.
         assert!(file.is_file(), "drop persists a changed setting");
-        let (settings, error) = Settings::load(&file);
+        let (settings, error) = crate::settings::load_settings(&file);
         assert!(error.is_none());
         assert_eq!(settings.get_str("ui.theme", "dark"), "light");
 

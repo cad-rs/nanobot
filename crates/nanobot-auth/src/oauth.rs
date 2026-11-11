@@ -361,7 +361,7 @@ pub fn persist_tokens(
             Value::String(id_token.clone()),
         )?;
     }
-    tighten_file_mode(settings.path());
+    tighten_file_mode(settings.location().as_deref().map(std::path::Path::new));
     Ok(())
 }
 

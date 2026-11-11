@@ -58,7 +58,7 @@ pub use container::{
 pub use error::BootError;
 pub use harness::{run_one_turn, Harness, HarnessBuilder, CLEAN_MARKER};
 pub use harness_toml::{ApprovalMode, HarnessProfile, ProviderConfig, HARNESS_TOML};
-pub use settings::{Settings, SETTINGS_FILE};
+pub use settings::{load_settings, Settings, SETTINGS_FILE};
 pub use entitlement_refresh::SessionGrace;
 pub use product_kit::RefreshSchedule;
 

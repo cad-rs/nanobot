@@ -209,7 +209,7 @@ fn tokens_round_trip_through_the_settings_store() {
     // A file-backed store becomes owner-only (Unix).
     let dir = std::env::temp_dir().join(format!("nb-auth-settings-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let mut file_settings = Settings::load(&dir.join("settings.json")).0;
+    let mut file_settings = nanobot_boot::load_settings(&dir.join("settings.json")).0;
     nanobot_auth::persist_tokens(&mut file_settings, "acme", &tokens).expect("persist file");
 
     nanobot_auth::forget_tokens(&mut settings, "acme").expect("forget");

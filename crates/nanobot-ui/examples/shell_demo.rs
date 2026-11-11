@@ -421,7 +421,7 @@ fn main() {
     let config = nanobot_boot::settings::user_config_dir("shell_demo");
     nanobot_boot::diagnostics::init(&config, "nanobot-ui shell demo");
     let (settings, note) =
-        nanobot_boot::Settings::load(&config.join(nanobot_boot::SETTINGS_FILE));
+        nanobot_boot::load_settings(&config.join(nanobot_boot::SETTINGS_FILE));
     if let Some(note) = note {
         log::warn!("{note}");
     }

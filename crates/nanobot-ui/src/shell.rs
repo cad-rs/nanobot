@@ -790,7 +790,7 @@ impl<S: SessionView> HarnessShell<S> {
         self.settings
             .as_ref()
             .and_then(|store| store.lock().ok())
-            .and_then(|settings| settings.path().map(|path| path.display().to_string()))
+            .and_then(|settings| settings.location())
     }
 
     /// The theme the shell renders in.
