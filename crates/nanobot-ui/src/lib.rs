@@ -25,6 +25,7 @@
 pub mod activity;
 pub mod composer;
 pub mod commands;
+pub mod file_picker_dialog;
 pub mod i18n;
 pub mod icons;
 pub mod layout;

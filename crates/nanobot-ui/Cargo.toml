@@ -6,6 +6,11 @@ license.workspace = true
 description = "nanobot gpui workbench shell: session list, session workspace, conversation stream, plan review, approval bar and the panel host that mounts product and plugin panels"
 
 [dependencies]
+# The product-infrastructure kit (storage providers, the in-app file
+# picker state, OPFS): shared with the workbench framework, own submodule
+# at the rcad-pro root (see product-kit/README.md). The path leaves this
+# repo on purpose - the kit's home is the sibling checkout.
+product-kit = { path = "../../../product-kit" }
 gpui = { workspace = true }
 gpui-component = { workspace = true }
 # Declarative UiNode trees for script panels (mounted by the panel host).
@@ -15,6 +20,7 @@ nanobot-gpu = { workspace = true }
 nanobot-rhai = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+log = { workspace = true }
 
 
 [dev-dependencies]

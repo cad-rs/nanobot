@@ -53,6 +53,14 @@ const MESSAGES: &[Msg] = &[
     ("shell.load", "开档", "Open"),
     ("shell.import", "导入", "Import"),
     ("shell.creator", "Creator", "Creator"),
+    // The in-app file picker (the web's OPFS storage has no OS dialog).
+    ("shell.pick_save", "存档到…", "Save to…"),
+    ("shell.pick_open", "开档", "Open"),
+    ("shell.pick_name_placeholder", "文件名", "File name"),
+    ("shell.pick_loading", "加载中…", "Loading…"),
+    ("shell.pick_empty", "（空）", "(empty)"),
+    ("shell.pick_source_browser", "浏览器存储", "Browser storage"),
+    ("shell.pick_confirm_overwrite", "覆盖", "Overwrite"),
     ("shell.guest_signin", "访客 · 点击登录", "Guest · click to sign in"),
     ("shell.plan_progress", "计划 {done}/{total}", "Plan {done}/{total}"),
     (

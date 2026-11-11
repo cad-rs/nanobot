@@ -197,6 +197,17 @@ pub(crate) type RetryCallback = Rc<dyn Fn(&SessionId, u64)>;
 type PlanDecisionCallback = Rc<dyn Fn(&SessionId, PlanDecision)>;
 
 /// The harness shell: the session list plus the active session's workspace.
+/// A finished file picker: an open pick carries the file's bytes (already
+/// read from storage), a save pick confirms the write has completed.
+pub struct FilePick {
+    /// True for a save picker's outcome, false for an open one.
+    pub save: bool,
+    /// Where the file lives (the provider id and its key).
+    pub location: product_kit::Location,
+    /// The file's bytes on an open pick; None on a save pick.
+    pub content: Option<Vec<u8>>,
+}
+
 pub struct HarnessShell<S: SessionView> {
     store: RefCell<SessionStore<S>>,
     /// The active session's whole workspace. `None` for a project without
@@ -267,6 +278,18 @@ pub struct HarnessShell<S: SessionView> {
     pub(crate) session_menu: Option<crate::session_menu::SessionMenu>,
     /// Whether the settings dialog is open.
     pub(crate) settings_open: bool,
+    /// The in-app file picker, when open (the web's storage has no OS
+    /// dialog). The overlay draws it; `storage` answers its listings.
+    pub(crate) file_picker: Option<product_kit::FilePicker>,
+    /// The product's storage providers (web builds register the browser's
+    /// origin-private file system).
+    pub storage: product_kit::Storage,
+    /// The save picker's file-name input, while a save picker is open.
+    pub(crate) file_picker_name_input: Option<Entity<InputState>>,
+    /// Observes a finished picker (open: the bytes; save: the write done).
+    pub(crate) on_file_picked: Option<Rc<dyn Fn(FilePick)>>,
+    /// The bytes a save picker writes, supplied by the app at confirm time.
+    pub(crate) file_save_bytes: Option<Rc<dyn Fn() -> Vec<u8>>>,
     /// Callback invoked when the user decides a contingent plan.
     pub(crate) on_plan_decision: Option<PlanDecisionCallback>,
     /// Undo/redo and container save/load/import: the app layer forwards them to
@@ -388,6 +411,19 @@ impl<S: SessionView> HarnessShell<S> {
             on_delete: None,
             session_menu: None,
             settings_open: false,
+            file_picker: None,
+            file_picker_name_input: None,
+            on_file_picked: None,
+            file_save_bytes: None,
+            storage: {
+                let mut storage = product_kit::Storage::default();
+                // Web builds get the browser's origin-private file system as
+                // the in-app picker's place; the desktop registers its own
+                // sources (none today: the OS dialogs still rule there).
+                #[cfg(target_family = "wasm")]
+                storage.register("opfs", std::sync::Arc::new(product_kit::opfs::Opfs));
+                storage
+            },
             on_message_sent: None,
             on_plan_decision: None,
             sidebar_projection: None,
@@ -695,6 +731,16 @@ impl<S: SessionView> HarnessShell<S> {
         F: Fn(&SessionId) + 'static,
     {
         self.on_open_in_creator = Some(Rc::new(callback));
+    }
+
+    /// The bytes a save picker writes, supplied at confirm time (the app
+    /// serialises whatever "the document" means for it). Without this, a
+    /// save pick reports "nothing to save".
+    pub fn set_file_save_bytes<F>(&mut self, provide: F)
+    where
+        F: Fn() -> Vec<u8> + 'static,
+    {
+        self.file_save_bytes = Some(Rc::new(provide));
     }
 
     /// Shares the harness's user settings with the shell: the layout, the
@@ -1445,7 +1491,10 @@ impl<S: SessionView> HarnessShell<S> {
     }
 
     /// The operations on the session on screen: undo, redo, save, load,
-    /// import. Each calls the product's callback, when there is one.
+    /// import. Each calls the product's callback, when there is one —
+    /// except save / load when in-app storage sources exist (the web's
+    /// OPFS): those open the in-app file picker instead, whose finished
+    /// choice arrives through [`Self::set_on_file_picked`].
     fn session_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
         let session = self
@@ -1455,8 +1504,6 @@ impl<S: SessionView> HarnessShell<S> {
         let buttons = [
             ("harness-undo", Icon::Undo, "shell.undo", &self.on_undo),
             ("harness-redo", Icon::Redo, "shell.redo", &self.on_redo),
-            ("harness-save", Icon::Save, "shell.save", &self.on_save),
-            ("harness-load", Icon::Load, "shell.load", &self.on_load),
             ("harness-import", Icon::Import, "shell.import", &self.on_import),
             (
                 "harness-open-in-creator",
@@ -1465,14 +1512,50 @@ impl<S: SessionView> HarnessShell<S> {
                 &self.on_open_in_creator,
             ),
         ];
-        div().flex().flex_row().gap_2().children(buttons.map(|(id, icon, label, callback)| {
-            let (callback, session) = (callback.clone(), session.clone());
-            header_button(id, icon, self.tr(label), p.fg, p.border).on_click(move |_, _, _| {
-                if let Some(callback) = &callback {
-                    callback(&session);
-                }
-            })
-        }))
+        let picker_sources = self.storage.in_app_sources();
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .gap_2()
+            .children(buttons.map(|(id, icon, label, callback)| {
+                let (callback, session) = (callback.clone(), session.clone());
+                header_button(id, icon, self.tr(label), p.fg, p.border).on_click(move |_, _, _| {
+                    if let Some(callback) = &callback {
+                        callback(&session);
+                    }
+                })
+            }));
+
+        let seed = format!("{}.jsonl", session);
+        let session_save = session.clone();
+        let picker_sources_save = picker_sources.clone();
+        row = row.child(
+            header_button("harness-save", Icon::Save, self.tr("shell.save"), p.fg, p.border)
+                .on_click(cx.listener(move |this, _ev, window, cx| {
+                    if !picker_sources_save.is_empty() {
+                        this.open_file_picker(
+                            Some(&seed),
+                            Vec::new(),
+                            window,
+                            cx,
+                        );
+                    } else if let Some(callback) = &this.on_save {
+                        callback(&session_save);
+                    }
+                })),
+        );
+        let session_load = session.clone();
+        row = row.child(
+            header_button("harness-load", Icon::Load, self.tr("shell.load"), p.fg, p.border)
+                .on_click(cx.listener(move |this, _ev, window, cx| {
+                    if !picker_sources.is_empty() {
+                        this.open_file_picker(None, Vec::new(), window, cx);
+                    } else if let Some(callback) = &this.on_load {
+                        callback(&session_load);
+                    }
+                })),
+        );
+        row
     }
 
     pub(crate) fn sidebar_footer(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2122,6 +2205,7 @@ impl<S: SessionView> Render for HarnessShell<S> {
             .child(body)
             .child(bottom)
             .children(self.session_menu_overlay(window, cx))
+            .children(self.file_picker_overlay(window, cx))
             .children(self.settings_overlay(window, cx))
             .children(self.palette_overlay(cx))
     }
@@ -2129,8 +2213,7 @@ impl<S: SessionView> Render for HarnessShell<S> {
 
 /// A toolbar button that is only an icon.
 fn toolbar_button(id: &'static str, icon: Icon, color: Hsla) -> Stateful<Div> {
-    div()
-        .id(id)
+    div()        .id(id)
         .p_1()
         .rounded(px(4.))
         .cursor_pointer()
