@@ -31,7 +31,7 @@ pub fn save(path: &Path, entries: &[LogEntry]) -> std::io::Result<()> {
         bytes.push(b'\n');
     }
     // All or nothing: a crash mid-save keeps the previous snapshot whole.
-    crate::atomic::write(path, &bytes)
+    product_kit::atomic_write(path, &bytes)
 }
 
 /// Map a `.ocad/...` path to the OPFS-safe form (`_ocad/...`).

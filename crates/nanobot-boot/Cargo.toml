@@ -30,6 +30,8 @@ uuid = { workspace = true }
 crc32fast = { workspace = true }
 # The facade the diagnostics log file listens on (and gpui logs through).
 log = { workspace = true }
+# Shared product infrastructure (atomic whole-file writes).
+product-kit = { path = "../../../product-kit" }
 # StaticProvider reads the clock; web-time keeps wasm builds working.
 web-time = { workspace = true }
 # The selfcheck and the CLI smoke modes drive the agent loop headlessly

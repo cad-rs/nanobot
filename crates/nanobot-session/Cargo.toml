@@ -13,6 +13,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 web-time = "1"
+# Shared product infrastructure (atomic whole-file writes).
+product-kit = { path = "../../../product-kit" }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 js-sys = "0.3"

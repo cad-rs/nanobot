@@ -66,7 +66,7 @@ pub use entitlement_refresh::{RefreshSchedule, SessionGrace};
 /// previous content.
 pub(crate) fn write_whole(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     #[cfg(not(target_family = "wasm"))]
-    return nanobot_session::atomic::write(path, bytes);
+    return product_kit::atomic_write(path, bytes);
     #[cfg(target_family = "wasm")]
     return std::fs::write(path, bytes);
 }
