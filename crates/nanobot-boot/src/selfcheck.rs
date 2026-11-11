@@ -13,8 +13,8 @@
 //! the mode is caught by the subprocess timeout (FAIL, not a hang).
 
 use std::path::Path;
-use std::time::{Duration, Instant};
 
+use product_kit::crash_probe::ProbePhase;
 use product_kit::selfcheck::{report as render, Summary};
 
 #[cfg(not(target_family = "wasm"))]
@@ -276,37 +276,17 @@ pub fn crash_probe_clean(harness: Harness, dir: &Path) -> i32 {
 fn run_probe_phase(
     exe: &std::path::Path,
     dir: &std::path::Path,
-    phase: &str,
+    phase: ProbePhase,
 ) -> Result<std::process::Output, String> {
-    use std::process::{Command, Stdio};
-    let mut child = Command::new(exe)
-        .arg("--selfcheck-crash")
-        .env("NB_CRASH_DIR", dir)
-        .env("NB_CRASH_PHASE", phase)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("无法启动子进程: {e}"))?;
-    let start = Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if start.elapsed() > Duration::from_secs(30) {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!("子进程超时（phase {phase}）"));
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Err(e) => return Err(format!("等待子进程失败: {e}")),
-        }
-    };
-    let mut out = child
-        .wait_with_output()
-        .map_err(|e| format!("读取子进程输出失败: {e}"))?;
-    out.status = status;
-    Ok(out)
+    use product_kit::crash_probe::{run_phase, ProbeFailure};
+    run_phase(exe, dir, phase, "NB_CRASH_DIR", "NB_CRASH_PHASE", "--selfcheck-crash").map_err(
+        |failure| match failure {
+            ProbeFailure::Spawn(e) => format!("无法启动子进程: {e}"),
+            ProbeFailure::Timeout(phase) => format!("子进程超时（phase {}）", phase.as_str()),
+            ProbeFailure::Wait(e) => format!("等待子进程失败: {e}"),
+            ProbeFailure::Output(e) => format!("读取子进程输出失败: {e}"),
+        },
+    )
 }
 
 /// The crash-recovery subprocess check (returns (passed, detail)).
@@ -324,11 +304,12 @@ fn crash_probe_check() -> (bool, String) {
         Err(_) => "无法定位当前 exe".to_string(),
         Ok(exe) => {
             let mut outcome: Result<(), String> = Ok(());
-            for phase in ["A", "B", "C"] {
+            for phase in [ProbePhase::Crash, ProbePhase::Recover, ProbePhase::Clean] {
+                let letter = phase.as_str();
                 outcome = match run_probe_phase(&exe, &dir, phase) {
                     Err(e) => Err(e),
                     Ok(output) if !output.status.success() => Err(format!(
-                        "会话 {phase} 失败 status={:?} stdout={} stderr={}",
+                        "会话 {letter} 失败 status={:?} stdout={} stderr={}",
                         output.status,
                         String::from_utf8_lossy(&output.stdout),
                         String::from_utf8_lossy(&output.stderr)

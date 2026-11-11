@@ -118,22 +118,21 @@ fn option_value(args: &[String], flag: &str) -> Option<String> {
 /// `make_builder` must assemble the product normally, with its project paths
 /// redirected into the isolated directory given by `NB_CRASH_DIR`.
 pub fn crash_probe_exit(make_builder: impl Fn() -> HarnessBuilder) -> i32 {
-    let dir = PathBuf::from(
-        std::env::var("NB_CRASH_DIR").expect("the NB_CRASH_DIR environment variable is required"),
-    );
-    let phase = std::env::var("NB_CRASH_PHASE").unwrap_or_default();
-    match phase.as_str() {
-        "B" => crate::selfcheck::crash_probe_recover(
+    use product_kit::crash_probe::{probe_dir, ProbePhase};
+
+    let dir = probe_dir("NB_CRASH_DIR");
+    match ProbePhase::from_env("NB_CRASH_PHASE") {
+        ProbePhase::Recover => crate::selfcheck::crash_probe_recover(
             make_builder().build().expect("session B assembly failed"),
             &dir,
         ),
-        "C" => crate::selfcheck::crash_probe_clean(
+        ProbePhase::Clean => crate::selfcheck::crash_probe_clean(
             make_builder().build().expect("session C assembly failed"),
             &dir,
         ),
         // Session A: the runtime is dropped by `std::process::exit`, i.e. not
         // at all — no clean marker is written.
-        _ => crate::selfcheck::crash_probe_crash(
+        ProbePhase::Crash => crate::selfcheck::crash_probe_crash(
             make_builder().build().expect("session A assembly failed"),
             &dir,
         ),
