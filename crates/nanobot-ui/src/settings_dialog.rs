@@ -19,7 +19,7 @@ use crate::shell::{palette, HarnessShell, Palette};
 use crate::theme::{ThemeKind, FONT_FAMILY_KEY, FONT_SIZE_KEY, LOCALE_KEY};
 
 /// One row of the dialog: what the setting is, then its choices.
-fn setting_row(label: &'static str, p: Palette) -> Div {
+pub(crate) fn setting_row(label: &'static str, p: Palette) -> Div {
     div().flex().flex_row().items_center().gap_2().child(
         div()
             .w(px(96.))
@@ -35,11 +35,13 @@ impl<S: SessionView> HarnessShell<S> {
     /// one thing at a time is over the window.
     pub fn open_settings(&mut self) {
         self.session_menu = None;
+        self.model_menu = None;
         self.settings_open = true;
     }
 
     /// Closes the settings dialog. False when it was not open.
     pub fn close_settings(&mut self) -> bool {
+        self.model_form = None;
         std::mem::take(&mut self.settings_open)
     }
 
@@ -66,6 +68,7 @@ impl<S: SessionView> HarnessShell<S> {
             .id("harness-settings-dialog")
             .w(px(520.))
             .max_w_full()
+            .max_h_full()
             .rounded(px(8.))
             .border_1()
             .border_color(p.border)
@@ -97,7 +100,14 @@ impl<S: SessionView> HarnessShell<S> {
                             .on_mouse_down(MouseButton::Left, cx.listener(close)),
                     ),
             )
-            .child(self.settings_body(window, cx).p_4());
+            .child(
+                div()
+                    .id("harness-settings-body")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(self.settings_body(window, cx).p_4()),
+            );
         let backdrop = div()
             .id("harness-settings-backdrop")
             .absolute()
@@ -239,6 +249,7 @@ impl<S: SessionView> HarnessShell<S> {
                         .text_xs(),
                 ),
             ))
+            .child(self.models_section(cx))
             .child(
                 div()
                     .text_xs()

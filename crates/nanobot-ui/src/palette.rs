@@ -47,6 +47,7 @@ pub mod id {
     pub const TOGGLE_TOOLS: &str = "shell.toggle_tools";
     pub const TOGGLE_THEME: &str = "shell.toggle_theme";
     pub const OPEN_SETTINGS: &str = "shell.open_settings";
+    pub const SWITCH_MODEL: &str = "shell.switch_model";
     pub const TOGGLE_MOTION: &str = "shell.toggle_motion";
     /// Prefix of "switch to this session"; the session's id follows.
     pub const SWITCH_SESSION: &str = "shell.switch_session:";
@@ -102,6 +103,9 @@ impl<S: SessionView> HarnessShell<S> {
         if self.turn_phase().is_busy() {
             commands.push(Command::new(id::STOP_TURN, self.tr("command.stop_turn")).with_keys("Esc"));
         }
+        if self.on_model.is_some() {
+            commands.push(Command::new(id::SWITCH_MODEL, self.tr("command.switch_model")));
+        }
         commands.extend(self.product_commands.iter().map(|(command, _)| command.clone()));
         let active = self.active_session_id().cloned();
         for session in self.store().open_project_sessions() {
@@ -145,6 +149,7 @@ impl<S: SessionView> HarnessShell<S> {
             id::STOP_TURN => return self.stop_turn(),
             id::TOGGLE_THEME => {}
             id::OPEN_SETTINGS => self.open_settings(),
+            id::SWITCH_MODEL => return self.open_model_menu(None),
             id::TOGGLE_MOTION => self.set_reduce_motion(!self.reduce_motion()),
             id::NEW_SESSION => match self.on_new_session.clone() {
                 Some(callback) => callback(),

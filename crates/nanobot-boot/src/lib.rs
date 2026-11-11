@@ -42,6 +42,7 @@ pub mod entitlement_refresh;
 pub mod error;
 pub mod harness;
 pub mod harness_toml;
+pub mod models;
 pub mod selfcheck;
 pub mod settings;
 
@@ -58,6 +59,7 @@ pub use container::{
 pub use error::BootError;
 pub use harness::{run_one_turn, Harness, HarnessBuilder, CLEAN_MARKER};
 pub use harness_toml::{ApprovalMode, HarnessProfile, ProviderConfig, HARNESS_TOML};
+pub use models::{ModelProfile, ModelProfiles};
 pub use settings::{Settings, SETTINGS_FILE};
 pub use entitlement_refresh::{RefreshSchedule, SessionGrace};
 
