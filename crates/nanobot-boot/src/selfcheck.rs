@@ -15,40 +15,14 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use product_kit::selfcheck::{report as render, Summary};
+
 #[cfg(not(target_family = "wasm"))]
 use crate::harness::is_user_message;
 use crate::harness::run_one_turn;
 use crate::Harness;
 
-/// One selfcheck outcome.
-#[derive(Debug, Clone)]
-pub struct Check {
-    pub name: String,
-    pub ok: bool,
-    pub skipped: bool,
-    pub detail: String,
-}
-
-impl Check {
-    pub fn new(name: impl Into<String>, ok: bool, detail: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            ok,
-            skipped: false,
-            detail: detail.into(),
-        }
-    }
-
-    /// Precondition not met (probe-style: unrelated checks SKIP, not FAIL).
-    pub fn skip(name: impl Into<String>, reason: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            ok: false,
-            skipped: true,
-            detail: reason.into(),
-        }
-    }
-}
+pub use product_kit::selfcheck::Check;
 
 /// The message the selfcheck drives through the agent (the persistence probe
 /// looks for it in the re-read log).
@@ -189,30 +163,7 @@ fn persistence_probe(_events: &Path) -> Check {
 }
 
 pub fn report(checks: &[Check]) -> i32 {
-    let failed = checks.iter().filter(|c| !c.ok && !c.skipped).count();
-    let skipped = checks.iter().filter(|c| c.skipped).count();
-    for check in checks {
-        let tag = if check.skipped {
-            "SKIP"
-        } else if check.ok {
-            "PASS"
-        } else {
-            "FAIL"
-        };
-        println!("[{}] {} — {}", tag, check.name, check.detail);
-    }
-    let run_total = checks.len() - skipped;
-    println!(
-        "selfcheck: {}/{} 项通过（{} 项跳过）",
-        run_total - failed,
-        run_total,
-        skipped
-    );
-    if failed == 0 {
-        0
-    } else {
-        1
-    }
+    render(checks, Summary::Chinese)
 }
 
 /// Headless selfcheck and exit (for a product `main`'s `--selfcheck` mode).
