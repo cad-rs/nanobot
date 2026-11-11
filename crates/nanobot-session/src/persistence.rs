@@ -78,6 +78,28 @@ pub async fn append_opfs(path: &Path, value: &serde_json::Value) -> Result<(), S
     opfs::write_file(&opfs_path(path), &content).await
 }
 
+/// Load the event log from an OPFS JSONL file.
+///
+/// The read side of [`save_opfs`]: each non-empty line deserializes as one
+/// `LogEntry`. The harness build skips native-style recovery on the web ("the
+/// host owns persistence"), so this is the primitive a web host hydrates a
+/// session list from.
+#[cfg(target_family = "wasm")]
+pub async fn load_opfs(path: &Path) -> Result<Vec<LogEntry>, String> {
+    let content = opfs::read_file(&opfs_path(path)).await?;
+    let mut entries = Vec::new();
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str(line) {
+            Ok(entry) => entries.push(entry),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(entries)
+}
+
 /// Append one JSON value as a line, creating the file and its parents.
 ///
 /// Unlike [`save`], this never rewrites: an append-only side log (the audit
@@ -118,6 +140,14 @@ pub fn load(path: &Path) -> std::io::Result<Vec<LogEntry>> {
     Ok(entries)
 }
 
+/// Surfaces a failed OPFS write through the browser console. Fire-and-forget
+/// persistence must not lose records silently: the console line is the only
+/// observable trace a web-side failure leaves.
+#[cfg(target_family = "wasm")]
+pub fn report_opfs_error(context: &str, error: &str) {
+    web_sys::console::error_1(&format!("nanobot-session {context}: {error}").into());
+}
+
 /// OPFS helpers (wasm only).
 #[cfg(target_family = "wasm")]
 mod opfs {
@@ -155,7 +185,13 @@ mod opfs {
             .dyn_into::<FileSystemDirectoryHandle>()
             .map_err(|_: JsValue| "not a directory handle")?;
 
-        let mut parts: Vec<&str> = relative_path.split('/').filter(|p| !p.is_empty()).collect();
+        // "." / ".." are reserved OPFS names: a project root of `.` (the cwd
+        // default on desktop) must not reach getDirectoryHandle as a
+        // component.
+        let mut parts: Vec<&str> = relative_path
+            .split('/')
+            .filter(|p| !p.is_empty() && *p != "." && *p != "..")
+            .collect();
         let file_name = parts.pop().ok_or("no file name")?;
         let mut dir = root.clone();
         for part in parts {
@@ -202,7 +238,10 @@ mod opfs {
             .dyn_into::<FileSystemDirectoryHandle>()
             .map_err(|_: JsValue| "not a directory handle")?;
 
-        let mut parts: Vec<&str> = relative_path.split('/').filter(|p| !p.is_empty()).collect();
+        let mut parts: Vec<&str> = relative_path
+            .split('/')
+            .filter(|p| !p.is_empty() && *p != "." && *p != "..")
+            .collect();
         let file_name = parts.pop().ok_or("no file name")?;
         let mut dir = root.clone();
         for part in parts {

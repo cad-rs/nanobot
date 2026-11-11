@@ -168,16 +168,30 @@ impl Session {
     }
 
     /// wasm: persist_to via OPFS (async, fire-and-forget).
+    ///
+    /// The binding-time write of the native form is kept: the initial log
+    /// (usually empty on the web, where hydration is host-owned) lands in
+    /// OPFS the moment the session is bound. A failed write is reported
+    /// through the console — fire-and-forget must not mean silent loss.
     #[cfg(target_family = "wasm")]
     pub fn persist_to(&self, path: impl Into<std::path::PathBuf>) -> Arc<dyn Disposable> {
         let path = path.into();
+        let initial = self.events();
+        let initial_path = path.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Err(error) = crate::persistence::save_opfs(&initial_path, &initial).await {
+                crate::persistence::report_opfs_error("initial session log", &error);
+            }
+        });
         let weak = Arc::downgrade(&self.inner);
         self.subscribe(move |_, _| {
             if let Some(inner) = weak.upgrade() {
                 let entries = inner.events.lock().unwrap().clone();
                 let path = path.clone();
                 wasm_bindgen_futures::spawn_local(async move {
-                    let _ = crate::persistence::save_opfs(&path, &entries).await;
+                    if let Err(error) = crate::persistence::save_opfs(&path, &entries).await {
+                        crate::persistence::report_opfs_error("session log", &error);
+                    }
                 });
             }
         })
@@ -272,7 +286,9 @@ impl Session {
             });
             let path = path.clone();
             wasm_bindgen_futures::spawn_local(async move {
-                let _ = crate::persistence::append_opfs(&path, &record).await;
+                if let Err(error) = crate::persistence::append_opfs(&path, &record).await {
+                    crate::persistence::report_opfs_error("audit trail", &error);
+                }
             });
         })
     }
