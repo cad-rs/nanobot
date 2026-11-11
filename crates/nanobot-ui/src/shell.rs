@@ -288,6 +288,9 @@ pub struct HarnessShell<S: SessionView> {
     pub(crate) file_picker_name_input: Option<Entity<InputState>>,
     /// Observes a finished picker (open: the bytes; save: the write done).
     pub(crate) on_file_picked: Option<Rc<dyn Fn(FilePick)>>,
+    /// The export arm: receives the storage registry, so the product packs
+    /// whatever its project is (the web exports the OPFS project).
+    pub(crate) on_export: Option<Rc<dyn Fn(product_kit::Storage)>>,
     /// The bytes a save picker writes, supplied by the app at confirm time.
     pub(crate) file_save_bytes: Option<Rc<dyn Fn() -> Vec<u8>>>,
     /// Callback invoked when the user decides a contingent plan.
@@ -415,6 +418,7 @@ impl<S: SessionView> HarnessShell<S> {
             file_picker_name_input: None,
             on_file_picked: None,
             file_save_bytes: None,
+            on_export: None,
             storage: {
                 let mut storage = product_kit::Storage::default();
                 // Web builds get the browser's origin-private file system as
@@ -731,6 +735,15 @@ impl<S: SessionView> HarnessShell<S> {
         F: Fn(&SessionId) + 'static,
     {
         self.on_open_in_creator = Some(Rc::new(callback));
+    }
+
+    /// Registers the export arm: called with the storage registry when the
+    /// user asks for the project package (the web packs the OPFS project).
+    pub fn set_on_export<F>(&mut self, callback: F)
+    where
+        F: Fn(product_kit::Storage) + 'static,
+    {
+        self.on_export = Some(Rc::new(callback));
     }
 
     /// The bytes a save picker writes, supplied at confirm time (the app
@@ -1513,6 +1526,7 @@ impl<S: SessionView> HarnessShell<S> {
             ),
         ];
         let picker_sources = self.storage.in_app_sources();
+        let has_picker = !picker_sources.is_empty();
         let mut row = div()
             .flex()
             .flex_row()
@@ -1528,11 +1542,10 @@ impl<S: SessionView> HarnessShell<S> {
 
         let seed = format!("{}.jsonl", session);
         let session_save = session.clone();
-        let picker_sources_save = picker_sources.clone();
         row = row.child(
             header_button("harness-save", Icon::Save, self.tr("shell.save"), p.fg, p.border)
                 .on_click(cx.listener(move |this, _ev, window, cx| {
-                    if !picker_sources_save.is_empty() {
+                    if has_picker {
                         this.open_file_picker(
                             Some(&seed),
                             Vec::new(),
@@ -1548,10 +1561,21 @@ impl<S: SessionView> HarnessShell<S> {
         row = row.child(
             header_button("harness-load", Icon::Load, self.tr("shell.load"), p.fg, p.border)
                 .on_click(cx.listener(move |this, _ev, window, cx| {
-                    if !picker_sources.is_empty() {
+                    if has_picker {
                         this.open_file_picker(None, Vec::new(), window, cx);
                     } else if let Some(callback) = &this.on_load {
                         callback(&session_load);
+                    }
+                })),
+        );
+        // The export arm (web): pack the project out of in-app storage.
+        row = row.child(
+            header_button("harness-export", Icon::Export, self.tr("shell.export"), p.fg, p.border)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if has_picker {
+                        if let Some(callback) = &this.on_export {
+                            callback(this.storage.clone());
+                        }
                     }
                 })),
         );

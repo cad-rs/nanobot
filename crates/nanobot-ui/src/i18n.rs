@@ -53,6 +53,7 @@ const MESSAGES: &[Msg] = &[
     ("shell.load", "开档", "Open"),
     ("shell.import", "导入", "Import"),
     ("shell.creator", "Creator", "Creator"),
+    ("shell.export", "导出工程", "Export project"),
     // The in-app file picker (the web's OPFS storage has no OS dialog).
     ("shell.pick_save", "存档到…", "Save to…"),
     ("shell.pick_open", "开档", "Open"),

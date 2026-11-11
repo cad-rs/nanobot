@@ -71,6 +71,7 @@ icons! {
     Load => "load",
     Import => "import",
     External => "external",
+    Export => "export",
     // folding and movement
     ChevronRight => "chevron-right",
     ChevronDown => "chevron-down",
