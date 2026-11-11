@@ -4,7 +4,6 @@
 #![cfg(not(target_family = "wasm"))]
 
 use nanobot_auth::{AuthCodeConfig, AuthCodeFlow, AuthCodePoll, AuthError, TokenSet};
-use sha2::{Digest as _, Sha256};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -169,8 +168,10 @@ fn a_code_is_exchanged_with_its_verifier_and_ends_in_tokens() {
     assert_eq!(form["redirect_uri"], sent["redirect_uri"]);
     // PKCE: the verifier sent to the token endpoint is the one whose hash
     // the sign-in page was given.
-    let digest = Sha256::digest(form["code_verifier"].as_bytes());
-    assert_eq!(base64_url(&digest), sent["code_challenge"]);
+    assert_eq!(
+        product_kit::auth_code::code_challenge(form["code_verifier"].as_str()),
+        sent["code_challenge"]
+    );
 
     assert!(
         matches!(block_on(flow.poll()), Err(AuthError::Config(_))),
@@ -290,20 +291,3 @@ fn starting_again_frees_a_pinned_port_and_forgets_the_last_attempt() {
     std::net::TcpListener::bind(("127.0.0.1", port)).expect("cancelling frees the port");
 }
 
-/// Unpadded base64url, as PKCE spells the challenge.
-fn base64_url(bytes: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::new();
-    for chunk in bytes.chunks(3) {
-        let b = [
-            chunk[0],
-            chunk.get(1).copied().unwrap_or(0),
-            chunk.get(2).copied().unwrap_or(0),
-        ];
-        let group = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        for i in 0..=chunk.len() {
-            out.push(TABLE[(group >> (18 - 6 * i)) as usize & 0x3f] as char);
-        }
-    }
-    out
-}

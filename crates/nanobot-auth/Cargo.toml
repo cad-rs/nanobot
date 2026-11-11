@@ -12,6 +12,8 @@ crate-type = ["rlib"]
 nanobot-boot = { workspace = true }
 # The glob a feature list matches against (the approval policy's matcher).
 nanobot-tools = { workspace = true }
+# Shared product infrastructure (the browser sign-in redirect's mechanics).
+product-kit = { path = "../../../product-kit" }
 reqwest = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
@@ -19,10 +21,10 @@ thiserror.workspace = true
 web-time.workspace = true
 ed25519-dalek.workspace = true
 
-# Browser sign-in (auth_code): the PKCE challenge, its random verifier and the
-# redirect's query. Desktop only — the loopback listener has no wasm form.
+# Browser sign-in (auth_code): the random verifier and the redirect's query.
+# Desktop only — the loopback listener has no wasm form. The PKCE challenge
+# and the redirect mechanics come from product-kit.
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-sha2 = { version = "0.10", default-features = false }
 getrandom = "0.2"
 form_urlencoded = "1"
 

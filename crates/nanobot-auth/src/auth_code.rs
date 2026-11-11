@@ -28,12 +28,13 @@
 //! [RFC 7636]: https://www.rfc-editor.org/rfc/rfc7636
 //! [RFC 8252]: https://www.rfc-editor.org/rfc/rfc8252
 
-use std::io::{BufRead, BufReader, ErrorKind, Read as _, Write as _};
+use std::io::ErrorKind;
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::sync::Mutex;
-use std::time::Duration;
 
-use sha2::{Digest as _, Sha256};
+use product_kit::auth_code::{
+    code_challenge, read_callback, read_callback_query, respond, Callback, CallbackEnd,
+};
 
 use crate::base64;
 use crate::error::AuthError;
@@ -221,10 +222,16 @@ impl AuthCodeFlow {
                 respond(&mut stream, "400 Bad Request", "This sign-in request is not valid.");
                 Ok(None)
             }
-            Callback::Over(error) => {
+            Callback::Over(end) => {
                 *pending = None;
                 respond(&mut stream, "200 OK", "Sign-in did not complete. You can close this tab.");
-                Err(error)
+                Err(match end {
+                    CallbackEnd::Denied => AuthError::AuthorizationDenied,
+                    CallbackEnd::Failed(message) => AuthError::Protocol(message),
+                    CallbackEnd::NoCode => {
+                        AuthError::Protocol("the sign-in page returned no code".into())
+                    }
+                })
             }
             Callback::Code(code) => {
                 let login = pending.take().expect("checked above");
@@ -252,68 +259,6 @@ impl AuthCodeFlow {
     }
 }
 
-/// What the query of a redirect says about the sign-in with `state`.
-#[derive(Debug, PartialEq)]
-enum Callback {
-    /// Not this sign-in's: only the browser it was sent to knows the state.
-    Forged,
-    /// The sign-in ended at the page.
-    Over(AuthError),
-    Code(String),
-}
-
-fn read_callback(query: &str, state: &str) -> Callback {
-    let param = |name: &str| {
-        form_urlencoded::parse(query.as_bytes())
-            .find(|(key, _)| key == name)
-            .map(|(_, value)| value.into_owned())
-    };
-    if param("state").as_deref() != Some(state) {
-        return Callback::Forged;
-    }
-    match (param("error"), param("code")) {
-        (Some(error), _) if error == "access_denied" => {
-            Callback::Over(AuthError::AuthorizationDenied)
-        }
-        (Some(error), _) => Callback::Over(AuthError::Protocol(format!(
-            "the sign-in page returned an error: {error:.80}"
-        ))),
-        (None, Some(code)) => Callback::Code(code),
-        (None, None) => Callback::Over(AuthError::Protocol(
-            "the sign-in page returned no code".into(),
-        )),
-    }
-}
-
-/// The query string of a `GET` for `path`; None for any other request. The
-/// whole header is read, because closing a socket with unread data can reset
-/// the connection before the browser sees the response.
-fn read_callback_query(stream: &mut TcpStream, path: &str) -> Option<String> {
-    stream.set_nonblocking(false).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
-    let mut reader = BufReader::new(stream.take(16 * 1024));
-    let mut request_line = String::new();
-    reader.read_line(&mut request_line).ok()?;
-    let mut line = String::new();
-    while matches!(reader.read_line(&mut line), Ok(n) if n > 0) && line.trim_end() != "" {
-        line.clear();
-    }
-    let target = request_line.strip_prefix("GET ")?.split_whitespace().next()?;
-    let (target_path, query) = target.split_once('?')?;
-    (target_path == path).then(|| query.to_string())
-}
-
-/// `message` is always fixed text: nothing from the request reaches the page.
-fn respond(stream: &mut TcpStream, status: &str, message: &str) {
-    let body = format!("<!doctype html><meta charset=utf-8><title>Sign-in</title><p>{message}</p>");
-    let _ = write!(
-        stream,
-        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{body}",
-        body.len()
-    );
-}
-
 /// 256 random bits, URL-safe: long enough for a PKCE verifier (43 characters).
 fn random_token() -> Result<String, AuthError> {
     let mut bytes = [0u8; 32];
@@ -322,9 +267,6 @@ fn random_token() -> Result<String, AuthError> {
     Ok(base64::encode_urlsafe(&bytes))
 }
 
-fn code_challenge(verifier: &str) -> String {
-    base64::encode_urlsafe(&Sha256::digest(verifier.as_bytes()))
-}
 
 #[cfg(test)]
 mod tests {
@@ -340,15 +282,15 @@ mod tests {
         );
         assert_eq!(
             read_callback("error=access_denied&state=s", "s"),
-            Callback::Over(AuthError::AuthorizationDenied)
+            Callback::Over(CallbackEnd::Denied)
         );
         assert!(matches!(
             read_callback("error=server_error&state=s", "s"),
-            Callback::Over(AuthError::Protocol(detail)) if detail.contains("server_error")
+            Callback::Over(CallbackEnd::Failed(detail)) if detail.contains("server_error")
         ));
         assert!(matches!(
             read_callback("state=s", "s"),
-            Callback::Over(AuthError::Protocol(_))
+            Callback::Over(CallbackEnd::NoCode)
         ));
     }
 
