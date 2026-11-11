@@ -20,6 +20,9 @@
 use std::sync::Mutex;
 
 use nanobot_boot::{Account, AccountProvider, EntitlementDecision, Settings};
+use product_kit::oauth::{
+    classify_poll_error, device_authorization_form, token_poll_form, PollError,
+};
 use serde_json::Value;
 
 use crate::base64;
@@ -104,14 +107,12 @@ impl DeviceFlow {
 
     /// Starts the flow: the provider mint a device code.
     pub async fn begin(&self) -> Result<DeviceCode, AuthError> {
-        let mut form: Vec<(String, String)> =
-            vec![("client_id".into(), self.config.client_id.clone())];
-        if !self.config.scopes.is_empty() {
-            form.push(("scope".into(), self.config.scopes.join(" ")));
-        }
-        if let Some(audience) = &self.config.audience {
-            form.push(("audience".into(), audience.clone()));
-        }
+        let scopes: Vec<&str> = self.config.scopes.iter().map(String::as_str).collect();
+        let form = device_authorization_form(
+            &self.config.client_id,
+            &scopes,
+            self.config.audience.as_deref(),
+        );
         let response = self
             .http
             .post(&self.config.device_auth_url)
@@ -145,11 +146,7 @@ impl DeviceFlow {
         let response = self
             .http
             .post(&self.config.token_url)
-            .form(&[
-                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-                ("device_code", code.device_code.as_str()),
-                ("client_id", self.config.client_id.as_str()),
-            ])
+            .form(&token_poll_form(&code.device_code, &self.config.client_id))
             .send()
             .await
             .map_err(|_| AuthError::Protocol("token poll request failed".into()))?;
@@ -175,15 +172,17 @@ impl DeviceFlow {
         }
 
         match string_field(&json, "error").as_deref() {
-            Some("authorization_pending") => Ok(PollOutcome::Pending {
-                retry_after_ms: code.interval_ms,
-            }),
-            Some("slow_down") => Ok(PollOutcome::SlowDown {
-                retry_after_ms: code.interval_ms + 5_000,
-            }),
-            Some("expired_token") => Err(AuthError::Expired),
-            Some("access_denied") => Err(AuthError::AuthorizationDenied),
-            Some(other) => Err(AuthError::Http { status, body: other.to_string() }),
+            Some(error) => match classify_poll_error(error) {
+                PollError::Pending => Ok(PollOutcome::Pending {
+                    retry_after_ms: code.interval_ms,
+                }),
+                PollError::SlowDown => Ok(PollOutcome::SlowDown {
+                    retry_after_ms: code.interval_ms + 5_000,
+                }),
+                PollError::Expired => Err(AuthError::Expired),
+                PollError::Denied => Err(AuthError::AuthorizationDenied),
+                PollError::Unknown(other) => Err(AuthError::Http { status, body: other }),
+            },
             None => Err(AuthError::Protocol(format!("token poll status {status}: {body:.120}"))),
         }
     }
