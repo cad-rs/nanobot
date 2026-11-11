@@ -264,6 +264,12 @@ pub struct HarnessShell<S: SessionView> {
     /// Told to show the object an entry is about.
     pub(crate) on_anchor: Option<SessionTextCallback>,
     pub(crate) on_delete: Option<SessionCallback>,
+    /// Told that a session was switched to another model profile.
+    pub(crate) on_model: Option<SessionTextCallback>,
+    /// The models the user configured (`llm.models`), as last read or written.
+    pub(crate) models: nanobot_boot::ModelProfiles,
+    pub(crate) model_menu: Option<crate::model_picker::ModelMenu>,
+    pub(crate) model_form: Option<crate::model_picker::ModelForm>,
     pub(crate) session_menu: Option<crate::session_menu::SessionMenu>,
     /// Whether the settings dialog is open.
     pub(crate) settings_open: bool,
@@ -382,6 +388,10 @@ impl<S: SessionView> HarnessShell<S> {
             on_retry: None,
             on_anchor: None,
             on_delete: None,
+            on_model: None,
+            models: nanobot_boot::ModelProfiles::default(),
+            model_menu: None,
+            model_form: None,
             session_menu: None,
             settings_open: false,
             on_message_sent: None,
@@ -693,6 +703,7 @@ impl<S: SessionView> HarnessShell<S> {
                     self.locale = Locale::from_code(code);
                 }
                 self.layout = LayoutState::new(Layout::load(&store));
+                self.models = nanobot_boot::ModelProfiles::load(&store);
                 self.permission_mode = PermissionMode::from_code(
                     &store.get_str(crate::activity::PERMISSION_MODE_KEY, ""),
                 );
@@ -1991,7 +2002,7 @@ impl<S: SessionView> Render for HarnessShell<S> {
             }))
             .on_action(cx.listener(|this: &mut Self, _: &StopTurn, _window, cx| {
                 // An open menu or dialog takes Escape first.
-                if this.close_settings() || this.close_session_menu() {
+                if this.close_model_menu() || this.close_settings() || this.close_session_menu() {
                     cx.notify();
                     return;
                 }
@@ -2102,6 +2113,7 @@ impl<S: SessionView> Render for HarnessShell<S> {
             .child(bottom)
             .children(self.session_menu_overlay(window, cx))
             .children(self.settings_overlay(window, cx))
+            .children(self.model_menu_overlay(window, cx))
             .children(self.palette_overlay(cx))
     }
 }

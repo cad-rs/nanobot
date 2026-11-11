@@ -384,6 +384,37 @@
 - **锚点标签**：产品给了 `set_on_anchor` 后标签可点，壳把对象名交给产品；窄窗口下同时切到视口。高亮本身是产品的事。
 - **D5（与 rcad-pro 的键位冲突）仍未对表。**
 
+### 实施记录（模型档案与按会话选用）
+
+**调研结论**（2026-11-11 查阅各工具文档）：
+
+| 问题 | 常见做法 | 本实现 |
+|---|---|---|
+| 一个条目是什么 | 多数是"提供方下挂多个模型"（Codex、opencode、pi、Zed、Crush、Goose）；Roo Code 是命名档案，一条包含接口、密钥、模型；Continue 是扁平模型列表 | 扁平的命名档案：名称、接口地址、模型 ID、密钥来源。同一接口的两个模型是两条 |
+| 密钥放哪 | 都不放进配置文件：系统钥匙串（Zed、Goose、Roo）、单独的凭据存储（pi `auth.json`、opencode、Codex）、或只写环境变量名（Codex `env_key`、Goose `api_key_env`） | 设置文件旁的 `credentials.json`，或档案里写环境变量名；环境变量有值时优先（与 Zed 相同） |
+| 会话与模型 | opencode、pi、Roo Code、Claude Code 都明确：会话记住自己的模型，恢复时沿用 | 会话记档案 id，由产品随会话保存 |
+| 切换是否改默认 | 有分歧：opencode、pi 不改（pi 要显式保存）；Zed 每次切换都改默认 | 不改。默认只在设置里改 |
+| 记住的模型没了 | 只有 Claude Code 写明：回落到正常优先级 | 回落到默认档案，不报错 |
+| 在哪切换 | 输入框旁显示当前模型，点击或 `/model` 打开列表 | 输入框下方那一行的模型名可点；命令面板有"切换模型" |
+
+来源：Codex <https://learn.chatgpt.com/docs/config-file/config-reference>，opencode <https://opencode.ai/docs/models/>，pi <https://raw.githubusercontent.com/badlogic/pi-mono/main/packages/coding-agent/docs/models.md>，Zed <https://zed.dev/docs/ai/use-api-access>，Roo Code <https://roocodeinc.github.io/Roo-Code/features/api-configuration-profiles>，Goose <https://goose-docs.ai/docs/getting-started/providers>，Claude Code <https://code.claude.com/docs/en/model-config>。
+
+**落地**：
+
+- `nanobot-boot::models`：`ModelProfile`（id、名称、协议、接口地址、模型 ID、密钥环境变量）与 `ModelProfiles`（列表加默认）。存在设置的 `llm.models` 和 `llm.default_model` 两个键里。
+- 装配时把每个档案注册成一个适配器和一条以档案 id 为名的路由；产品没有指定模型时，会话从默认档案开始。
+- `Harness::use_model(wanted)`：重新读设置、注册档案，并把这个会话的 agent 指向 `wanted`（没有或已删除则指向默认）。装配之后新加的档案因此立刻可用。为此 `Agent` 的运行时改为可整体替换（`Agent::update_llm`），进行中的请求用它开始时的那份。
+- 壳：设置弹窗多一节"模型"（列表、添加、修改、删除、设为默认）；输入框下方的模型名可点，列出档案供切换；`set_on_model` 回调告诉产品"这个会话换成了这个档案"；`WorkspaceView::model_id` 让产品报告会话记的档案 id。
+
+**产品要接的三处**：会话打开时调 `harness.use_model(会话记的 id)`；`set_on_model` 里保存 id 并调 `use_model`；`model_id()` 返回保存的 id。
+
+**没有做的**：
+
+- 协议只有 OpenAI 兼容一种，表单里因此没有协议选项。Anthropic、Gemini 原生协议需要先有适配器。
+- 密钥在 `credentials.json` 里是明文。接系统钥匙串需要新依赖（如 `keyring`），当前离线构建拿不到。
+- 没有上下文窗口、推理强度、价格等每模型参数；没有"测试连接"；没有按凭据是否可用过滤列表。
+- 修改正在使用的档案后，已打开的会话要到下一次 `use_model` 才用上新地址。
+
 ## 12. 实施顺序
 
 开工前先做四项最小验收，任何一项不通过都会改变后面的方案：

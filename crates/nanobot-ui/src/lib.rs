@@ -29,6 +29,7 @@ pub mod i18n;
 pub mod icons;
 pub mod layout;
 pub mod model;
+pub mod model_picker;
 pub mod motion;
 pub mod palette;
 pub mod panels;
@@ -2181,5 +2182,104 @@ mod tests {
         cx.simulate_keystrokes("escape");
         redraw(&shell, cx);
         assert!(!shell.read_with(cx, |shell, _| shell.settings_is_open()));
+    }
+
+    // ---- model profiles ----
+
+    fn profile(id: &str, name: &str) -> nanobot_boot::ModelProfile {
+        nanobot_boot::ModelProfile {
+            id: id.to_string(),
+            ..nanobot_boot::ModelProfile::new(name, "https://api.example.com/v1", "wire")
+        }
+    }
+
+    #[test]
+    fn models_are_kept_in_the_settings_and_their_keys_are_not() {
+        let settings = std::sync::Arc::new(std::sync::Mutex::new(nanobot_boot::Settings::in_memory()));
+        let mut shell = HarnessShell::new(two_project_store());
+        shell.set_settings(Some(settings.clone()));
+        assert!(shell.session_model().is_none());
+
+        shell.save_model(profile("a", "Fast"), Some("sk-secret"));
+        shell.save_model(profile("b", "Deep"), None);
+        assert_eq!(shell.session_model().map(|p| p.id.as_str()), Some("a"), "the first is the default");
+        assert!(shell.set_default_model("b"));
+        assert!(!shell.set_default_model("nope"));
+
+        // Another shell on the same store sees the same list.
+        let mut other = HarnessShell::new(two_project_store());
+        other.set_settings(Some(settings.clone()));
+        assert_eq!(other.models().profiles.len(), 2);
+        assert_eq!(other.session_model().map(|p| p.id.as_str()), Some("b"));
+        {
+            let store = settings.lock().unwrap();
+            let listed = store.get(nanobot_boot::models::MODELS_KEY).unwrap().to_string();
+            assert!(!listed.contains("sk-secret"));
+            assert!(nanobot_boot::models::has_stored_key(&store, "a"));
+        }
+
+        // Removing the default leaves the other as the default, and no key.
+        assert!(shell.remove_model("b"));
+        assert!(shell.remove_model("a"));
+        assert!(!shell.remove_model("a"));
+        assert!(!nanobot_boot::models::has_stored_key(&settings.lock().unwrap(), "a"));
+    }
+
+    #[test]
+    fn switching_the_model_tells_the_product_and_leaves_the_default() {
+        let mut shell = HarnessShell::new(two_project_store());
+        shell.save_model(profile("a", "Fast"), None);
+        shell.save_model(profile("b", "Deep"), None);
+        assert!(!shell.open_model_menu(None), "the product gave no way to switch");
+        assert!(!shell.commands().iter().any(|c| c.id == crate::palette::id::SWITCH_MODEL));
+
+        let chosen = Rc::new(RefCell::new(Vec::new()));
+        let seen = chosen.clone();
+        shell.set_on_model(move |session, model| {
+            seen.borrow_mut().push((session.as_str().to_string(), model.to_string()));
+        });
+        assert!(shell.run_command(crate::palette::id::SWITCH_MODEL, 1400.));
+        assert!(shell.model_menu_is_open());
+        assert!(!shell.choose_model("nope"));
+        assert!(!shell.model_menu_is_open(), "choosing closes the list");
+        assert!(shell.choose_model("b"));
+        assert_eq!(*chosen.borrow(), vec![("s1".to_string(), "b".to_string())]);
+        assert_eq!(shell.models().default_profile().map(|p| p.id.as_str()), Some("a"));
+    }
+
+    #[test]
+    fn with_no_model_yet_the_list_opens_the_settings_instead() {
+        let mut shell = HarnessShell::new(two_project_store());
+        shell.set_on_model(|_, _| {});
+        assert!(shell.open_model_menu(Some((10., 700.))));
+        assert!(!shell.model_menu_is_open());
+        assert!(shell.settings_is_open());
+    }
+
+    #[gpui::test]
+    fn a_model_is_added_through_the_form_in_the_settings_dialog(cx: &mut gpui::TestAppContext) {
+        let (shell, cx) = typing_shell(cx);
+        shell.update(cx, |shell, _| {
+            shell.set_on_model(|_, _| {});
+            shell.save_model(profile("a", "Fast"), None);
+            shell.open_settings();
+        });
+        redraw(&shell, cx);
+        shell.update_in(cx, |shell, window, cx| {
+            shell.open_model_form(None, window, cx);
+            assert!(!shell.submit_model_form(cx), "an empty form is not a model");
+            shell.open_model_form(Some("a"), window, cx);
+        });
+        redraw(&shell, cx);
+        // Saved unchanged: still one model, same id.
+        assert!(shell.update(cx, |shell, cx| shell.submit_model_form(cx)));
+        shell.update(cx, |shell, _| {
+            assert_eq!(shell.models().profiles.len(), 1);
+            assert_eq!(shell.models().get("a").unwrap().name, "Fast");
+            shell.open_model_menu(Some((10., 700.)));
+        });
+        redraw(&shell, cx);
+        cx.simulate_keystrokes("escape");
+        assert!(!shell.read_with(cx, |shell, _| shell.model_menu_is_open()));
     }
 }
