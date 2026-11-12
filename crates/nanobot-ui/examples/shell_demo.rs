@@ -266,6 +266,11 @@ fn long_answer() -> String {
         .collect()
 }
 
+thread_local! {
+    /// The model profile each session was switched to, by session id.
+    static SESSION_MODELS: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+}
+
 impl Demo {
     fn new(id: &str, title: &str, status: SessionStatus) -> Self {
         Self {
@@ -323,6 +328,9 @@ impl WorkspaceView for Demo {
     }
     fn model_label(&self) -> Option<String> {
         Some("demo-model".to_string())
+    }
+    fn model_id(&self) -> Option<String> {
+        SESSION_MODELS.with(|models| models.borrow().get(self.id.as_str()).cloned())
     }
     fn context_usage(&self) -> Option<f32> {
         // The streaming session is the one running out of room.
@@ -542,6 +550,14 @@ fn main() {
                 shell.set_on_fork(|id| log::info!("fork {id}"));
                 shell.set_on_anchor(|id, anchor| log::info!("show {anchor} of {id}"));
                 shell.set_on_delete(|id| log::info!("delete {id}"));
+                // A product keeps the profile id with the session and points
+                // the session's agent at it (`Harness::use_model`).
+                shell.set_on_model(|id, model| {
+                    log::info!("session {id} now runs on model profile {model}");
+                    SESSION_MODELS.with(|models| {
+                        models.borrow_mut().insert(id.as_str().to_string(), model.to_string());
+                    });
+                });
                 // Trying again, played out: the error goes and an answer comes.
                 let talks = conversations.clone();
                 shell.set_on_retry(move |id, seq| {

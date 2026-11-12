@@ -212,6 +212,26 @@ impl Harness {
         &self.settings_file
     }
 
+    /// Points this session at the model profile `wanted` — the id the session
+    /// recorded — or at the user's default when `wanted` is `None` or names a
+    /// profile that is gone. The profiles are read from the settings again,
+    /// so one added or corrected since the assembly takes effect now. Returns
+    /// the profile the session runs on; `None` when there is no usable
+    /// profile, and the agent is left as it was.
+    pub fn use_model(&self, wanted: Option<&str>) -> Option<crate::models::ModelProfile> {
+        let store = self.settings.lock().ok()?;
+        let profiles = crate::models::ModelProfiles::load(&store);
+        self.agent.update_llm(|llm| {
+            crate::models::register_profiles(llm, &profiles, &store);
+        });
+        let chosen = profiles
+            .resolve(wanted)
+            .filter(|profile| profile.is_complete())?
+            .clone();
+        self.agent.set_model(&chosen.id);
+        Some(chosen)
+    }
+
     /// The identity snapshot from the account provider (`None` = not signed
     /// in; the default [`AnonymousProvider`] never signs in).
     pub fn account(&self) -> Option<Account> {
@@ -683,6 +703,20 @@ impl HarnessBuilder {
             notes.push(format!("{} model route(s) declared", model_routes.len()));
         }
 
+        // The models the user configured: each routable by its profile id.
+        let profiles = settings
+            .lock()
+            .map(|store| {
+                let profiles = crate::models::ModelProfiles::load(&store);
+                let count = crate::models::register_profiles(&mut llm, &profiles, &store);
+                (count > 0).then_some(profiles)
+            })
+            .ok()
+            .flatten();
+        if let Some(profiles) = &profiles {
+            notes.push(format!("{} model profile(s) from the settings", profiles.profiles.len()));
+        }
+
         let mut tool_count = 0usize;
         let registry = match registry {
             Some(registry) => {
@@ -718,6 +752,14 @@ impl HarnessBuilder {
         if let Some(persona) = persona {
             agent.set_persona(persona);
         }
+        // The product's model wins; without one a new session starts on the
+        // user's default profile.
+        let model = model.or_else(|| {
+            profiles
+                .as_ref()
+                .and_then(|profiles| profiles.default_profile())
+                .map(|profile| profile.id.clone())
+        });
         if let Some(model) = model {
             agent.set_model(model);
         }
@@ -918,6 +960,34 @@ mod tests {
             Some("gpt-6-mini".to_string()),
             "`with_model_route` routes the alias to its provider and records its wire model"
         );
+    }
+
+    #[cfg(feature = "nanobot-llm-providers")]
+    #[test]
+    fn a_session_runs_on_the_profile_it_names_or_on_the_default() {
+        use crate::models::{ModelProfile, ModelProfiles};
+
+        let dir = std::env::temp_dir().join(format!("nb-harness-models-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join("settings.json");
+        let mut profiles = ModelProfiles::default();
+        profiles.upsert(ModelProfile { id: "a".into(), ..ModelProfile::new("A", "http://a/v1", "small") });
+        profiles.store(&mut crate::settings::load_settings(&file).0).unwrap();
+
+        let harness = Harness::builder()
+            .with_session_id("sess-profiles")
+            .with_settings_path(file.clone())
+            .build()
+            .expect("assembly");
+        assert_eq!(harness.use_model(None).map(|p| p.id), Some("a".to_string()));
+
+        // A profile added after the assembly is usable at once; one that is
+        // gone falls back to the default.
+        profiles.upsert(ModelProfile { id: "b".into(), ..ModelProfile::new("B", "http://b/v1", "big") });
+        profiles.store(&mut harness.settings().lock().unwrap()).unwrap();
+        assert_eq!(harness.use_model(Some("b")).map(|p| p.model), Some("big".to_string()));
+        assert_eq!(harness.use_model(Some("deleted")).map(|p| p.id), Some("a".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

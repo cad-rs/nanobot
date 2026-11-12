@@ -230,6 +230,11 @@ pub trait WorkspaceView: Clone + 'static {
     fn model_label(&self) -> Option<String> {
         None
     }
+    /// The id of the model profile the session runs on, as the product
+    /// recorded it. `None` — or an id that is gone — is the user's default.
+    fn model_id(&self) -> Option<String> {
+        None
+    }
     /// The share of the context window in use, 0 to 1, when the product knows.
     fn context_usage(&self) -> Option<f32> {
         None

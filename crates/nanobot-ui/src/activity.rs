@@ -787,7 +787,7 @@ impl<S: SessionView> HarnessShell<S> {
                     .gap_3()
                     .text_xs()
                     .text_color(p.muted)
-                    .when_some(ws.model_label(), |d, model| d.child(model))
+                    .children(self.model_chip(ws, cx))
                     .child(
                         div()
                             .id("harness-permission-mode")

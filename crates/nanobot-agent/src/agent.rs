@@ -210,7 +210,9 @@ type PromptAssembler = Arc<dyn Fn(String) -> String + Send + Sync>;
 
 struct AgentInner {
     session: Session,
-    llm: LlmRuntime,
+    /// Swapped whole when the routes change, so a request in flight keeps the
+    /// runtime it started with.
+    llm: Mutex<Arc<LlmRuntime>>,
     tools: ToolPipeline,
     inbox: Inbox,
     turn_counter: AtomicU32,
@@ -472,7 +474,7 @@ impl Agent {
         Self {
             inner: Arc::new(AgentInner {
                 session,
-                llm,
+                llm: Mutex::new(Arc::new(llm)),
                 tools,
                 inbox: Inbox::new(),
                 turn_counter: AtomicU32::new(0),
@@ -544,11 +546,22 @@ impl Agent {
     /// was given (an alias), so the runtime's resolution is the truth.
     fn wire_model(&self) -> String {
         let id = self.model_id();
-        self.inner
-            .llm
-            .resolve(&id)
-            .map(|route| route.model)
-            .unwrap_or(id)
+        self.llm().resolve(&id).map(|route| route.model).unwrap_or(id)
+    }
+
+    /// The runtime requests are routed through, as it is now.
+    fn llm(&self) -> Arc<LlmRuntime> {
+        self.inner.llm.lock().unwrap().clone()
+    }
+
+    /// Changes the runtime's adapters and routes after assembly: how a model
+    /// the user configured while the agent was alive becomes routable. A
+    /// request already in flight finishes on the runtime it started with.
+    pub fn update_llm(&self, change: impl FnOnce(&mut LlmRuntime)) {
+        let mut slot = self.inner.llm.lock().unwrap();
+        let mut next = LlmRuntime::clone(&slot);
+        change(&mut next);
+        *slot = Arc::new(next);
     }
 
     /// Set the plan verifier (the product's intent grader). Without one, a
@@ -1110,7 +1123,8 @@ impl Agent {
             max_tokens: Some(COMPACT_MAX_TOKENS),
         };
 
-        let mut stream = self.inner.llm.stream_model(&model_id, request);
+        let llm = self.llm();
+        let mut stream = llm.stream_model(&model_id, request);
         let mut assembler = BlockAssembler::new();
         use futures_util::StreamExt;
         while let Some(item) = stream.next().await {
@@ -1404,7 +1418,8 @@ impl Agent {
                 };
 
                 // Stream from LLM.
-                let mut stream = self.inner.llm.stream_model(&model_id, request);
+                let llm = self.llm();
+                let mut stream = llm.stream_model(&model_id, request);
                 let mut assembler = BlockAssembler::new();
                 let mut stream_error: Option<String> = None;
 
