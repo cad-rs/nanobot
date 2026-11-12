@@ -170,7 +170,7 @@ impl<F> Assets<F> {
     }
 }
 
-impl<F: AssetSource> AssetSource for Assets<F> {
+impl<F: product_kit::assets::AssetSource> AssetSource for Assets<F> {
     fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
         let ours = path
             .strip_prefix(PREFIX)
@@ -178,14 +178,22 @@ impl<F: AssetSource> AssetSource for Assets<F> {
             .and_then(|name| Icon::ALL.iter().find(|icon| icon.name() == name));
         match ours {
             Some(icon) => Ok(Some(Cow::Borrowed(icon.bytes()))),
-            None => self.0.load(path),
+            None => Ok(self.0.load(path)),
         }
     }
 
     fn list(&self, path: &str) -> gpui::Result<Vec<SharedString>> {
-        let mut found = self.0.list(path)?;
+        // The product contract enumerates every path it holds; gpui scopes a
+        // listing by prefix.
+        let mut found: Vec<SharedString> = self
+            .0
+            .paths()
+            .into_iter()
+            .filter(|p| p.starts_with(path))
+            .map(SharedString::from)
+            .collect();
         if PREFIX.starts_with(path) || path.starts_with(PREFIX.trim_end_matches('/')) {
-            found.extend(Icon::ALL.iter().map(|icon| icon.path()));
+            found.extend(Icon::ALL.iter().map(|icon| SharedString::from(icon.path())));
         }
         Ok(found)
     }
@@ -224,12 +232,12 @@ mod tests {
 
     struct Product;
 
-    impl AssetSource for Product {
-        fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
-            Ok((path == "logo.svg").then_some(Cow::Borrowed(b"<svg/>".as_slice())))
+    impl product_kit::assets::AssetSource for Product {
+        fn load(&self, path: &str) -> Option<Cow<'static, [u8]>> {
+            (path == "logo.svg").then_some(Cow::Borrowed(b"<svg/>".as_slice()))
         }
-        fn list(&self, _path: &str) -> gpui::Result<Vec<SharedString>> {
-            Ok(vec!["logo.svg".into()])
+        fn paths(&self) -> Vec<String> {
+            vec!["logo.svg".to_string()]
         }
     }
 
@@ -240,7 +248,9 @@ mod tests {
         assert!(assets.load(&Icon::Send.path()).unwrap().is_some());
         assert!(assets.load("nanobot-ui/icons/nope.svg").unwrap().is_none());
         assert!(assets.load("missing.svg").unwrap().is_none());
-        let listed = assets.list("nanobot-ui/icons").unwrap();
+        // gpui builds its registry from the root listing; the product contract
+        // enumerates every path it holds, so both are reachable there.
+        let listed = assets.list("").unwrap();
         assert!(listed.contains(&Icon::Send.path()) && listed.contains(&"logo.svg".into()));
     }
 }
