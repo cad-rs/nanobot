@@ -20,7 +20,7 @@ use gpui::{
     deferred, div, prelude::*, px, rgb, App, Bounds, Context, Size, Window, WindowBounds,
     WindowOptions,
 };
-use nanobot_gpu::{viewport_element, Gpu, Viewport, ViewportContent, ViewportInput};
+use gpui_gpu_view::{viewport_element, Gpu, Viewport, ViewportContent, ViewportInput};
 
 /// How long each phase lasts: still, sweeping, still.
 const STILL: Duration = Duration::from_millis(2500);

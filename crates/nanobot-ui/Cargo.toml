@@ -11,12 +11,14 @@ description = "nanobot gpui workbench shell: session list, session workspace, co
 # at the rcad-pro root (see product-kit/README.md). The path leaves this
 # repo on purpose - the kit's home is the sibling checkout.
 product-kit = { path = "../../../product-kit" }
+# The shared GPU render slot (device, per-platform presenters, input routing),
+# consumed through product-kit like the rest of the shared infrastructure.
+gpui-gpu-view = { path = "../../../product-kit/crates/gpui-gpu-view" }
 gpui = { workspace = true }
 gpui-component = { workspace = true }
 # Declarative UiNode trees for script panels (mounted by the panel host).
 gpui-rhai = { workspace = true }
 nanobot-boot = { workspace = true }
-nanobot-gpu = { workspace = true }
 nanobot-rhai = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

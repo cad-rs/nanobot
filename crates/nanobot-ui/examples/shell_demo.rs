@@ -54,7 +54,7 @@ use std::sync::{Arc, Mutex};
 use gpui::{
     div, prelude::*, px, AnyElement, App, Bounds, Size, WindowBounds, WindowOptions,
 };
-use nanobot_gpu::{
+use gpui_gpu_view::{
     viewport_element, Gpu, Viewport, ViewportContent, ViewportInput, ViewportProjection,
     ViewportSlot,
 };

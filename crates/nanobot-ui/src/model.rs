@@ -12,7 +12,7 @@
 
 use std::fmt;
 
-use nanobot_gpu::ViewportSlot;
+use gpui_gpu_view::ViewportSlot;
 
 use crate::transcript::{Conversation, TurnPhase};
 

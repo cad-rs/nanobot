@@ -865,7 +865,7 @@ mod tests {
         BranchMarker, PlanPhase, PlanStep, Project, SessionStatus, SidebarGroup, WorkspaceView,
     };
     use crate::transcript::Conversation;
-    use nanobot_gpu::{ViewportProjection, ViewportSlot};
+    use gpui_gpu_view::{ViewportProjection, ViewportSlot};
 
     const HOUR: u64 = 60 * 60 * 1000;
     const NOW: u64 = 1_000 * HOUR;

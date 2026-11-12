@@ -35,7 +35,7 @@ use gpui_component::{
 };
 use nanobot_boot::account::Account;
 use nanobot_boot::Settings;
-use nanobot_gpu::{ViewportProjection, ViewportSlot};
+use gpui_gpu_view::{ViewportProjection, ViewportSlot};
 
 use crate::model::{
     PlanDecision, ProjectId,
@@ -1294,7 +1294,7 @@ impl<S: SessionView> HarnessShell<S> {
 
     fn end_drag(&mut self) {
         if self.dragging.take().is_some() {
-            nanobot_gpu::suspend_viewport_input(false);
+            gpui_gpu_view::suspend_viewport_input(false);
             self.save_layout();
         }
     }
@@ -1334,7 +1334,7 @@ impl<S: SessionView> HarnessShell<S> {
                     // The pointer will cross the viewport: on Windows its
                     // native surface would otherwise keep the moves and the
                     // release to itself, and the drag would stall at its edge.
-                    nanobot_gpu::suspend_viewport_input(true);
+                    gpui_gpu_view::suspend_viewport_input(true);
                     cx.stop_propagation();
                     cx.notify();
                 }),

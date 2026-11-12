@@ -15,7 +15,7 @@
 //!
 //! The product registers its domain panels through
 //! [`shell::HarnessShell::panel_host`] and its renderer through
-//! [`nanobot_gpu::ViewportSlot`]. Nothing in this crate knows a domain word.
+//! [`gpui_gpu_view::ViewportSlot`]. Nothing in this crate knows a domain word.
 //!
 //! The shell's chrome (dark/light theme, the settings dialog) is framework
 //! surface: [`theme`] switches the gpui-component global theme every palette
@@ -82,7 +82,7 @@ pub use widgets::{button, line, picker, short_hash, show, truncate, HashedRef};
 mod tests {
     use super::*;
     use gpui::{AnyElement, IntoElement as _};
-    use nanobot_gpu::{ViewportProjection, ViewportSlot};
+    use gpui_gpu_view::{ViewportProjection, ViewportSlot};
     use std::cell::RefCell;
     use std::rc::Rc;
 

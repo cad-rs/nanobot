@@ -25,7 +25,6 @@ Extraction is incremental. See the migration path in the design doc:
 | `nanobot-agent` | **landed** — turn/step loop, plan state machine, PlanVerifier seam |
 | `nanobot-skills` | **landed** — skill runner (manifest -> listeners), ships no skills |
 | `nanobot-boot` | **landed** — `Harness`/`HarnessBuilder` assembly, `harness.toml` identity, CLI modes (`--selfcheck` / `--selfcheck-crash` / `--agent-smoke` / `--agent-run` / `--smoke`), probe-style selfcheck with the three-phase crash-recovery probe, generic project container (`ProjectPaths` / `Manifest` / `Project`); atomic settings and manifest saves; `diagnostics` (rolling log file, panic crash reports, plain-text export, opt-in `CrashReporter`); `RefreshSchedule` + `SessionGrace` (when to re-check entitlements, and a lapse never closing what is in use) |
-| `nanobot-gpu` | **landed** — the wgpu↔gpui render slot: process-wide shared device (`shared_gpu`), per-platform presentation and input routing (`Viewport` / `ViewportContent` / `viewport_element`), and the `ViewportSlot` contract the product's renderer implements |
 | `nanobot-rhai` | **landed** — Rhai script plugin host: `plugin.toml` manifest plus an entry point that declares panels / views / commands / toolbar items; loading is isolated, so a bad plugin never stops the others; a manifest's `requires` gates a plugin on the user's capabilities before its script runs |
 | `nanobot-ui` | **landed** — gpui workbench shell: session list, session workspace (conversation + plan review + approval / clarify bars + composer), viewport region, and the panel dock that hosts product and script-plugin panels. Generic over `SessionView` |
 
@@ -40,17 +39,21 @@ crates/
   nanobot-agent/    turn/step loop + plan state machine
   nanobot-skills/   skill runner (manifest -> listeners)
   nanobot-boot/     Harness assembly + harness.toml + CLI/selfcheck + project container
-  nanobot-gpu/      render slot: shared device + per-platform presentation + input
   nanobot-rhai/     Rhai script plugin host (manifest -> panels/views/commands)
   nanobot-ui/       gpui workbench shell + panel dock
 .vendor/            gpui-pre shims + patched gpui-rhai (see .vendor/README.md)
 ```
 
+The wgpu↔gpui render slot (process-wide shared device, per-platform
+presentation, input routing, the `ViewportSlot` contract) is the shared
+`gpui-gpu-view` crate in the sibling `product-kit` checkout, consumed through
+a path dependency — the same slot the workbench framework uses.
+
 The kernel crates are **GUI-free**: no `gpui`, no `wgpu`, no `rcad-*`, no `ocad-*`.
 That is enforced by `tools/nanobot-vendor-check.py` in rcad-pro (design §3.2),
 and it is what lets the kernel serve a CLI, a test, or an MCP server without
-dragging a UI along. The shell layer (`nanobot-gpu` / `nanobot-rhai` /
-`nanobot-ui`) is the only place gpui and wgpu appear.
+dragging a UI along. The shell layer (`nanobot-rhai` / `nanobot-ui`, plus the
+shared `gpui-gpu-view` slot) is the only place gpui and wgpu appear.
 
 The gpui stack is [gpui-fast](https://github.com/longbridge/gpui-fast) at a
 pinned commit, `gpui-component` 0.9 from crates.io and `gpui-rhai` 0.4.2 — the
