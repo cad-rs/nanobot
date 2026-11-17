@@ -23,20 +23,9 @@ pub struct SupabaseProvider {
 
 impl SupabaseProvider {
     pub fn new() -> Self {
-        Self::with_config(Config::default())
-    }
-
-    /// Signs in against an explicit Supabase project configuration.
-    pub fn with_config(config: Config) -> Self {
         Self {
-            account: SharedAccount::new(config),
+            account: SharedAccount::new(Config::default()),
         }
-    }
-
-    /// The underlying capability (a product with its own sign-in loop, or a
-    /// custom configuration).
-    pub fn supabase(&self) -> &SharedAccount {
-        &self.account
     }
 
     /// Starts the platform's sign-in; the product opens `request.url`.
@@ -47,11 +36,6 @@ impl SupabaseProvider {
     /// One sign-in poll.
     pub fn poll_sign_in(&self) -> Result<Poll, String> {
         self.account.poll()
-    }
-
-    /// The bearer token for the site's own services while signed in.
-    pub fn access_token(&self) -> Option<String> {
-        self.account.access_token()
     }
 
     /// Ends the session.
@@ -75,8 +59,8 @@ impl Default for SupabaseProvider {
 impl AccountProvider for SupabaseProvider {
     fn account(&self) -> Option<Account> {
         self.account.account().map(|account| {
-            let mut mapped = Account::new(account.id, account.name);
-            mapped.expires_at_ms = account.expires_at.map(|secs| secs.max(0) as u64 * 1000);
+            let mut mapped = Account::new(account.user_id.clone(), account.display_name().to_string());
+            mapped.expires_at_ms = Some(account.expires_at.max(0) as u64 * 1000);
             mapped
         })
     }
@@ -104,7 +88,6 @@ mod tests {
                 .check(nanobot_boot::account::TURN_CAPABILITY)
                 .is_allowed()
         );
-        assert_eq!(provider.access_token(), None);
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -112,7 +95,6 @@ mod tests {
     fn the_desktop_sign_in_points_at_supabase() {
         let provider = SupabaseProvider::new();
         let request = provider.begin_sign_in().expect("the sign-in starts");
-        assert!(request.user_code.is_none());
         assert!(
             request.url.contains("/auth/v1/authorize"),
             "{}",
