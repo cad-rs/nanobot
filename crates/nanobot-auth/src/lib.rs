@@ -12,6 +12,9 @@
 //! - [`license`] — offline licenses: an ed25519-signed entitlement token
 //!   the harness verifies at load with only a public key, for the air-gapped
 //!   lab and the perpetual desktop sale.
+//! - [`supabase`] — the rcad.app web session shared by the site's apps
+//!   (`ocad` web, `creator` web, the console): a provider that reads the
+//!   console's Supabase session from local storage.
 
 pub mod error;
 #[cfg(not(target_family = "wasm"))]
@@ -19,6 +22,7 @@ pub mod auth_code;
 pub mod license;
 pub mod oauth;
 pub mod plugin;
+pub mod supabase;
 
 pub(crate) mod base64;
 
@@ -38,6 +42,7 @@ pub use oauth::{
     forget_tokens, persist_tokens, restore_tokens, DeviceCode, DeviceFlow, OAuth2Config,
     OAuth2Provider, PollOutcome, TokenSet,
 };
+pub use supabase::SupabaseProvider;
 
 /// The unix clock (ms) both backends read for expiry decisions.
 pub(crate) fn now_ms() -> u64 {
